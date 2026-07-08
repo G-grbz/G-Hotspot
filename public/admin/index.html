@@ -1,0 +1,716 @@
+<!doctype html>
+<html lang="en" data-i18n-storage="gh_admin_language">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>G-Hotspot Administration</title>
+  <link rel="icon" href="/img/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/admin/admin.css?v=1.0.0">
+</head>
+<body class="i18n-loading">
+  <section id="loginScreen" class="login-screen">
+    <div class="login-visual">
+      <div class="login-visual__content">
+        <div class="signal-orbit"><span></span><span></span><span></span><b>G</b></div>
+        <p class="overline">OPNsense Captive Portal</p>
+        <h1><span>Your entire network,</span><br><span>in one screen.</span></h1>
+        <p>Verify guest access, generate vouchers and monitor network usage in detail.</p>
+        <div class="login-stats">
+          <div><strong>7/24</strong><span>Live monitoring</span></div>
+          <div><strong>7</strong><span>Verification methods</span></div>
+          <div><strong>∞</strong><span>Voucher management</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="login-panel">
+      <form id="loginForm" class="login-card">
+        <div class="login-language-row">
+          <div class="mobile-brand"><span>G</span><strong>G-Hotspot</strong></div>
+          <select id="loginLanguage" name="loginLanguage" class="top-language" aria-label="Language">
+            <option value="en">EN</option>
+            <option value="tr">TR</option>
+          </select>
+        </div>
+        <p class="overline">Administration Console</p>
+        <h2>Welcome back</h2>
+        <p class="muted">Sign in with your administrator account to continue.</p>
+        <label for="loginUsername">Username</label>
+        <div class="input-wrap">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 21a8 8 0 0 0-16 0M12 13a5 5 0 1 0 0-10 5 5 0 0 0 0 10Z"/></svg>
+          <input id="loginUsername" name="username" autocomplete="username" value="admin" required>
+        </div>
+        <label for="loginPassword">Password</label>
+        <div class="input-wrap">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+          <input id="loginPassword" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <button class="primary-button login-button" type="submit">Enter administration panel <span>→</span></button>
+        <div id="loginNotice" class="form-notice hidden"></div>
+        <p id="loginProjectAttribution" class="login-foot">Powered by G-Hotspot / Gökhan GÜRBÜZ (G-grbz) · AGPL-3.0-only</p>
+      </form>
+    </div>
+  </section>
+
+  <div id="adminApp" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="sidebar__brand">
+        <div class="logo-mark">G</div>
+        <div class="sidebar__brand-text"><strong id="brandName">G-Hotspot</strong><span>Administration Console</span></div>
+      </div>
+      <nav class="nav-list" aria-label="Main menu">
+        <button class="nav-item active" data-view="dashboard">
+          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg>
+          <span>Dashboard</span>
+        </button>
+        <button class="nav-item" data-view="sessions">
+          <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          <span>Sessions</span><b id="activeNavCount" class="nav-badge">0</b>
+        </button>
+        <button class="nav-item" data-view="verifications">
+          <svg viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3v8Z"/><path d="m9 12 2 2 4-4"/></svg>
+          <span>Verifications</span>
+        </button>
+        <button class="nav-item" data-view="logs">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 6 12 12 16 14"/>
+          </svg>
+          <span>Activity Logs</span>
+        </button>
+        <button class="nav-item" data-view="traffic-logs">
+          <svg viewBox="0 0 24 24"><path d="M3 17h18M7 17V7M12 17V3M17 17v-6"/><path d="m7 7 3 3 5-5 2 2 4-4"/></svg>
+          <span>Traffic Logs</span>
+        </button>
+        <button class="nav-item" data-view="opnsense-template">
+          <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M9 13h6M9 17h6M9 9h1"/></svg>
+          <span>Create template</span>
+        </button>
+        <button class="nav-item" data-view="settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+          <span>Settings</span>
+        </button>
+      </nav>
+      <div class="sidebar__bottom">
+        <div class="gateway-card">
+          <span class="status-dot"></span>
+          <div><strong>OPNsense Gateway</strong><span id="gatewayMode">Connecting…</span></div>
+        </div>
+        <button id="sidebarToggle" class="sidebar-toggle" type="button" aria-label="Collapse sidebar" title="Collapse sidebar" aria-pressed="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+            <rect x="3" y="4" width="18" height="16" rx="2"/>
+            <rect x="3" y="4" width="7" height="16" rx="2" fill="currentColor" fill-opacity="0.15" stroke="none"/>
+            <line x1="10" y1="4" x2="10" y2="20"/>
+          </svg>
+          <span id="sidebarToggleText">Collapse</span>
+        </button>
+        <button id="themeToggle" class="sidebar-toggle theme-toggle" type="button" aria-label="Switch to dark mode" title="Switch to dark mode" aria-pressed="false">
+          <svg class="theme-toggle__moon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/>
+          </svg>
+          <svg class="theme-toggle__sun" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"/>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/>
+          </svg>
+          <span id="themeToggleText">Dark mode</span>
+          <i class="theme-toggle__switch" aria-hidden="true"><b></b></i>
+        </button>
+        <button id="logoutButton" class="nav-item logout">
+          <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
+          <span>Log out</span>
+        </button>
+        <div id="adminProjectAttribution" class="admin-attribution">Powered by G-Hotspot / Gökhan GÜRBÜZ (G-grbz) · AGPL-3.0-only</div>
+      </div>
+    </aside>
+
+    <div id="sidebarOverlay" class="sidebar-overlay"></div>
+    <main class="main-area">
+      <header class="topbar">
+        <button id="mobileMenu" class="icon-button mobile-menu" aria-label="Open menu">
+          <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        </button>
+        <div>
+          <p id="pageEyebrow" class="overline">CONTROL CENTER</p>
+          <h1 id="pageTitle">Dashboard</h1>
+        </div>
+        <div class="topbar__actions">
+          <select id="adminLanguage" name="adminLanguage" class="top-language" aria-label="Language">
+            <option value="en">EN</option>
+            <option value="tr">TR</option>
+          </select>
+          <button id="syncButton" class="secondary-button">
+            <svg viewBox="0 0 24 24" aria-hidden="true" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20 11a8 8 0 0 0-14.9-4M4 4v5h5"/>
+              <path d="M4 13a8 8 0 0 0 14.9 4M20 20v-5h-5"/>
+            </svg>
+            <span>Sync OPNsense</span>
+          </button>
+          <div class="admin-profile">
+            <button id="releaseStatusButton" class="avatar release-avatar" type="button" aria-label="Check for updates" title="Check for updates">
+              <span id="adminAvatarInitial">A</span>
+              <span id="releaseUpdateBadge" class="release-update-badge" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+              </span>
+            </button>
+            <div><strong id="adminName">admin</strong><span>System Administrator</span></div>
+          </div>
+        </div>
+      </header>
+
+      <div class="content">
+        <div id="systemAlerts" class="system-alerts hidden"></div>
+        <section class="view active" data-view-panel="dashboard">
+          <div class="welcome-row">
+            <div>
+              <h2>Network status looks good.</h2>
+              <p id="welcomeDate">Last successful sync: —</p>
+            </div>
+            <button class="primary-button" data-open-voucher>
+              <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+              Create new voucher
+            </button>
+          </div>
+
+          <article id="dashboardStorageAlert" class="dashboard-storage-alert hidden">
+            <div class="dashboard-storage-alert__icon">
+              <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 15h.01M11 15h6"/></svg>
+            </div>
+            <div class="dashboard-storage-alert__body">
+              <div class="dashboard-storage-alert__head">
+                <div>
+                  <strong id="dashboardStorageTitle">Syslog storage warning</strong>
+                  <span id="dashboardStorageMessage">—</span>
+                </div>
+                <button class="text-button" type="button" data-settings-shortcut="notifications">Notification settings</button>
+              </div>
+              <div class="dashboard-storage-alert__bar"><span id="dashboardStorageBar"></span></div>
+            </div>
+          </article>
+
+          <article id="dashboardApprovalRequests" class="panel-card approval-panel hidden">
+            <div class="panel-head">
+              <div><h3>Pending admin approval requests</h3><p id="dashboardApprovalCount">— requests</p></div>
+              <button class="text-button" type="button" data-settings-shortcut="admin-approval">Manage requests <span>→</span></button>
+            </div>
+            <div id="dashboardApprovalList" class="approval-list"></div>
+          </article>
+
+          <div class="metric-grid">
+            <article class="metric-card violet">
+              <div class="metric-icon"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM19 8v6M22 11h-6"/></svg></div>
+              <div class="metric-label"><span>Active Sessions</span><b class="live-pill">LIVE</b></div>
+              <strong id="metricActive">—</strong>
+              <p id="metricToday">Total connections today: —</p>
+            </article>
+            <article class="metric-card blue">
+              <div class="metric-icon"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg></div>
+              <div class="metric-label"><span>Total Download</span></div>
+              <strong id="metricDownload">—</strong>
+              <p>All recorded sessions</p>
+            </article>
+            <article class="metric-card amber">
+              <div class="metric-icon"><svg viewBox="0 0 24 24"><path d="M12 21V9M7 14l5-5 5 5M5 3h14"/></svg></div>
+              <div class="metric-label"><span>Total Upload</span></div>
+              <strong id="metricUpload">—</strong>
+              <p>All recorded sessions</p>
+            </article>
+            <article class="metric-card green">
+              <div class="metric-icon"><svg viewBox="0 0 24 24"><path d="M21 12a3 3 0 0 0-3-3V5H3v4a3 3 0 0 1 0 6v4h15v-4a3 3 0 0 0 3-3Z"/></svg></div>
+              <div class="metric-label"><span>Available Vouchers</span></div>
+              <strong id="metricVouchers">—</strong>
+              <p><span id="metricRedeemed">—</span> redemptions</p>
+            </article>
+          </div>
+
+          <div class="dashboard-grid">
+            <article class="panel-card chart-card">
+              <div class="panel-head">
+                <div><h3>Connection traffic</h3><p>Session activity for the last 7 days</p></div>
+                <span class="period-pill">Last 7 days</span>
+              </div>
+              <div id="sessionTrafficChart" class="traffic-chart session-traffic-chart"></div>
+              <div class="chart-legend"><span><i class="violet-dot"></i>Session count</span><span><i class="gray-dot"></i>Daily traffic</span></div>
+            </article>
+            <article class="panel-card method-card">
+              <div class="panel-head"><div><h3>Verification distribution</h3><p>Last 7 days</p></div></div>
+              <div id="methodDonut" class="donut-wrap"></div>
+              <div id="methodLegend" class="method-legend"></div>
+            </article>
+          </div>
+
+          <div class="traffic-insights-grid">
+            <article class="panel-card method-card top-sites-card">
+              <div class="panel-head">
+                <div><h3>Top visited sites</h3><p id="topSitesSubtitle">Last 6 hours</p></div>
+                <select id="topSitesRange" name="topSitesRange" class="period-select compact-select">
+                  <option value="1">1 hour</option>
+                  <option value="6" selected>6 hours</option>
+                  <option value="12">12 hours</option>
+                  <option value="24">24 hours</option>
+                </select>
+              </div>
+              <div id="topSitesDonut" class="donut-wrap site-donut"></div>
+              <div id="topSitesLegend" class="site-legend"></div>
+            </article>
+
+            <article class="panel-card method-card top-sites-card">
+              <div class="panel-head">
+                <div><h3>Top local download / upload clients</h3><p id="topBandwidthSubtitle">Last 6 hours</p></div>
+                <select id="topBandwidthRange" name="topBandwidthRange" class="period-select compact-select">
+                  <option value="1">1 hour</option>
+                  <option value="6" selected>6 hours</option>
+                  <option value="12">12 hours</option>
+                  <option value="24">24 hours</option>
+                </select>
+              </div>
+              <div id="topBandwidthDonut" class="donut-wrap site-donut"></div>
+              <div id="topBandwidthLegend" class="site-legend"></div>
+            </article>
+
+            <article class="panel-card chart-card traffic-usage-card">
+              <div class="panel-head">
+                <div><h3>Download / upload traffic</h3><p id="trafficChartSubtitle">Hourly traffic for today</p></div>
+                <select id="trafficPeriod" name="trafficPeriod" class="period-select">
+                  <option value="hourly">Hourly</option>
+                  <option value="6h">6 hours</option>
+                  <option value="12h">12 hours</option>
+                  <option value="daily">Daily</option>
+                  <option value="weekly">Weekly</option>
+                  <option value="monthly">Monthly</option>
+                </select>
+              </div>
+              <div id="trafficSummary" class="traffic-summary"></div>
+              <div id="trafficChart" class="traffic-chart bandwidth-traffic-chart"></div>
+              <div class="chart-legend"><span><i class="blue-dot"></i>Download</span><span><i class="amber-dot"></i>Upload</span><span><i class="violet-dot"></i>Live records</span></div>
+            </article>
+          </div>
+
+          <article class="panel-card">
+            <div class="panel-head">
+              <div><h3>Recent connections</h3><p>Most recently verified hotspot users</p></div>
+              <button class="text-button" data-go-view="sessions">View all <span>→</span></button>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead><tr><th>USER</th><th>METHOD</th><th>DEVICE / IP</th><th>USAGE</th><th>DURATION</th><th>STATUS</th></tr></thead>
+                <tbody id="recentSessionsBody"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <section class="view" data-view-panel="sessions">
+          <div class="section-toolbar">
+            <div class="search-box"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="sessionSearch" name="sessionSearch" placeholder="Search email, phone, T.C. identity, IP or MAC"></div>
+            <select id="sessionMethod" name="sessionMethod"><option value="">All methods</option><option value="email">Email</option><option value="nvi">T.C. Identity</option><option value="whatsapp">WhatsApp</option><option value="telegram">Telegram</option><option value="sms">SMS</option><option value="voucher">Voucher</option><option value="admin-approval">Admin approval</option></select>
+            <select id="sessionState" name="sessionState"><option value="">All statuses</option><option value="active">Active</option><option value="ended">Ended</option><option value="failed">Failed</option></select>
+            <a class="secondary-button" href="/api/admin/export/sessions.csv"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>Download CSV</a>
+          </div>
+          <article class="panel-card table-card">
+            <div class="table-title">
+              <div><h3>Usage sessions</h3><p id="sessionCount">— records</p></div>
+              <div class="session-column-picker">
+                <button id="sessionColumnsButton" class="secondary-button compact-button" type="button" aria-haspopup="true" aria-expanded="false">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+                  <span>Columns</span>
+                </button>
+                <div id="sessionColumnsMenu" class="session-columns-menu hidden" role="menu"></div>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table id="sessionsTable" class="wide-table sessions-table">
+                <thead id="sessionsHead"></thead>
+                <tbody id="sessionsBody"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <section class="view" data-view-panel="verifications">
+          <div class="section-toolbar">
+            <div class="search-box"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="verificationSearch" name="verificationSearch" placeholder="Search email, phone, T.C. identity, IP or MAC"></div>
+            <select id="verificationKind" name="verificationKind"><option value="">All methods</option><option value="email">Email</option><option value="nvi">T.C. Identity</option><option value="whatsapp">WhatsApp</option><option value="telegram">Telegram</option><option value="sms">SMS</option><option value="voucher">Voucher</option><option value="admin-approval">Admin approval</option></select>
+            <select id="verificationStatus" name="verificationStatus"><option value="">All statuses</option><option value="verified">Verified</option><option value="approved">Approved</option><option value="pending">Pending</option><option value="rejected">Rejected</option><option value="failed">Failed</option><option value="expired">Expired</option></select>
+          </div>
+          <article class="panel-card table-card">
+            <div class="table-title"><div><h3>Verification records</h3><p id="verificationCount">— records</p></div><span class="privacy-note">Personal data is visible only to administrators</span></div>
+            <div class="table-scroll">
+              <table class="wide-table">
+                <thead><tr><th>VERIFIED IDENTITY</th><th>METHOD</th><th>CLIENT</th><th>REQUEST DATE</th><th>WRONG CODE ATTEMPTS</th><th>RESULT</th><th>DETAIL</th></tr></thead>
+                <tbody id="verificationsBody"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <section class="view" data-view-panel="logs">
+          <div class="section-toolbar">
+            <div class="search-box"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="logSearch" name="logSearch" placeholder="Search activity, user or IP"></div>
+            <select id="logKind" name="logKind"><option value="">All activities</option><option value="authorization">Access</option><option value="verification">Verification</option><option value="admin">Administrator</option></select>
+          </div>
+          <article class="panel-card log-panel">
+            <div class="table-title"><div><h3>Detailed activity stream</h3><p>Verification, access and administrator operations</p></div><span class="live-pill">LIVE LOG</span></div>
+            <div id="logsList" class="logs-list"></div>
+          </article>
+        </section>
+
+        <section class="view" data-view-panel="traffic-logs">
+          <div class="section-toolbar traffic-log-toolbar">
+            <div class="traffic-endpoint-filters">
+              <input id="trafficLogSourceIp" name="trafficLogSourceIp" placeholder="Source IP" autocomplete="off">
+              <input id="trafficLogSourcePort" name="trafficLogSourcePort" placeholder="Source port" autocomplete="off" inputmode="numeric">
+              <input id="trafficLogDestinationIp" name="trafficLogDestinationIp" placeholder="Destination IP" autocomplete="off">
+              <input id="trafficLogDestinationPort" name="trafficLogDestinationPort" placeholder="Destination port" autocomplete="off" inputmode="numeric">
+            </div>
+            <div class="traffic-date-filters">
+              <label for="trafficLogStartAt"><span>Start time</span><input id="trafficLogStartAt" name="trafficLogStartAt" type="datetime-local"></label>
+              <label for="trafficLogEndAt"><span>End time</span><input id="trafficLogEndAt" name="trafficLogEndAt" type="datetime-local"></label>
+            </div>
+            <select id="trafficLogPeriod" name="trafficLogPeriod"><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select>
+            <select id="trafficLogKind" name="trafficLogKind"><option value="">All traffic</option><option value="session">Session snapshots</option><option value="flow">Firewall flows</option></select>
+            <div class="traffic-log-actions">
+              <a id="trafficLogsExport" class="secondary-button" href="/api/admin/export/traffic-logs.csv?period=daily"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>Download CSV</a>
+              <button id="trafficLogStreamToggleButton" class="icon-button traffic-log-stream-button" type="button" aria-label="Pause live traffic logs" title="Pause live traffic logs" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg></button>
+              <button id="trafficLogSettingsButton" class="icon-button traffic-log-settings-button" type="button" aria-label="Traffic log settings" title="Traffic log settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg></button>
+            </div>
+          </div>
+          <div class="traffic-log-layout">
+            <article class="panel-card log-panel traffic-live-panel">
+              <div class="table-title">
+                <div><h3>Traffic logs</h3><p id="trafficLogCount">— records</p></div>
+              </div>
+              <div id="trafficLogSummary" class="traffic-log-summary"></div>
+              <div id="trafficLogsList" class="traffic-logs-list"></div>
+            </article>
+          </div>
+          <div id="trafficLogSettingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="trafficLogSettingsTitle">
+            <div class="modal-backdrop" data-close-traffic-log-settings></div>
+            <div class="modal-card traffic-log-settings-modal-card">
+              <div class="modal-head">
+                <h2 id="trafficLogSettingsTitle">Traffic log settings</h2>
+                <button class="icon-button" type="button" aria-label="Close" data-close-traffic-log-settings><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+              </div>
+              <form id="trafficLogSettingsForm">
+                <div class="traffic-log-settings-fields">
+                  <label class="switch-field" for="trafficLogsEnabled">
+                    <input id="trafficLogsEnabled" name="trafficLogsEnabled" type="checkbox">
+                    <span>Keep operational traffic logs</span>
+                  </label>
+                  <div class="setting-field">
+                    <label for="trafficLogsRetentionDays">Retention period (days)</label>
+                    <input id="trafficLogsRetentionDays" name="trafficLogsRetentionDays" type="number" min="1" max="365" value="30">
+                  </div>
+                  <label class="switch-field" for="trafficLogsResolveDomains">
+                    <input id="trafficLogsResolveDomains" name="trafficLogsResolveDomains" type="checkbox">
+                    <span>Resolve destination domains when possible</span>
+                  </label>
+                  <div class="setting-field">
+                    <label for="trafficLogsLiveRefreshSeconds">Live refresh interval (seconds)</label>
+                    <input id="trafficLogsLiveRefreshSeconds" name="trafficLogsLiveRefreshSeconds" type="number" min="2" max="60" value="5">
+                  </div>
+                </div>
+                <div class="settings-footer">
+                  <button id="saveTrafficLogSettings" class="primary-button" type="submit">Save log settings</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" data-view-panel="opnsense-template">
+          <div class="template-builder-layout">
+            <article class="panel-card template-builder-card">
+              <form id="opnsenseTemplateForm">
+                <div class="settings-header">
+                  <h2>OPNsense captive portal template</h2>
+                  <p>index.html</p>
+                </div>
+                <div class="template-builder-fields">
+                  <div class="setting-field">
+                    <label for="opnsenseTemplateLang">HTML language</label>
+                    <input id="opnsenseTemplateLang" name="lang" autocomplete="off" maxlength="35" required>
+                    <small>Sets the lang attribute on the generated HTML page, for example tr or en.</small>
+                  </div>
+                  <div class="setting-field">
+                    <label for="opnsenseTemplateTitle">Page title</label>
+                    <input id="opnsenseTemplateTitle" name="title" maxlength="120" required>
+                    <small>Shown in the browser tab while OPNsense is redirecting the guest.</small>
+                  </div>
+                  <div class="setting-field full">
+                    <label for="opnsenseTemplateTargetUrl">Redirect URL</label>
+                    <input id="opnsenseTemplateTargetUrl" name="targetUrl" type="url" inputmode="url" required>
+                    <small>Automatically uses the IP/host and port where this Node.js admin panel is opened. Change it only if guests must use another public URL.</small>
+                  </div>
+                  <div class="setting-field">
+                    <label for="opnsenseTemplateRefreshSeconds">Redirect delay (seconds)</label>
+                    <input id="opnsenseTemplateRefreshSeconds" name="refreshSeconds" type="number" min="0" max="60" step="1" required>
+                    <small>Controls the meta refresh wait time. JavaScript still redirects immediately when available.</small>
+                  </div>
+                  <div class="setting-field full">
+                    <label for="opnsenseTemplateRedirectText">Redirect paragraph</label>
+                    <textarea id="opnsenseTemplateRedirectText" name="redirectText" maxlength="500" required></textarea>
+                    <small>Shown as the first message on the OPNsense redirect page.</small>
+                  </div>
+                  <div class="setting-field full">
+                    <label for="opnsenseTemplateLinkText">Link text</label>
+                    <input id="opnsenseTemplateLinkText" name="linkText" maxlength="200" required>
+                    <small>Shown on the manual continue link if automatic redirect does not run.</small>
+                  </div>
+                  <div class="setting-field full">
+                    <label for="opnsenseTemplateNoscriptText">No JavaScript text</label>
+                    <textarea id="opnsenseTemplateNoscriptText" name="noscriptText" maxlength="500" required></textarea>
+                    <small>Shown when the guest browser has JavaScript disabled.</small>
+                  </div>
+                </div>
+                <div class="settings-footer">
+                  <button id="resetOpnsenseTemplateButton" class="secondary-button" type="button">Reset defaults</button>
+                  <button id="downloadOpnsenseTemplateButton" class="primary-button" type="submit">
+                    <svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+                    Download ZIP
+                  </button>
+                </div>
+              </form>
+            </article>
+            <article class="panel-card template-preview-card">
+              <div class="panel-head">
+                <div><h3>index.html preview</h3><p>opnsense-captiveportal-template.zip</p></div>
+              </div>
+              <div class="template-browser-preview">
+                <div class="template-browser-preview__bar"><span></span><span></span><span></span></div>
+                <div class="template-browser-preview__body">
+                  <strong id="opnsenseTemplatePreviewTitle">Redirecting</strong>
+                  <p id="opnsenseTemplatePreviewText">Redirecting to the guest network portal…</p>
+                  <a id="opnsenseTemplatePreviewLink" href="http://172.16.2.2:8080/" target="_blank" rel="noreferrer">Continue to G-Hotspot</a>
+                </div>
+              </div>
+              <pre class="template-code-preview"><code id="opnsenseTemplateCode"></code></pre>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" data-view-panel="settings">
+          <div class="settings-layout">
+            <aside id="settingsTabs" class="settings-tabs"></aside>
+            <div class="settings-content">
+              <article class="panel-card settings-card">
+                <form id="settingsForm">
+                  <div id="settingsHeader" class="settings-header"></div>
+                  <div id="settingsFields" class="settings-fields"></div>
+                  <div id="emailTestPanel" class="email-test-panel hidden">
+                    <div>
+                      <label for="emailTestRecipient">Test recipient</label>
+                      <input id="emailTestRecipient" name="emailTestRecipient" type="email" autocomplete="email" placeholder="recipient@example.com">
+                      <small>Save the SMTP settings first, then send a test message.</small>
+                    </div>
+                    <button id="testEmailButton" class="secondary-button" type="button">Send test email</button>
+                  </div>
+                  <div id="syslogPanel" class="syslog-panel hidden">
+                    <div class="syslog-panel__head">
+                      <div>
+                        <strong>Syslog status</strong>
+                        <span id="syslogStatusText">Loading…</span>
+                      </div>
+                      <div class="syslog-panel__actions">
+                        <button id="syslogSyncButton" class="secondary-button" type="button">Sync now</button>
+                        <button id="syslogExportButton" class="secondary-button" type="button">Create export</button>
+                        <a class="secondary-button" href="/api/admin/export/syslog.csv">Download CSV</a>
+                      </div>
+                    </div>
+                    <div id="syslogStats" class="syslog-stats"></div>
+                  </div>
+                  <div class="settings-footer">
+                    <p id="settingsRestartNotice" class="settings-restart hidden"></p>
+                    <button id="syslogVacuumButton" class="secondary-button hidden" type="button">Compact database</button>
+                    <button id="saveSettingsButton" class="primary-button" type="submit">Save settings</button>
+                  </div>
+                </form>
+              </article>
+              <div id="voucherManagementPanel" class="settings-voucher-panel hidden">
+                <div class="section-toolbar voucher-toolbar">
+                  <div class="search-box"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="voucherSearch" name="voucherSearch" placeholder="Search label, code suffix or ID"></div>
+                  <select id="voucherStatus" name="voucherStatus"><option value="">All vouchers</option><option value="active">Available</option><option value="used">Depleted</option><option value="expired">Expired</option><option value="disabled">Disabled</option></select>
+                  <button class="primary-button" data-open-voucher><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Create voucher</button>
+                </div>
+                <article class="panel-card table-card">
+                  <div class="table-title"><div><h3>Voucher inventory</h3><p id="voucherCount">— voucher</p></div></div>
+                  <div class="table-scroll">
+                    <table class="wide-table">
+                      <thead><tr><th>VOUCHER</th><th>LABEL</th><th>USAGE</th><th>ACCESS DURATION</th><th>VALIDITY</th><th>CREATED</th><th>STATUS</th><th></th></tr></thead>
+                      <tbody id="vouchersBody"></tbody>
+                    </table>
+                  </div>
+                </article>
+              </div>
+              <div id="adminApprovalManagementPanel" class="settings-voucher-panel hidden">
+                <div class="section-toolbar voucher-toolbar">
+                  <div class="search-box"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="adminApprovalSearch" name="adminApprovalSearch" placeholder="Search name, contact, IP or MAC"></div>
+                  <select id="adminApprovalStatus" name="adminApprovalStatus">
+                    <option value="">All requests</option>
+                    <option value="pending">Pending</option>
+                    <option value="approved">Approved</option>
+                    <option value="rejected">Rejected</option>
+                    <option value="expired">Expired</option>
+                    <option value="failed">Failed</option>
+                  </select>
+                </div>
+                <article class="panel-card table-card">
+                  <div class="table-title"><div><h3>Admin approval requests</h3><p id="adminApprovalCount">— requests</p></div></div>
+                  <div class="table-scroll">
+                    <table class="wide-table">
+                      <thead><tr><th>GUEST</th><th>CONTACT</th><th>CLIENT</th><th>REQUEST DATE</th><th>DECISION</th><th>STATUS</th><th></th></tr></thead>
+                      <tbody id="adminApprovalBody"></tbody>
+                    </table>
+                  </div>
+                </article>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div id="voucherModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="voucherModalTitle">
+    <div class="modal-backdrop" data-close-modal></div>
+    <div class="modal-card">
+      <div class="modal-head">
+        <div><p class="overline">VOUCHER GENERATOR</p><h2 id="voucherModalTitle">Create a new voucher</h2></div>
+        <button class="icon-button" data-close-modal aria-label="Close"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+      </div>
+      <form id="voucherForm">
+        <div class="form-grid">
+          <div class="full"><label for="voucherLabel">Label / group name</label><input id="voucherLabel" name="voucherLabel" placeholder="Example: Lobby Guests"></div>
+          <div><label for="voucherCountInput">Quantity</label><input id="voucherCountInput" name="voucherCountInput" type="number" min="1" max="500" value="10" required></div>
+          <div><label for="voucherUses">Usage limit</label><input id="voucherUses" name="voucherUses" type="number" min="1" max="1000" value="1" required></div>
+          <div><label for="voucherDuration">Access duration</label><select id="voucherDuration" name="voucherDuration"><option value="60">1 hour</option><option value="180">3 hours</option><option value="360">6 hours</option><option value="720" selected>12 hours</option><option value="1440">1 day</option><option value="4320">3 days</option><option value="10080">7 days</option></select></div>
+          <div><label for="voucherExpires">Expiration date</label><input id="voucherExpires" name="voucherExpires" type="datetime-local"></div>
+        </div>
+        <div class="info-strip"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg><span>Codes are shown in plain text only once for security.</span></div>
+        <div class="modal-actions"><button type="button" class="secondary-button" data-close-modal>Cancel</button><button class="primary-button" type="submit">Create vouchers</button></div>
+      </form>
+      <div id="voucherResult" class="voucher-result hidden">
+        <div class="success-symbol">✓</div>
+        <h3><span id="createdVoucherCount">0</span> vouchers ready</h3>
+        <p>Copy the codes now or download them as CSV.</p>
+        <textarea id="createdVoucherCodes" name="createdVoucherCodes" readonly></textarea>
+        <div class="modal-actions"><button id="downloadVouchers" class="secondary-button">Download CSV</button><button id="copyVouchers" class="primary-button">Copy all</button></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="adminApprovalDecisionModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="adminApprovalDecisionTitle">
+    <div class="modal-backdrop" data-close-decision-modal></div>
+    <div class="modal-card decision-modal-card">
+      <div class="modal-head">
+        <div>
+          <p id="adminApprovalDecisionEyebrow" class="overline">ADMIN APPROVAL</p>
+          <h2 id="adminApprovalDecisionTitle">Approval message</h2>
+        </div>
+        <button id="adminApprovalDecisionClose" class="icon-button" type="button" aria-label="Close" data-close-decision-modal>
+          <svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <form id="adminApprovalDecisionForm">
+        <label for="adminApprovalDecisionMessage">Message sent to guest</label>
+        <textarea id="adminApprovalDecisionMessage" name="adminApprovalDecisionMessage" rows="5"></textarea>
+        <div class="info-strip"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg><span>The message is saved with the request and sent by e-mail or SMS when the matching notification channel is active.</span></div>
+        <div class="modal-actions">
+          <button id="adminApprovalDecisionCancel" type="button" class="secondary-button" data-close-decision-modal>Cancel</button>
+          <button id="adminApprovalDecisionSubmit" class="primary-button" type="submit">Approve</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="actionConfirmModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="actionConfirmTitle">
+    <div class="modal-backdrop" data-close-action-confirm></div>
+    <div class="modal-card confirm-modal-card">
+      <div class="modal-head">
+        <div>
+          <p id="actionConfirmEyebrow" class="overline">SESSION ACTION</p>
+          <h2 id="actionConfirmTitle">Disconnect session</h2>
+        </div>
+        <button class="icon-button" type="button" aria-label="Close" data-close-action-confirm>
+          <svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="confirm-modal-body">
+        <p id="actionConfirmMessage">Disconnect this user from the internet?</p>
+        <div class="modal-actions">
+          <button id="actionConfirmCancel" type="button" class="secondary-button" data-close-action-confirm>Cancel</button>
+          <button id="actionConfirmSubmit" class="primary-button" type="button">Disconnect session</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="templatePlaceholderModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="templatePlaceholderTitle">
+    <div class="modal-backdrop" data-close-template-placeholders></div>
+    <div class="modal-card template-placeholder-modal-card">
+      <div class="modal-head">
+        <div>
+          <p id="templatePlaceholderEyebrow" class="overline">TEMPLATE VARIABLES</p>
+          <h2 id="templatePlaceholderTitle">Available placeholders</h2>
+        </div>
+        <button class="icon-button" type="button" aria-label="Close" data-close-template-placeholders>
+          <svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="template-placeholder-body">
+        <p id="templatePlaceholderIntro"></p>
+        <div id="templatePlaceholderExample" class="template-placeholder-example"></div>
+        <div id="templatePlaceholderList" class="template-placeholder-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="releaseModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="releaseModalTitle">
+    <div class="modal-backdrop" data-close-release-modal></div>
+    <div class="modal-card release-modal-card">
+      <div class="modal-head release-modal-head">
+        <div>
+          <p id="releaseModalEyebrow" class="overline">UPDATE AVAILABLE</p>
+          <h2 id="releaseModalTitle">G-Hotspot update available</h2>
+        </div>
+        <button class="icon-button" type="button" aria-label="Close" data-close-release-modal>
+          <svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="release-modal-body">
+        <div class="release-summary">
+          <div>
+            <span>Installed version</span>
+            <strong id="releaseCurrentVersion">—</strong>
+          </div>
+          <div>
+            <span>Latest release</span>
+            <strong id="releaseLatestVersion">—</strong>
+          </div>
+          <div>
+            <span>Published</span>
+            <strong id="releasePublishedAt">—</strong>
+          </div>
+        </div>
+        <div id="releaseNotes" class="markdown-content release-notes"></div>
+        <div class="modal-actions">
+          <button class="secondary-button" type="button" data-close-release-modal>Later</button>
+          <a id="releaseGithubLink" class="primary-button" href="https://github.com/G-grbz/G-Hotspot/releases" target="_blank" rel="noreferrer">
+            <svg viewBox="0 0 24 24"><path d="M7 17 17 7M8 7h9v9"/></svg>
+            GitHub release
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toastRegion" class="toast-region" aria-live="polite"></div>
+  <script src="/i18n.js?v=1.0.0"></script>
+  <script src="/admin/admin.js?v=1.0.0" defer></script>
+</body>
+</html>

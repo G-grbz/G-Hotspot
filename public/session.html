@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Active session · G-Hotspot</title>
+  <link rel="icon" href="/img/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/style.css?v=1.0.0">
+  <link rel="stylesheet" href="/portal-theme.css">
+</head>
+<body class="i18n-loading">
+  <main class="shell session-shell">
+    <section class="card session-card">
+      <div class="brand-row">
+        <div class="brand">
+          <div class="brand__mark">
+            <img id="brandLogo" class="brand-logo hidden" alt="">
+            <span class="brand-fallback">G</span>
+          </div>
+          <div>
+            <p id="networkLabel" class="eyebrow">GUEST NETWORK</p>
+            <h1 id="appName">G-Hotspot</h1>
+          </div>
+        </div>
+        <select id="languageSelect" class="language-select" aria-label="Language">
+          <option value="en">EN</option>
+          <option value="tr">TR</option>
+        </select>
+      </div>
+
+      <div class="session-hero">
+        <div id="sessionStatusIcon" class="session-status-icon">✓</div>
+        <div>
+          <h2 id="sessionStatusTitle">Internet access is active</h2>
+          <p id="remainingText">Loading session information…</p>
+        </div>
+      </div>
+
+      <div class="session-grid">
+        <div class="session-detail"><span>Local IP address</span><strong id="clientIp">—</strong></div>
+        <div class="session-detail"><span>MAC address</span><strong id="clientMac">—</strong><small id="deviceName"></small></div>
+        <div class="session-detail"><span>Verification method</span><strong id="method">—</strong><small id="identity"></small></div>
+        <div class="session-detail"><span>Gateway status</span><strong id="gatewayStatus">—</strong><small id="gatewayMode"></small></div>
+        <div class="session-detail"><span>Session started</span><strong id="startedAt">—</strong></div>
+        <div class="session-detail"><span>End time</span><strong id="expiresAt">—</strong><small id="duration"></small></div>
+        <div class="session-detail"><span>Downloaded</span><strong id="download">0 B</strong></div>
+        <div class="session-detail"><span>Uploaded</span><strong id="upload">0 B</strong></div>
+        <div id="quotaPeriodDetail" class="session-detail hidden"><span>Quota period</span><strong id="quotaPeriod">—</strong><small id="quotaPeriodReset"></small></div>
+        <div id="quotaDownloadDetail" class="session-detail hidden"><span>Download quota</span><strong id="quotaDownload">—</strong><small id="quotaDownloadRemaining"></small></div>
+        <div id="quotaUploadDetail" class="session-detail hidden"><span>Upload quota</span><strong id="quotaUpload">—</strong><small id="quotaUploadRemaining"></small></div>
+      </div>
+
+      <div id="notice" class="notice hidden" role="status" aria-live="polite"></div>
+      <div class="session-actions">
+        <a id="continueButton" class="button secondary" href="/">Continue browsing</a>
+        <button id="logoutButton" class="danger-button" type="button">Log out and disconnect</button>
+      </div>
+      <div class="session-terms">
+        <button id="sessionTermsButton" class="session-terms__button" data-terms-trigger type="button">Click for the terms of use you accepted.</button>
+      </div>
+    </section>
+  </main>
+  <div id="termsModal" class="terms-modal hidden" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="termsModalTitle">
+    <div class="terms-modal__backdrop" data-terms-close></div>
+    <section class="terms-modal__panel" tabindex="-1">
+      <header class="terms-modal__header">
+        <h2 id="termsModalTitle">Terms of Use</h2>
+        <button id="termsClose" class="terms-modal__close" type="button" aria-label="Close" data-terms-close>&times;</button>
+      </header>
+      <div id="termsModalContent" class="terms-modal__content"></div>
+    </section>
+  </div>
+  <script src="/i18n.js?v=1.0.0"></script>
+  <script src="/terms.js?v=1.0.0" defer></script>
+  <script src="/session.js?v=1.0.0" defer></script>
+</body>
+</html>

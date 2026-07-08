@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>G-Hotspot</title>
+  <link rel="icon" href="/img/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/style.css?v=1.0.0">
+  <link rel="stylesheet" href="/portal-theme.css">
+</head>
+<body class="i18n-loading">
+  <main class="shell">
+    <section class="card">
+      <div class="brand-row">
+        <div class="brand">
+          <div class="brand__mark">
+            <img id="brandLogo" class="brand-logo hidden" alt="">
+            <span class="brand-fallback">G</span>
+          </div>
+          <div>
+            <p id="networkLabel" class="eyebrow">GUEST NETWORK</p>
+            <h1 id="appName">G-Hotspot</h1>
+          </div>
+        </div>
+        <select id="languageSelect" class="language-select" aria-label="Language">
+          <option value="en">EN</option>
+          <option value="tr">TR</option>
+        </select>
+      </div>
+      <p id="verificationPrompt" class="lead">Choose a verification method to open internet access.</p>
+      <div id="clientInfo" class="client-info"></div>
+
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-tab="voucher" type="button">Voucher</button>
+        <button class="tab" data-tab="admin-approval" type="button">Admin approval</button>
+        <button class="tab" data-tab="email" type="button">Email</button>
+        <button class="tab" data-tab="nvi" type="button">T.C. Identity</button>
+        <button class="tab" data-tab="whatsapp" type="button">WhatsApp</button>
+        <button class="tab" data-tab="telegram" type="button">Telegram</button>
+        <button class="tab" data-tab="sms" type="button">SMS</button>
+      </div>
+
+      <section class="panel active" data-panel="voucher">
+        <form id="voucherForm">
+          <label for="voucherCode">Voucher code</label>
+          <input id="voucherCode" name="code" autocomplete="one-time-code" maxlength="14" autocapitalize="characters" spellcheck="false" placeholder="ABCD-EFGH-JKLM" required>
+          <button type="submit">Open internet access</button>
+        </form>
+      </section>
+
+      <section class="panel" data-panel="admin-approval">
+        <form id="adminApprovalForm">
+          <label for="adminApprovalFullName">First and last name</label>
+          <input id="adminApprovalFullName" name="fullName" autocomplete="name" placeholder="Name Surname" required>
+          <label for="adminApprovalContact">E-mail or phone number</label>
+          <div class="phone-entry phone-entry--contact">
+            <select id="adminApprovalCountryCode" class="phone-country-select" data-country-code-select aria-label="Country code"></select>
+            <input id="adminApprovalContact" name="contact" autocomplete="email tel" placeholder="name@example.com or 5xx xxx xx xx">
+          </div>
+          <button type="submit">Send approval request</button>
+        </form>
+        <div id="adminApprovalWaiting" class="approval-waiting hidden">
+          <p class="code-destination">Your request is waiting for administrator approval.</p>
+          <button id="adminApprovalCheck" class="button secondary" type="button">Check status</button>
+          <button id="adminApprovalNew" class="text-action" type="button">Create a new request</button>
+        </div>
+      </section>
+
+      <section class="panel" data-panel="email">
+        <form id="emailRequestForm">
+          <label for="email">Email address</label>
+          <input id="email" name="email" type="email" autocomplete="email" placeholder="name@example.com" required>
+          <button type="submit">Send verification code</button>
+        </form>
+        <form id="emailVerifyForm" class="hidden">
+          <label for="emailCode">6-digit code</label>
+          <input id="emailCode" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456" required>
+          <button type="submit">Verify code</button>
+        </form>
+      </section>
+
+      <section class="panel" data-panel="nvi">
+        <form id="nviForm">
+          <label for="nviTckn">T.C. identity number</label>
+          <input id="nviTckn" name="tckn" inputmode="numeric" autocomplete="off" maxlength="11" placeholder="12345678901" required>
+          <div class="nvi-identity-row">
+            <div class="nvi-field">
+              <label for="nviFirstName">First name</label>
+              <input id="nviFirstName" name="firstName" autocomplete="given-name" placeholder="Name" required>
+            </div>
+            <div class="nvi-field">
+              <label for="nviLastName">Last name</label>
+              <input id="nviLastName" name="lastName" autocomplete="family-name" placeholder="Surname" required>
+            </div>
+            <div class="nvi-field nvi-field--birth-year">
+              <label for="nviBirthYear">Birth year</label>
+              <input id="nviBirthYear" name="birthYear" inputmode="numeric" autocomplete="bday-year" maxlength="4" placeholder="1990" required>
+            </div>
+          </div>
+          <div id="nviPhoneGroup">
+            <label for="nviPhone">Mobile phone number</label>
+            <div class="phone-entry">
+              <select id="nviCountryCode" class="phone-country-select" data-country-code-select aria-label="Country code"></select>
+              <input id="nviPhone" name="phone" type="tel" autocomplete="tel" placeholder="5xx xxx xx xx">
+            </div>
+          </div>
+          <button id="nviSubmitButton" type="submit">Verify identity and connect</button>
+        </form>
+        <form id="nviVerifyForm" class="hidden">
+          <p id="nviDestination" class="code-destination"></p>
+          <label for="nviCode">6-digit SMS code</label>
+          <input id="nviCode" name="code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="6" placeholder="123456" required>
+          <button type="submit">Verify and connect</button>
+          <div class="inline-actions">
+            <button id="nviResend" class="text-action" type="button">Send again</button>
+            <button id="nviChangeIdentity" class="text-action" type="button">Change identity information</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel" data-panel="whatsapp">
+        <form id="whatsappForm">
+          <label for="phone">WhatsApp phone number</label>
+          <div class="phone-entry">
+            <select id="whatsappCountryCode" class="phone-country-select" data-country-code-select aria-label="Country code"></select>
+            <input id="phone" name="phone" type="tel" autocomplete="tel" placeholder="5xx xxx xx xx" required>
+          </div>
+          <button type="submit">Send WhatsApp code</button>
+        </form>
+        <form id="whatsappVerifyForm" class="hidden">
+          <p id="whatsappDestination" class="code-destination"></p>
+          <label for="whatsappCode">6-digit WhatsApp code</label>
+          <input id="whatsappCode" name="code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="6" placeholder="123456" required>
+          <button type="submit">Verify and connect</button>
+          <div class="inline-actions">
+            <button id="whatsappResend" class="text-action" type="button">Send again</button>
+            <button id="whatsappChangeNumber" class="text-action" type="button">Change number</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel" data-panel="sms">
+        <form id="smsForm">
+          <label for="smsPhone">Mobile phone number</label>
+          <div class="phone-entry">
+            <select id="smsCountryCode" class="phone-country-select" data-country-code-select aria-label="Country code"></select>
+            <input id="smsPhone" name="phone" type="tel" autocomplete="tel" placeholder="5xx xxx xx xx" required>
+          </div>
+          <button type="submit">Send SMS code</button>
+        </form>
+        <form id="smsVerifyForm" class="hidden">
+          <p id="smsDestination" class="code-destination"></p>
+          <label for="smsCode">6-digit SMS code</label>
+          <input id="smsCode" name="code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="6" placeholder="123456" required>
+          <button type="submit">Verify and connect</button>
+          <div class="inline-actions">
+            <button id="smsResend" class="text-action" type="button">Send again</button>
+            <button id="smsChangeNumber" class="text-action" type="button">Change number</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel" data-panel="telegram">
+        <form id="telegramForm">
+          <label for="telegramPhone">Telegram phone number</label>
+          <div class="phone-entry">
+            <select id="telegramCountryCode" class="phone-country-select" data-country-code-select aria-label="Country code"></select>
+            <input id="telegramPhone" name="phone" type="tel" autocomplete="tel" placeholder="5xx xxx xx xx" required>
+          </div>
+          <button type="submit">Start Telegram verification</button>
+        </form>
+        <form id="telegramVerifyForm" class="hidden">
+          <p id="telegramDestination" class="code-destination"></p>
+          <button id="telegramBotLink" class="button secondary" type="button">Copy Telegram command</button>
+          <div id="telegramManualStart" class="manual-start hidden">
+            <span id="telegramBotName" class="manual-start__bot"></span>
+            <span>Manual start command</span>
+            <div class="manual-start__row">
+              <code id="telegramStartCommand"></code>
+              <button id="telegramCopyStart" class="manual-copy" type="button">Copy</button>
+            </div>
+          </div>
+          <label for="telegramCode">6-digit Telegram code</label>
+          <input id="telegramCode" name="code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="6" placeholder="123456" required>
+          <button type="submit">Verify and connect</button>
+          <div class="inline-actions">
+            <button id="telegramResend" class="text-action" type="button">Send again</button>
+            <button id="telegramChangeNumber" class="text-action" type="button">Change number</button>
+          </div>
+        </form>
+      </section>
+
+      <div id="notice" class="notice hidden" role="status" aria-live="polite"></div>
+      <div id="termsButton" class="terms-button">By continuing, you accept the terms of use for this guest network.</div>
+      <div id="projectAttribution" class="project-attribution">Powered by G-Hotspot / Gökhan GÜRBÜZ (G-grbz) · AGPL-3.0-only</div>
+    </section>
+  </main>
+
+  <div id="termsModal" class="terms-modal hidden" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="termsModalTitle">
+    <div class="terms-modal__backdrop" data-terms-close></div>
+    <section class="terms-modal__panel" tabindex="-1">
+      <header class="terms-modal__header">
+        <h2 id="termsModalTitle">Terms of Use</h2>
+        <button id="termsClose" class="terms-modal__close" type="button" aria-label="Close" data-terms-close>&times;</button>
+      </header>
+      <div id="termsModalContent" class="terms-modal__content"></div>
+    </section>
+  </div>
+  <div id="countryCodeModal" class="country-modal hidden" role="dialog" aria-modal="false" aria-hidden="true" aria-labelledby="countryCodeModalTitle">
+    <section class="country-modal__panel" tabindex="-1">
+      <header class="country-modal__header">
+        <h2 id="countryCodeModalTitle">Select country code</h2>
+        <button id="countryCodeClose" class="country-modal__close" type="button" aria-label="Close" data-country-code-close>&times;</button>
+      </header>
+      <div class="country-modal__search">
+        <input id="countryCodeSearch" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Search country or code" aria-label="Search country or code">
+      </div>
+      <div id="countryCodeList" class="country-modal__list" role="listbox"></div>
+      <p id="countryCodeEmpty" class="country-modal__empty hidden">No country code found.</p>
+    </section>
+  </div>
+  <script src="/i18n.js?v=1.0.0"></script>
+  <script src="/terms.js?v=1.0.0" defer></script>
+  <script src="/app.js?v=1.0.0" defer></script>
+</body>
+</html>

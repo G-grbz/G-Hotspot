@@ -1,0 +1,18 @@
+G-Hotspot
+Copyright (C) 2026 Gökhan GÜRBÜZ and G-Hotspot contributors
+
+Original project attribution:
+
+- Project: G-Hotspot
+- Author / maintainer: Gökhan GÜRBÜZ
+- GitHub username: G-grbz
+- GitHub: https://github.com/G-grbz
+- License: GNU Affero General Public License v3.0 only (AGPL-3.0-only)
+
+This distribution includes software developed for G-Hotspot. If you
+modify, distribute, host, or provide network access to this software,
+preserve this notice and comply with the AGPL-3.0-only license in
+LICENSE.
+
+The web portal, administration panel, and /api/v1/about endpoint expose
+the project attribution and license information for operators and users.

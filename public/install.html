@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en" data-i18n-storage="gh_install_language">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>G-Hotspot Install</title>
+  <link rel="icon" href="/img/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/install.css">
+</head>
+<body class="i18n-loading">
+  <main class="install-shell">
+    <aside class="install-side">
+      <div class="brand-row">
+        <div class="brand-mark">G</div>
+        <div>
+          <strong>G-Hotspot</strong>
+          <span>Captive Portal</span>
+        </div>
+      </div>
+      <select id="installLanguage" class="language-select" aria-label="Language" data-i18n-language-select>
+        <option value="en">EN</option>
+        <option value="tr">TR</option>
+      </select>
+      <div class="install-side__body">
+        <p class="overline">SYSTEM INSTALL</p>
+        <h1>Initial setup</h1>
+        <h2 id="stepTitle">Application settings</h2>
+      </div>
+      <div class="install-meta">
+        <span>system.db</span>
+        <b>Required</b>
+      </div>
+    </aside>
+
+    <section class="install-panel">
+      <form id="installForm" class="install-form" novalidate>
+        <input type="hidden" name="DEFAULT_LANGUAGE" id="defaultLanguage" value="en">
+
+        <ol class="step-list" aria-label="Installation steps">
+          <li class="active" data-step-indicator="0"><span>1</span><strong>Application</strong></li>
+          <li data-step-indicator="1"><span>2</span><strong>Gateway</strong></li>
+          <li data-step-indicator="2"><span>3</span><strong>Verification</strong></li>
+        </ol>
+
+        <section class="wizard-step" data-step="0">
+          <fieldset>
+          <legend>Application</legend>
+          <label for="appName">Application name</label>
+          <input id="appName" name="APP_NAME" value="G-Hotspot" autocomplete="organization">
+
+          <label for="databasePath">Database path</label>
+          <input id="databasePath" name="DATABASE_PATH" value="./data/hotspot.db" spellcheck="false">
+          </fieldset>
+
+          <fieldset>
+          <legend>Administrator</legend>
+          <div class="field-grid">
+            <div>
+              <label for="adminUsername">Username</label>
+              <input id="adminUsername" name="ADMIN_USERNAME" value="admin" autocomplete="username" required>
+            </div>
+            <div>
+              <label for="adminPassword">Password</label>
+              <input id="adminPassword" name="ADMIN_PASSWORD" type="password" autocomplete="new-password" required>
+            </div>
+          </div>
+
+          <label for="adminSessionHours">Session lifetime (hours)</label>
+          <input id="adminSessionHours" name="ADMIN_SESSION_HOURS" type="number" min="1" max="168" value="12" required>
+
+          <label for="appSecret">Application secret</label>
+          <div class="secret-row">
+            <input id="appSecret" name="APP_SECRET" type="password" autocomplete="new-password" minlength="32" required>
+            <button id="generateSecretButton" class="secondary-button" type="button">Generate</button>
+          </div>
+          </fieldset>
+        </section>
+
+        <section class="wizard-step hidden" data-step="1">
+          <fieldset>
+          <legend>Gateway mode</legend>
+          <div class="mode-control">
+            <label>
+              <input type="radio" name="GATEWAY_MODE" value="mock" checked>
+              <span>Mock mode</span>
+            </label>
+            <label>
+              <input type="radio" name="GATEWAY_MODE" value="opnsense-api">
+              <span>OPNsense API</span>
+            </label>
+          </div>
+          </fieldset>
+
+          <fieldset id="opnsenseFields" class="hidden">
+          <legend>OPNsense API</legend>
+          <label for="opnsenseBaseUrl">Base URL</label>
+          <input id="opnsenseBaseUrl" name="OPNSENSE_BASE_URL" placeholder="https://192.168.1.1" inputmode="url" spellcheck="false">
+
+          <div class="field-grid">
+            <div>
+              <label for="opnsenseZoneId">Zone ID</label>
+              <input id="opnsenseZoneId" name="OPNSENSE_ZONE_ID" type="number" min="0" max="19" value="0">
+            </div>
+            <label class="checkbox-field" for="opnsenseTls">
+              <input id="opnsenseTls" name="OPNSENSE_TLS_REJECT_UNAUTHORIZED" type="checkbox" checked>
+              <span>Verify TLS certificate</span>
+            </label>
+          </div>
+
+          <div class="field-grid">
+            <div>
+              <label for="opnsenseApiKey">API key</label>
+              <input id="opnsenseApiKey" name="OPNSENSE_API_KEY" autocomplete="off" spellcheck="false">
+            </div>
+            <div>
+              <label for="opnsenseApiSecret">API secret</label>
+              <input id="opnsenseApiSecret" name="OPNSENSE_API_SECRET" type="password" autocomplete="new-password">
+            </div>
+          </div>
+            <div class="test-row">
+              <button id="testOpnsenseButton" class="secondary-button" type="button">Test connection</button>
+              <span id="opnsenseTestStatus" class="test-status"></span>
+            </div>
+          </fieldset>
+        </section>
+
+        <section class="wizard-step hidden" data-step="2">
+          <fieldset>
+            <legend>Captive Portal Zones</legend>
+            <label for="opnsenseZoneMap">Client network zone map</label>
+            <textarea id="opnsenseZoneMap" name="OPNSENSE_ZONE_MAP" placeholder="172.16.2.0/24=0&#10;172.16.3.0/24=1"></textarea>
+            <div id="opnsenseNetworkChoices" class="network-choices" aria-live="polite"></div>
+            <small>Optional. Match client networks to captive portal zone IDs; falls back to Zone ID.</small>
+          </fieldset>
+
+          <fieldset>
+            <legend>Verification methods</legend>
+            <div id="verificationMethods" class="method-list"></div>
+          </fieldset>
+        </section>
+
+        <div class="wizard-actions">
+          <button id="backButton" class="secondary-button hidden" type="button">Back</button>
+          <button id="skipFinishButton" class="secondary-button hidden" type="button">Skip and finish</button>
+          <button id="nextButton" class="primary-button" type="button">Next</button>
+          <button id="installButton" class="primary-button hidden" type="submit">Complete installation</button>
+        </div>
+        <div id="installNotice" class="notice hidden"></div>
+      </form>
+    </section>
+  </main>
+
+  <script src="/i18n.js"></script>
+  <script src="/install.js"></script>
+</body>
+</html>

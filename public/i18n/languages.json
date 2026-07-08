@@ -1,0 +1,16 @@
+[
+  {
+    "code": "en",
+    "label": "EN",
+    "name": "English",
+    "locale": "en-US",
+    "file": "/i18n/en.json"
+  },
+  {
+    "code": "tr",
+    "label": "TR",
+    "name": "Turkish",
+    "locale": "tr-TR",
+    "file": "/i18n/tr.json"
+  }
+]

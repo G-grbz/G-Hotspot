@@ -1,0 +1,19 @@
+[Unit]
+Description=G-Hotspot captive portal service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/USER/g-hotspot
+ExecStart=/usr/bin/node src/server.js
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/USER/g-hotspot/data
+
+[Install]
+WantedBy=default.target

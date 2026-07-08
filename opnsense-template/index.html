@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="refresh" content="3;url=http://172.16.2.2:8080/">
+  <title>Redirecting</title>
+</head>
+<body>
+<p>Redirecting to the guest network portal…</p>
+<p><a href="http://172.16.2.2:8080/">Continue to G-Hotspot</a></p>
+<script>
+  (function () {
+    var target = 'http://172.16.2.2:8080/';
+    var query = window.location.search || '';
+    var hash = window.location.hash || '';
+    window.location.replace(target + query + hash);
+  }());
+</script>
+<noscript><p>JavaScript is disabled. Use the link above to continue.</p></noscript>
+</body>
+</html>
