@@ -571,6 +571,120 @@ test('syslog export refuses retroactive timestamp when timestamping was disabled
   }
 });
 
+test('syslog export retries stale evidence-gap after inferring earlier timestamp state', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-stale-gap-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  let requestCount = 0;
+  const tsa = http.createServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    requestCount += 1;
+    response.writeHead(200, { 'content-type': 'application/timestamp-reply' });
+    response.end(Buffer.from('timestamp-token'));
+  });
+  await new Promise(resolve => tsa.listen(0, '127.0.0.1', resolve));
+  try {
+    const hour = 60 * 60 * 1000;
+    const previousStart = Date.UTC(2026, 6, 8, 8, 0, 0);
+    const targetStart = previousStart + hour;
+    const targetEnd = targetStart + hour;
+    const previousRecord = syslogRecordFromSession({
+      sessionId: 'session-stale-gap-previous',
+      clientIp: '192.168.10.54',
+      downloadBytes: 15,
+      uploadBytes: 7,
+      lastSeenAt: previousStart + 60000
+    }, {
+      id: 'auth-stale-gap-previous',
+      method: 'voucher',
+      identity: 'voucher-stale-gap-previous',
+      client_ip: '192.168.10.54',
+      created_at: previousStart + 30000
+    }, { enabled: true, networks: 'any' });
+    const targetRecord = syslogRecordFromSession({
+      sessionId: 'session-stale-gap-target',
+      clientIp: '192.168.10.55',
+      downloadBytes: 20,
+      uploadBytes: 8,
+      lastSeenAt: targetStart + 60000
+    }, {
+      id: 'auth-stale-gap-target',
+      method: 'voucher',
+      identity: 'voucher-stale-gap-target',
+      client_ip: '192.168.10.55',
+      created_at: targetStart + 30000
+    }, { enabled: true, networks: 'any' });
+    previousRecord.createdAt = previousStart + 60000;
+    targetRecord.createdAt = targetStart + 60000;
+    db.appendSyslogLogs([previousRecord, targetRecord]);
+    db.setLaw5651State('timestamp_enabled_since_at', String(previousStart), previousStart);
+
+    const config = {
+      appName: 'G-Hotspot',
+      syslog: {
+        exportDirectory: path.join(directory, 'exports'),
+        timeZone: 'UTC',
+        kamusmTimestampEnabled: true,
+        kamusmUser: 'user',
+        kamusmPassword: 'pass',
+        kamusmUrl: `http://127.0.0.1:${tsa.address().port}/tsa`,
+        kamusmTimeoutSeconds: 60
+      }
+    };
+    const previous = await createSyslogExportArchive({
+      db,
+      config,
+      exportReason: 'kamusm',
+      periodStartAt: previousStart,
+      periodEndAt: targetStart
+    });
+    assert.equal(previous.timestampStatus, 'created');
+    assert.equal(requestCount, 1);
+
+    db.setLaw5651State('timestamp_enabled_since_at', String(targetStart + 30 * 60 * 1000), targetStart);
+    db.createLaw5651Export({
+      exportReason: 'kamusm',
+      periodStartAt: targetStart,
+      periodEndAt: targetEnd,
+      filePath: path.join(directory, 'stale-gap.log'),
+      manifestPath: path.join(directory, 'stale-gap.log'),
+      timestampRequestPath: '',
+      timestampTokenPath: '',
+      timestampMode: 'kamusm-rfc3161',
+      signaturePath: '',
+      signatureMode: 'disabled',
+      recordCount: 1,
+      firstSequence: null,
+      lastSequence: null,
+      firstCreatedAt: targetStart + 60000,
+      lastCreatedAt: targetStart + 60000,
+      previousExportHash: '',
+      exportHash: 'stale-gap',
+      timestampStatus: 'evidence-gap',
+      timestampError: 'Timestamping was not continuously enabled for this syslog period.',
+      signatureStatus: 'disabled',
+      signatureError: ''
+    });
+
+    const retried = await createSyslogExportArchive({
+      db,
+      config,
+      exportReason: 'kamusm',
+      periodStartAt: targetStart,
+      periodEndAt: targetEnd
+    });
+
+    assert.equal(retried.reused, undefined);
+    assert.equal(retried.timestampStatus, 'created');
+    assert.equal(fs.existsSync(retried.timestampTokenPath), true);
+    assert.equal(requestCount, 2);
+    assert.equal(Number(db.getLaw5651State('timestamp_enabled_since_at').value), previousStart);
+  } finally {
+    await new Promise(resolve => tsa.close(resolve));
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('syslog export timestamps the daily log with a generic RFC3161 TSA URL', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-rfc3161-'));
   const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
@@ -1361,6 +1475,201 @@ test('syslog automatic exporter rate-limits timestamp catch-up to the selected i
     assert.equal(second[0].timestampStatus, 'created');
     assert.equal(requestCount, 2);
   } finally {
+    await new Promise(resolve => tsa.close(resolve));
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('syslog daily auto exporter does not inherit hourly timestamp cooldown after schedule change', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-auto-daily-after-hourly-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  let requestCount = 0;
+  const tsa = http.createServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    requestCount += 1;
+    response.writeHead(200, { 'content-type': 'application/timestamp-reply' });
+    response.end(Buffer.from('timestamp-token'));
+  });
+  await new Promise(resolve => tsa.listen(0, '127.0.0.1', resolve));
+  try {
+    const hour = 60 * 60 * 1000;
+    const day = 24 * hour;
+    const now = Date.now();
+    const nowDate = new Date(now);
+    const todayStart = Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth(), nowDate.getUTCDate());
+    const yesterdayStart = todayStart - day;
+    const hourlyStart = todayStart - 2 * hour;
+    const hourlyEnd = todayStart - hour;
+    const pendingDailyRecordAt = hourlyEnd + 30 * 60 * 1000;
+    const records = [
+      syslogRecordFromSession({
+        sessionId: 'session-auto-hourly-before-daily',
+        clientIp: '172.16.4.10',
+        downloadBytes: 1280,
+        uploadBytes: 0,
+        lastSeenAt: hourlyStart + 60 * 1000
+      }, {
+        id: 'auth-auto-hourly-before-daily',
+        method: 'voucher',
+        identity: 'voucher-auto-hourly-before-daily',
+        client_ip: '172.16.4.10',
+        created_at: hourlyStart
+      }, { enabled: true, networks: '172.16.4.0/24' }),
+      syslogRecordFromSession({
+        sessionId: 'session-auto-daily-after-hourly',
+        clientIp: '172.16.4.11',
+        downloadBytes: 2560,
+        uploadBytes: 128,
+        lastSeenAt: pendingDailyRecordAt
+      }, {
+        id: 'auth-auto-daily-after-hourly',
+        method: 'voucher',
+        identity: 'voucher-auto-daily-after-hourly',
+        client_ip: '172.16.4.11',
+        created_at: pendingDailyRecordAt
+      }, { enabled: true, networks: '172.16.4.0/24' })
+    ];
+    records[0].createdAt = hourlyStart + 60 * 1000;
+    records[1].createdAt = pendingDailyRecordAt;
+    db.appendSyslogLogs(records);
+    db.setLaw5651State('timestamp_enabled_since_at', String(yesterdayStart), yesterdayStart);
+
+    const timestampConfig = {
+      appName: 'G-Hotspot',
+      syslog: {
+        enabled: true,
+        timeZone: 'UTC',
+        exportDirectory: path.join(directory, 'exports'),
+        kamusmTimestampEnabled: true,
+        kamusmUser: 'user',
+        kamusmPassword: 'pass',
+        kamusmUrl: `http://127.0.0.1:${tsa.address().port}/tsa`,
+        kamusmTimeoutSeconds: 60,
+        autoExportEnabled: true,
+        autoExportInterval: '1h',
+        autoExportIntervalMinutes: 60
+      }
+    };
+    const hourly = await createSyslogExportArchive({
+      db,
+      config: timestampConfig,
+      exportReason: 'kamusm',
+      periodStartAt: hourlyStart,
+      periodEndAt: hourlyEnd
+    });
+    assert.equal(hourly.timestampStatus, 'created');
+    assert.equal(requestCount, 1);
+
+    timestampConfig.syslog.autoExportInterval = 'daily';
+    timestampConfig.syslog.autoExportIntervalMinutes = 1440;
+    const exporter = createSyslogAutoExporter({ db, config: timestampConfig, logger: { warn() {} } });
+    assert.equal(exporter.status().timestampRateLimited, false);
+    const results = await exporter.runDueExports(Math.max(Date.now() + 1000, todayStart + 60 * 1000));
+    assert.equal(results.length, 1);
+    assert.equal(results[0].exportReason, 'kamusm');
+    assert.equal(results[0].periodStartAt, hourlyEnd);
+    assert.equal(results[0].periodEndAt, todayStart);
+    assert.equal(results[0].timestampStatus, 'created');
+    assert.equal(requestCount, 2);
+  } finally {
+    await new Promise(resolve => tsa.close(resolve));
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('syslog daily auto exporter stamps a newly closed day after delayed catch-up', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-auto-daily-delayed-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  const originalNow = Date.now;
+  let requestCount = 0;
+  const tsa = http.createServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    requestCount += 1;
+    response.writeHead(200, { 'content-type': 'application/timestamp-reply' });
+    response.end(Buffer.from('timestamp-token'));
+  });
+  await new Promise(resolve => tsa.listen(0, '127.0.0.1', resolve));
+  try {
+    const hour = 60 * 60 * 1000;
+    const day = 24 * hour;
+    const now = originalNow();
+    const nowDate = new Date(now);
+    const todayStart = Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth(), nowDate.getUTCDate());
+    const yesterdayStart = todayStart - day;
+    const tomorrowStart = todayStart + day;
+    const delayedCatchUpAt = todayStart + 12 * hour;
+    const records = [
+      syslogRecordFromSession({
+        sessionId: 'session-auto-daily-delayed-previous',
+        clientIp: '172.16.5.10',
+        downloadBytes: 1000,
+        uploadBytes: 100,
+        lastSeenAt: yesterdayStart + hour
+      }, {
+        id: 'auth-auto-daily-delayed-previous',
+        method: 'voucher',
+        identity: 'voucher-auto-daily-delayed-previous',
+        client_ip: '172.16.5.10',
+        created_at: yesterdayStart + hour
+      }, { enabled: true, networks: '172.16.5.0/24' }),
+      syslogRecordFromSession({
+        sessionId: 'session-auto-daily-delayed-current',
+        clientIp: '172.16.5.11',
+        downloadBytes: 2000,
+        uploadBytes: 200,
+        lastSeenAt: todayStart + hour
+      }, {
+        id: 'auth-auto-daily-delayed-current',
+        method: 'voucher',
+        identity: 'voucher-auto-daily-delayed-current',
+        client_ip: '172.16.5.11',
+        created_at: todayStart + hour
+      }, { enabled: true, networks: '172.16.5.0/24' })
+    ];
+    records[0].createdAt = yesterdayStart + hour;
+    records[1].createdAt = todayStart + hour;
+    db.appendSyslogLogs(records);
+    db.setLaw5651State('timestamp_enabled_since_at', String(yesterdayStart - hour), yesterdayStart - hour);
+
+    const config = {
+      appName: 'G-Hotspot',
+      syslog: {
+        enabled: true,
+        timeZone: 'UTC',
+        exportDirectory: path.join(directory, 'exports'),
+        kamusmTimestampEnabled: true,
+        kamusmUser: 'user',
+        kamusmPassword: 'pass',
+        kamusmUrl: `http://127.0.0.1:${tsa.address().port}/tsa`,
+        kamusmTimeoutSeconds: 60,
+        autoExportEnabled: true,
+        autoExportInterval: 'daily',
+        autoExportIntervalMinutes: 1440
+      }
+    };
+    Date.now = () => delayedCatchUpAt;
+    const catchUp = await createSyslogExportArchive({
+      db,
+      config,
+      exportReason: 'kamusm',
+      periodStartAt: yesterdayStart,
+      periodEndAt: todayStart
+    });
+    Date.now = originalNow;
+    assert.equal(catchUp.timestampStatus, 'created');
+    assert.equal(requestCount, 1);
+
+    const exporter = createSyslogAutoExporter({ db, config, logger: { warn() {} } });
+    const results = await exporter.runDueExports(tomorrowStart + 60 * 1000);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].periodStartAt, todayStart);
+    assert.equal(results[0].periodEndAt, tomorrowStart);
+    assert.equal(results[0].timestampStatus, 'created');
+    assert.equal(requestCount, 2);
+  } finally {
+    Date.now = originalNow;
     await new Promise(resolve => tsa.close(resolve));
     db.close();
     fs.rmSync(directory, { recursive: true, force: true });

@@ -484,14 +484,18 @@ function automaticExportTime(row) {
 }
 
 function latestAutomaticExport(db, lawConfig = null) {
-  const rows = typeof db.listLaw5651Exports === 'function'
-    ? db.listLaw5651Exports({ reasons: AUTO_EXPORT_REASONS, limit: 1000 })
-    : AUTO_EXPORT_REASONS.map(reason => db.latestLaw5651Export({ reason })).filter(Boolean);
+  const rows = automaticExportRows(db);
   const filtered = lawConfig
     ? rows.filter(row => automaticExportSatisfied(db, row, lawConfig))
     : rows;
   filtered.sort((left, right) => automaticExportTime(right) - automaticExportTime(left));
   return filtered[0] || null;
+}
+
+function automaticExportRows(db) {
+  return typeof db.listLaw5651Exports === 'function'
+    ? db.listLaw5651Exports({ reasons: AUTO_EXPORT_REASONS, limit: 1000 })
+    : AUTO_EXPORT_REASONS.map(reason => db.latestLaw5651Export({ reason })).filter(Boolean);
 }
 
 function findAutomaticExportByPeriod(db, periodStartAt, periodEndAt) {
@@ -505,6 +509,15 @@ function timestampAttempted(row = {}) {
   if (TIMESTAMP_PROVIDER_ATTEMPT_STATUSES.has(status)) return true;
   const mode = String(row.timestamp_mode || row.timestampMode || '').trim().toLowerCase();
   return Boolean(!status && mode && mode !== 'disabled');
+}
+
+function timestampAttemptMatchesInterval(row = {}, interval = null, timeZone = 'UTC') {
+  if (!interval) return true;
+  const periodStart = Math.trunc(Number(row.period_start_at ?? row.periodStartAt));
+  const periodEnd = Math.trunc(Number(row.period_end_at ?? row.periodEndAt));
+  if (!Number.isFinite(periodStart) || !Number.isFinite(periodEnd) || periodEnd <= periodStart) return true;
+  if (interval.daily) return isLocalDailyWindow(periodStart, periodEnd, timeZone);
+  return periodEnd - periodStart === interval.intervalMs;
 }
 
 function timestampRuntimeMode(lawConfig = {}) {
@@ -559,9 +572,24 @@ function storeTimestampDisabledIntervals(db, intervals, now = Date.now()) {
 }
 
 function inferTimestampEnabledSince(db, now = Date.now()) {
-  const latest = latestAutomaticTimestampAttempt(db, now);
-  const createdAt = Math.trunc(Number(latest?.created_at) || 0);
-  return createdAt > 0 ? createdAt : Math.trunc(Number(now) || Date.now());
+  const current = Math.trunc(Number(now) || Date.now());
+  const futureTolerance = current + AUTO_EXPORT_GRACE_MS;
+  const rows = automaticExportRows(db)
+    .filter(timestampAttempted)
+    .filter(row => {
+      const createdAt = Math.trunc(Number(row.created_at) || 0);
+      return createdAt > 0 && createdAt <= futureTolerance;
+    })
+    .sort((left, right) => {
+      const leftStart = Number(left.period_start_at ?? left.created_at ?? 0);
+      const rightStart = Number(right.period_start_at ?? right.created_at ?? 0);
+      return leftStart - rightStart;
+    });
+  const first = rows[0];
+  const periodStart = Math.trunc(Number(first?.period_start_at) || 0);
+  if (periodStart > 0) return periodStart;
+  const createdAt = Math.trunc(Number(first?.created_at) || 0);
+  return createdAt > 0 ? createdAt : current;
 }
 
 function observeTimestampModeState(db, lawConfig = {}, now = Date.now()) {
@@ -579,8 +607,10 @@ function observeTimestampModeState(db, lawConfig = {}, now = Date.now()) {
       return;
     }
     const enabledSince = Math.trunc(Number(law5651StateValue(db, TIMESTAMP_ENABLED_SINCE_STATE)) || 0);
-    if (!enabledSince) {
-      setLaw5651StateValue(db, TIMESTAMP_ENABLED_SINCE_STATE, String(inferTimestampEnabledSince(db, current)), current);
+    const intervals = timestampDisabledIntervals(db);
+    const inferredSince = inferTimestampEnabledSince(db, current);
+    if (!enabledSince || (!intervals.length && inferredSince > 0 && inferredSince < enabledSince)) {
+      setLaw5651StateValue(db, TIMESTAMP_ENABLED_SINCE_STATE, String(inferredSince), current);
     }
     return;
   }
@@ -628,14 +658,13 @@ function evidenceGapTimestamp(lawConfig = {}, gap = {}) {
   };
 }
 
-function latestAutomaticTimestampAttempt(db, now = Date.now()) {
-  const rows = typeof db.listLaw5651Exports === 'function'
-    ? db.listLaw5651Exports({ reasons: AUTO_EXPORT_REASONS, limit: 1000 })
-    : AUTO_EXPORT_REASONS.map(reason => db.latestLaw5651Export({ reason })).filter(Boolean);
+function latestAutomaticTimestampAttempt(db, now = Date.now(), { interval = null, timeZone = 'UTC' } = {}) {
+  const rows = automaticExportRows(db);
   const current = Math.trunc(Number(now) || Date.now());
   const futureTolerance = current + AUTO_EXPORT_GRACE_MS;
   return rows
     .filter(timestampAttempted)
+    .filter(row => timestampAttemptMatchesInterval(row, interval, timeZone))
     .filter(row => {
       const createdAt = Math.trunc(Number(row.created_at) || 0);
       return createdAt > 0 && createdAt <= futureTolerance;
@@ -643,24 +672,45 @@ function latestAutomaticTimestampAttempt(db, now = Date.now()) {
     .sort((left, right) => Number(right.created_at || 0) - Number(left.created_at || 0))[0] || null;
 }
 
-function latestAutomaticTimestampAttemptAt(db, state = {}, now = Date.now()) {
-  const stateAttemptAt = Math.trunc(Number(state.lastTimestampAttemptAt) || 0);
-  const persistedAttemptAt = Math.trunc(Number(latestAutomaticTimestampAttempt(db, now)?.created_at) || 0);
+function latestAutomaticTimestampAttemptAt(db, state = {}, now = Date.now(), options = {}) {
+  const schedule = options.interval?.schedule || '';
+  const stateSchedule = String(state.lastTimestampAttemptSchedule || '');
+  const stateAttemptAt = !schedule || !stateSchedule || stateSchedule === schedule
+    ? Math.trunc(Number(state.lastTimestampAttemptAt) || 0)
+    : 0;
+  const persistedAttemptAt = Math.trunc(Number(latestAutomaticTimestampAttempt(db, now, options)?.created_at) || 0);
   return Math.max(stateAttemptAt, persistedAttemptAt);
 }
 
-function nextAutomaticTimestampAllowedAt(db, state, intervalMs, now = Date.now()) {
-  const lastAttemptAt = latestAutomaticTimestampAttemptAt(db, state, now);
-  return lastAttemptAt > 0 ? lastAttemptAt + intervalMs : null;
+function nextAutomaticTimestampAllowedAt(
+  db,
+  state,
+  interval,
+  now = Date.now(),
+  timeZone = 'UTC',
+  { periodEndAt = null } = {}
+) {
+  const lastAttemptAt = latestAutomaticTimestampAttemptAt(db, state, now, { interval, timeZone });
+  const periodEnd = Math.trunc(Number(periodEndAt));
+  if (Number.isFinite(periodEnd) && periodEnd > lastAttemptAt) return null;
+  return lastAttemptAt > 0 ? lastAttemptAt + interval.intervalMs : null;
 }
 
 function automaticExportSatisfied(db, existing, lawConfig = {}) {
   if (!existing) return false;
-  if (
-    timestampEnabled(lawConfig) &&
-    !['created', TIMESTAMP_EVIDENCE_GAP_STATUS].includes(existing.timestamp_status)
-  ) {
-    return false;
+  if (timestampEnabled(lawConfig)) {
+    const timestampStatus = String(existing.timestamp_status || '').trim().toLowerCase();
+    if (timestampStatus === TIMESTAMP_EVIDENCE_GAP_STATUS) {
+      const gap = timestampEvidenceGap(
+        db,
+        lawConfig,
+        existing.period_start_at,
+        existing.period_end_at
+      );
+      if (!gap) return false;
+    } else if (timestampStatus !== 'created') {
+      return false;
+    }
   }
   if (existing.period_start_at != null && existing.period_end_at != null) {
     const total = db.listLaw5651Logs({
@@ -1779,6 +1829,7 @@ export function createLaw5651AutoExporter({ db, config, logger = console, notifi
     lastExportAt: null,
     lastExportId: '',
     lastTimestampAttemptAt: null,
+    lastTimestampAttemptSchedule: '',
     nextTimestampAllowedAt: null,
     timestampRateLimited: false,
     lastError: '',
@@ -1798,7 +1849,7 @@ export function createLaw5651AutoExporter({ db, config, logger = console, notifi
       ? nextDailyExportRunAt(now, timeZone)
       : nextIntervalExportRunAt(db, now, interval.intervalMs, lawConfig);
     const timestampNextRunAt = timestampEnabled(lawConfig)
-      ? nextAutomaticTimestampAllowedAt(db, state, interval.intervalMs, now)
+      ? nextAutomaticTimestampAllowedAt(db, state, interval, now, timeZone)
       : null;
     state.enabled = Boolean(lawConfig.enabled && lawConfig.autoExportEnabled !== false);
     state.intervalMinutes = interval.intervalMinutes;
@@ -1842,17 +1893,9 @@ export function createLaw5651AutoExporter({ db, config, logger = console, notifi
         return [];
       }
       state.waitingForGateway = false;
-      if (timestampEnabled(lawConfig)) {
-        const timestampAllowedAt = nextAutomaticTimestampAllowedAt(db, state, interval.intervalMs, current);
-        state.nextTimestampAllowedAt = timestampAllowedAt;
-        state.timestampRateLimited = Boolean(timestampAllowedAt && current < timestampAllowedAt);
-        if (state.timestampRateLimited) {
-          state.lastError = '';
-          refreshState(current);
-          return [];
-        }
-      } else {
+      if (!timestampEnabled(lawConfig)) {
         state.lastTimestampAttemptAt = null;
+        state.lastTimestampAttemptSchedule = '';
         state.nextTimestampAllowedAt = null;
         state.timestampRateLimited = false;
       }
@@ -1876,6 +1919,18 @@ export function createLaw5651AutoExporter({ db, config, logger = console, notifi
           ? addLocalDays(periodStart, 1, timeZone)
           : periodStart + interval.intervalMs;
         if (periodEnd > closedEnd) break;
+        if (timestampEnabled(lawConfig)) {
+          const timestampAllowedAt = nextAutomaticTimestampAllowedAt(db, state, interval, current, timeZone, {
+            periodEndAt: periodEnd
+          });
+          state.nextTimestampAllowedAt = timestampAllowedAt;
+          state.timestampRateLimited = Boolean(timestampAllowedAt && current < timestampAllowedAt);
+          if (state.timestampRateLimited) {
+            state.lastError = '';
+            refreshState(current);
+            return exports;
+          }
+        }
         const result = await exportWindow(periodStart, periodEnd, lawConfig);
         if (result) {
           exports.push(result);
@@ -1884,6 +1939,7 @@ export function createLaw5651AutoExporter({ db, config, logger = console, notifi
           state.exportedWindows += 1;
           if (timestampEnabled(lawConfig) && timestampAttempted(result)) {
             state.lastTimestampAttemptAt = current;
+            state.lastTimestampAttemptSchedule = interval.schedule;
             state.nextTimestampAllowedAt = current + interval.intervalMs;
             timestampAttemptedThisRun = true;
           }
