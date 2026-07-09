@@ -3173,6 +3173,13 @@ function portalPreviewNumber(key, fallback, min = 0, max = 100) {
   return Math.min(max, Math.max(min, value));
 }
 
+function portalPreviewBoolean(key, fallback = false) {
+  const value = portalPreviewRawValue(key);
+  if (typeof value === 'boolean') return value;
+  if (value === undefined || value === null || value === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+}
+
 function portalPreviewRgba(colorKey, opacityKey, colorFallback, opacityFallback) {
   const hex = portalPreviewColor(colorKey, colorFallback).slice(1);
   const opacity = portalPreviewNumber(opacityKey, opacityFallback, 0, 100) / 100;
@@ -3206,6 +3213,12 @@ function updatePortalPreview() {
   stage.style.setProperty('--preview-body-image', portalPreviewAsset('body-background'));
   stage.style.setProperty('--preview-body-image-opacity', String(portalPreviewNumber('PORTAL_BODY_IMAGE_OPACITY', 100) / 100));
   stage.style.setProperty('--preview-body-image-blur', `${portalPreviewNumber('PORTAL_BODY_IMAGE_BLUR', 0, 0, 40)}px`);
+  stage.style.setProperty(
+    '--preview-body-image-animation',
+    portalPreviewBoolean('PORTAL_BODY_IMAGE_ANIMATION_ENABLED')
+      ? 'portal-preview-backdrop-cinematic 24s ease-in-out infinite alternate'
+      : 'none'
+  );
   stage.style.setProperty('--preview-card-color', portalPreviewColor('PORTAL_CARD_BACKGROUND_COLOR', '#FFFFFF'));
   stage.style.setProperty('--preview-card-color-opacity', String(portalPreviewNumber('PORTAL_CARD_BACKGROUND_OPACITY', 100) / 100));
   stage.style.setProperty('--preview-card-border', [
@@ -3263,6 +3276,7 @@ function bindPortalPreviewInputs() {
     'PORTAL_BODY_BACKGROUND_OPACITY',
     'PORTAL_BODY_IMAGE_OPACITY',
     'PORTAL_BODY_IMAGE_BLUR',
+    'PORTAL_BODY_IMAGE_ANIMATION_ENABLED',
     'PORTAL_CARD_BACKGROUND_COLOR',
     'PORTAL_CARD_BACKGROUND_OPACITY',
     'PORTAL_CARD_BORDER_WIDTH',

@@ -202,6 +202,7 @@ test('settings mask secrets and persist runtime-safe changes', () => {
     );
     assert.equal(before.values.PORTAL_PRIMARY_COLOR, '#5340CC');
     assert.equal(before.values.PORTAL_CARD_IMAGE_OPACITY, '100');
+    assert.equal(before.values.PORTAL_BODY_IMAGE_ANIMATION_ENABLED, 'false');
     assert.equal(
       before.values.PORTAL_TERMS_TEXT,
       'By continuing, you accept the terms of use for this guest network.'
@@ -221,6 +222,7 @@ test('settings mask secrets and persist runtime-safe changes', () => {
       PORTAL_TERMS_MARKDOWN: '## Kullanım Koşulları\n\n- Ağ kurallarına uyun.',
       PORTAL_POLICY_MARKDOWN: '## Güvenli İnternet Politikası\n\n- Güvenli kullanım kurallarına uyun.',
       PORTAL_PRIVACY_MARKDOWN: '## Kişisel Veri Aydınlatma Metni\n\n- Kişisel veri işleme amaçlarını okuyun.',
+      PORTAL_BODY_IMAGE_ANIMATION_ENABLED: true,
       WHATSAPP_ACCESS_TOKEN: ''
     }, envPath);
     assert.equal(result.restartRequired, false);
@@ -228,6 +230,7 @@ test('settings mask secrets and persist runtime-safe changes', () => {
     assert.match(content, /^APP_NAME=After$/mu);
     assert.match(content, /^DEFAULT_LANGUAGE=tr$/mu);
     assert.match(content, /^ALLOWED_COUNTRY_CODES="90\\n33\\n1"$/mu);
+    assert.match(content, /^PORTAL_BODY_IMAGE_ANIMATION_ENABLED=true$/mu);
     assert.equal(
       getSettings(envPath).values.PORTAL_TITLE_TEXT,
       'Otel WiFi Girişi'
@@ -256,6 +259,7 @@ test('settings mask secrets and persist runtime-safe changes', () => {
       getSettings(envPath).values.PORTAL_PRIVACY_MARKDOWN,
       '## Kişisel Veri Aydınlatma Metni\n\n- Kişisel veri işleme amaçlarını okuyun.'
     );
+    assert.equal(getSettings(envPath).values.PORTAL_BODY_IMAGE_ANIMATION_ENABLED, 'true');
     saveSettings({
       PORTAL_TITLE_TEXT: '',
       PORTAL_NETWORK_LABEL_TEXT: '',

@@ -434,6 +434,8 @@
   "Body color opacity": "Body color opacity",
   "Body image opacity": "Body image opacity",
   "Body image blur": "Body image blur",
+  "Cinematic backdrop motion": "Cinematic backdrop motion",
+  "Animates only the full-screen verification backdrop image; the card background remains static.": "Animates only the full-screen verification backdrop image; the card background remains static.",
   "Card appearance": "Card appearance",
   "Card background color": "Card background color",
   "Card color opacity": "Card color opacity",

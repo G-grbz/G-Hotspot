@@ -38,6 +38,7 @@ test('appearance assets accept supported images and generate CSP-safe theme CSS'
       bodyBackgroundOpacity: 80,
       bodyImageOpacity: 70,
       bodyImageBlur: 4,
+      bodyImageAnimationEnabled: true,
       cardBackgroundColor: '#FFFFFF',
       cardBackgroundOpacity: 90,
       cardImageOpacity: 60,
@@ -57,6 +58,7 @@ test('appearance assets accept supported images and generate CSP-safe theme CSS'
     const css = portalThemeCss(config);
     assert.match(css, /--portal-primary: #112233/u);
     assert.match(css, /--portal-card-backdrop-blur: 8px/u);
+    assert.match(css, /--portal-body-image-animation: portal-backdrop-cinematic 34s ease-in-out infinite alternate/u);
     assert.match(css, /url\("\/api\/v1\/appearance\/assets\/body-background\?v=/u);
 
     deleteAppearanceAsset(config, 'logo');

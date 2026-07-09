@@ -419,6 +419,8 @@
   "Body color opacity": "Sayfa Arka Plan Renk Opaklığı",
   "Body image opacity": "Sayfa Arka Plan Görsel Opaklığı",
   "Body image blur": "Sayfa Arka Plan Görsel Bulanıklığı",
+  "Cinematic backdrop motion": "Sinematik Arka Plan Hareketi",
+  "Animates only the full-screen verification backdrop image; the card background remains static.": "Yalnızca doğrulama ekranındaki tam ekran arka plan görselini hareketlendirir; kart arka planı sabit kalır.",
   "Card appearance": "Kart Görünümü",
   "Card background color": "Kart Arka Plan Rengi",
   "Card color opacity": "Kart Renk Opaklığı",

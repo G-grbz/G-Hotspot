@@ -271,6 +271,7 @@ export function portalThemeCss(config) {
   --portal-body-image: ${cssUrl(assets['body-background'].url)};
   --portal-body-image-opacity: ${theme.bodyImageOpacity / 100};
   --portal-body-image-blur: ${theme.bodyImageBlur}px;
+  --portal-body-image-animation: ${theme.bodyImageAnimationEnabled ? 'portal-backdrop-cinematic 34s ease-in-out infinite alternate' : 'none'};
   --portal-card-color: ${theme.cardBackgroundColor};
   --portal-card-color-opacity: ${theme.cardBackgroundOpacity / 100};
   --portal-card-border: ${cardBorder};

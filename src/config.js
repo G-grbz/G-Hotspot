@@ -382,6 +382,7 @@ function buildConfig() {
       bodyBackgroundOpacity: envInteger('PORTAL_BODY_BACKGROUND_OPACITY', 100, { min: 0, max: 100 }),
       bodyImageOpacity: envInteger('PORTAL_BODY_IMAGE_OPACITY', 100, { min: 0, max: 100 }),
       bodyImageBlur: envInteger('PORTAL_BODY_IMAGE_BLUR', 0, { min: 0, max: 40 }),
+      bodyImageAnimationEnabled: envBoolean('PORTAL_BODY_IMAGE_ANIMATION_ENABLED', false),
       cardBackgroundColor: envColor('PORTAL_CARD_BACKGROUND_COLOR', '#FFFFFF'),
       cardBackgroundOpacity: envInteger('PORTAL_CARD_BACKGROUND_OPACITY', 100, { min: 0, max: 100 }),
       cardBorderWidth: envInteger('PORTAL_CARD_BORDER_WIDTH', 1, { min: 0, max: 20 }),

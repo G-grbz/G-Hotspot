@@ -241,6 +241,11 @@ export const settingsSchema = [
       field('PORTAL_BODY_IMAGE_BLUR', 'Body image blur', {
         type: 'range', min: 0, max: 40, defaultValue: '0', suffix: 'px'
       }),
+      field('PORTAL_BODY_IMAGE_ANIMATION_ENABLED', 'Cinematic backdrop motion', {
+        type: 'boolean',
+        defaultValue: 'false',
+        warning: 'Animates only the full-screen verification backdrop image; the card background remains static.'
+      }),
       field('PORTAL_CARD_BACKGROUND_COLOR', 'Card background color', {
         type: 'color', defaultValue: '#FFFFFF', section: 'Card appearance'
       }),
