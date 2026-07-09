@@ -112,9 +112,13 @@ username `G-grbz`, https://github.com/G-grbz. The portal, administration
 panel and `/api/v1/about` endpoint expose the project attribution for
 operators and users.
 
-## Türkçe Kısa Kurulum
+## Türkçe Hızlı Kurulum
 
 ```bash
+git clone https://github.com/G-grbz/G-Hotspot.git
+
+cd G-Hotspot
+
 npm start
 ```
 
