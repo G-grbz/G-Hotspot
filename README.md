@@ -20,8 +20,8 @@ Türkçe: G-Hotspot, OPNsense captive portal için hazırlanmış hafif bir Node
 
 ## Documentation
 
-* [Türkçe ayrıntılı dokümantasyon](docs/README.tr.md)
 * [English detailed documentation](docs/README.en.md)
+* [Türkçe ayrıntılı dokümantasyon](docs/README.tr.md)
 * [Docs index](docs/README.md)
 
 ## Current Status
@@ -33,13 +33,17 @@ Türkçe: G-Hotspot, OPNsense captive portal için hazırlanmış hafif bir Node
 * Default gateway mode: `mock`
 * Production gateway mode: `opnsense-api`
 
-Important validation note:
+## Important Validation Note
 
-* 5651/syslog logging and the KamuSM RFC3161 timestamp flow have been live-tested with a real KamuSM account. Generic RFC3161 and API-key TSA providers commonly used for US/EU deployments, T.C. identity verification through NVİ KPSv2 and WhatsApp Cloud API delivery are implemented and covered by local tests/mocks where applicable, but they have not been live-tested against real external production services in this repository state. Validate these flows in your own OPNsense, Kea DHCP, KamuSM or selected TSA provider, NVİ and Meta environments before using them for production or legal evidence processes. Before relying on the 5651/syslog output, generate a sample evidence package (`.log`, `.log.tsq`, `.log.tsr`) and have it reviewed by the legal, privacy, security and evidence-retention teams or advisors responsible for your jurisdiction and organization.
+5651/syslog logging and the KamuSM RFC3161 timestamp flow have been live-tested with a real KamuSM account. Generic RFC3161 and API-key TSA providers commonly used for US/EU deployments, T.C. identity verification through NVİ KPSv2 and WhatsApp Cloud API delivery are implemented and covered by local tests/mocks where applicable, but they have not been live-tested against real external production services in this repository state.
 
-Önemli doğrulama notu:
+Validate these flows in your own OPNsense, Kea DHCP, KamuSM or selected TSA provider, NVİ and Meta environments before using them for production or legal evidence processes. Before relying on the 5651/syslog output, generate a sample evidence package (`.log`, `.log.tsq`, `.log.tsr`) and have it reviewed by the legal, privacy, security and evidence-retention teams or advisors responsible for your jurisdiction and organization.
 
-* 5651/syslog loglama ve KamuSM RFC3161 zaman damgası akışı gerçek KamuSM hesabıyla canlı test edilmiştir. ABD/AB dağıtımlarında yaygın kullanılan genel RFC3161 ve API-key TSA sağlayıcıları, NVİ KPSv2 ile T.C. kimlik doğrulaması ve WhatsApp Cloud API gönderimi kod seviyesinde uygulanmıştır ve uygun yerlerde yerel test/mock kapsamı vardır; ancak bu repo durumunda gerçek dış üretim servisleriyle canlı test edilmemiştir. Üretim veya hukuki delil süreçlerinden önce kendi OPNsense, Kea DHCP, KamuSM veya seçtiğiniz TSA sağlayıcı, NVİ ve Meta ortamınızda doğrulama yapın. 5651/syslog çıktısına güvenmeden önce örnek bir delil paketi (`.log`, `.log.tsq`, `.log.tsr`) üretin ve bulunduğunuz ülke ile kurumunuzdan sorumlu hukuk, KVKK/gizlilik, bilgi güvenliği ve delil saklama ekiplerine veya danışmanlarına inceletin.
+## Önemli Doğrulama Notu
+
+5651/syslog loglama ve KamuSM RFC3161 zaman damgası akışı gerçek KamuSM hesabıyla canlı test edilmiştir. ABD/AB dağıtımlarında yaygın kullanılan genel RFC3161 ve API-key TSA sağlayıcıları, NVİ KPSv2 ile T.C. kimlik doğrulaması ve WhatsApp Cloud API gönderimi kod seviyesinde uygulanmıştır ve uygun yerlerde yerel test/mock kapsamı vardır; ancak bu repo durumunda gerçek dış üretim servisleriyle canlı test edilmemiştir.
+
+Üretim veya hukuki delil süreçlerinden önce kendi OPNsense, Kea DHCP, KamuSM veya seçtiğiniz TSA sağlayıcı, NVİ ve Meta ortamınızda doğrulama yapın. 5651/syslog çıktısına güvenmeden önce örnek bir delil paketi (`.log`, `.log.tsq`, `.log.tsr`) üretin ve bulunduğunuz ülke ile kurumunuzdan sorumlu hukuk, KVKK/gizlilik, bilgi güvenliği ve delil saklama ekiplerine veya danışmanlarına inceletin.
 
 ## Feature Summary
 
@@ -58,13 +62,13 @@ Important validation note:
 * 5651/syslog-oriented tamper-evident logging with hash chain and optional KamuSM RFC3161 daily timestamp files.
 * System notifications by e-mail, SMS and Telegram.
 
-## Quick Start
+## Quick Start / Hızlı Kurulum
+
+Clone the repository and start G-Hotspot:
 
 ```bash
 git clone https://github.com/G-grbz/G-Hotspot.git
-
 cd G-Hotspot
-
 npm start
 ```
 
@@ -88,11 +92,31 @@ npm run check
 curl http://SERVER_IP:8080/health
 ```
 
-`npm start` creates `data/system.db` on first run and opens the web installer at
-`/install` until the administrator account, application secret and gateway mode
-are configured. Existing `.env` files are not overwritten and are imported into
-`system.db` for backward compatibility. After import, runtime configuration is
-read from `system.db`; `.env` is not loaded as a live settings source.
+### English
+
+The first `npm start` prepares `data/system.db`. Open
+`http://SERVER_IP:8080/install` and choose mock or OPNsense API mode, then set
+the administrator username, administrator password and application secret.
+
+Existing `.env` files are imported into `system.db` for backward compatibility.
+After import, runtime configuration is read from `system.db`; `.env` is not
+loaded as a live settings source.
+
+For production setup, OPNsense API permissions, Kea DHCP, 5651/syslog, NVİ and
+WhatsApp configuration, read the [English documentation](docs/README.en.md).
+
+### Türkçe
+
+İlk `npm start` çalıştırması `data/system.db` dosyasını hazırlar. Tarayıcıdan
+`http://SERVER_IP:8080/install` adresini açıp mock veya OPNsense API modunu,
+yönetici kullanıcı adını, yönetici şifresini ve uygulama anahtarını belirleyin.
+
+Mevcut `.env` dosyaları geriye uyumluluk için ilk açılışta `system.db` içine
+aktarılır. Importtan sonra çalışma zamanı ayarları `system.db` üzerinden
+okunur; `.env` canlı ayar kaynağı olarak yüklenmez.
+
+Ayrıntılı üretim kurulumu, OPNsense API izinleri, Kea DHCP, 5651/syslog, NVİ ve
+WhatsApp ayarları için [Türkçe dokümantasyona](docs/README.tr.md) bakın.
 
 ## Production Notes
 
@@ -107,41 +131,10 @@ read from `system.db`; `.env` is not loaded as a live settings source.
 
 G-Hotspot is licensed under the GNU Affero General Public License v3.0 only
 (`AGPL-3.0-only`). Keep the `LICENSE` and `NOTICE` files with all copies and
-modified versions. Original project attribution: Gökhan GÜRBÜZ, GitHub
-username `G-grbz`, https://github.com/G-grbz. The portal, administration
-panel and `/api/v1/about` endpoint expose the project attribution for
-operators and users.
+modified versions.
 
-## Türkçe Hızlı Kurulum
+Original project attribution: Gökhan GÜRBÜZ, GitHub username `G-grbz`,
+https://github.com/G-grbz.
 
-```bash
-git clone https://github.com/G-grbz/G-Hotspot.git
-
-cd G-Hotspot
-
-npm start
-```
-
-İlk `npm start` çalıştırması `data/system.db` dosyasını hazırlar. Tarayıcıdan
-`http://SERVER_IP:8080/install` adresini açıp mock veya OPNsense API modunu,
-yönetici kullanıcı adını, yönetici şifresini ve uygulama anahtarını belirleyin.
-Mevcut `.env` dosyaları geriye uyumluluk için ilk açılışta `system.db` içine
-aktarılır. Importtan sonra çalışma zamanı ayarları `system.db` üzerinden
-okunur; `.env` canlı ayar kaynağı olarak yüklenmez.
-
-Ayrıntılı üretim kurulumu, OPNsense API izinleri, Kea DHCP, 5651/syslog, NVİ ve WhatsApp ayarları için [Türkçe dokümantasyona](docs/README.tr.md) bakın.
-
-## English Quick Setup
-
-```bash
-npm start
-```
-
-The first `npm start` prepares `data/system.db`. Open
-`http://SERVER_IP:8080/install` and choose mock or OPNsense API mode, then set
-the administrator username, administrator password and application secret.
-Existing `.env` files are imported into `system.db` for backward compatibility.
-After import, runtime configuration is read from `system.db`; `.env` is not
-loaded as a live settings source.
-
-For production setup, OPNsense API permissions, Kea DHCP, 5651/syslog, NVİ and WhatsApp configuration, read the [English documentation](docs/README.en.md).
+The portal, administration panel and `/api/v1/about` endpoint expose the project
+attribution for operators and users.
