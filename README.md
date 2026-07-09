@@ -61,6 +61,10 @@ Important validation note:
 ## Quick Start
 
 ```bash
+git clone https://github.com/G-grbz/G-Hotspot.git
+
+cd G-Hotspot
+
 npm start
 ```
 
