@@ -451,7 +451,7 @@ export const settingsSchema = [
         options: ['disabled', 'kamusm', 'rfc3161', 'api-key'],
         defaultValue: 'disabled',
         section: 'Syslog timestamp',
-        warning: 'Choose KamuSM for the existing Turkey flow, generic RFC3161 TSA for EU/US-style providers, or API key mode for RFC3161 services protected by an HTTP key. After syslog evidence logging starts, disabling timestamping breaks the evidence chain and is blocked from the admin panel.'
+        warning: 'Choose KamuSM for the existing Turkey flow, generic RFC3161 TSA for EU/US-style providers, or API key mode for RFC3161 services protected by an HTTP key. When disabling timestamping, you can stamp currently unexported records first; exports created while timestamping is disabled stay unsigned.'
       }),
       field('SYSLOG_KAMUSM_USER', 'KamuSM username', {
         visibleWhenValue: { key: 'SYSLOG_TIMESTAMP_MODE', value: 'kamusm' }

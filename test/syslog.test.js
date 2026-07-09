@@ -8,8 +8,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { HotspotDatabase } from '../src/db.js';
 import {
-  createSyslogAutoExporter, createSyslogExportArchive, createSyslogHealthGuard, createSyslogServer,
-  syslogCsv, syslogRecordFromSession, syslogRecordsFromMessage
+  createSyslogAutoExporter,
+  createSyslogExportArchive,
+  createSyslogHealthGuard,
+  createSyslogServer,
+  createSyslogTimestampDisableExport,
+  syslogCsv,
+  syslogRecordFromSession,
+  syslogRecordsFromMessage
 } from '../src/services/syslog.js';
 import { timedatectlNtpStatus } from '../src/services/law5651.js';
 import { ipv4InNetworkList } from '../src/lib/network.js';
@@ -513,9 +519,17 @@ test('syslog timestamp export reuses an existing timestamped period', async () =
   }
 });
 
-test('syslog export refuses retroactive timestamp when timestamping was disabled during the period', async () => {
+test('syslog export timestamps unexported records after timestamping was disabled and re-enabled', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-kamusm-gap-'));
   const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  let requestCount = 0;
+  const tsa = http.createServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    requestCount += 1;
+    response.writeHead(200, { 'content-type': 'application/timestamp-reply' });
+    response.end(Buffer.from('timestamp-token'));
+  });
+  await new Promise(resolve => tsa.listen(0, '127.0.0.1', resolve));
   try {
     const periodStart = Date.UTC(2026, 6, 8, 10, 0, 0);
     const periodEnd = periodStart + 60 * 60 * 1000;
@@ -534,7 +548,7 @@ test('syslog export refuses retroactive timestamp when timestamping was disabled
     }, { enabled: true, networks: 'any' });
     record.createdAt = periodStart + 60000;
     db.appendSyslogLogs([record]);
-    db.setLaw5651State('timestamp_enabled_since_at', String(periodStart - 60 * 60 * 1000), periodStart);
+    db.setLaw5651State('timestamp_enabled_since_at', String(periodStart + 2 * 60 * 1000), periodStart);
     db.setLaw5651State('timestamp_disabled_intervals_json', JSON.stringify([{
       startAt: periodStart + 30 * 1000,
       endAt: periodStart + 90 * 1000
@@ -550,8 +564,8 @@ test('syslog export refuses retroactive timestamp when timestamping was disabled
           kamusmTimestampEnabled: true,
           kamusmUser: 'user',
           kamusmPassword: 'pass',
-          kamusmUrl: 'http://127.0.0.1:1/tsa',
-          kamusmTimeoutSeconds: 5
+          kamusmUrl: `http://127.0.0.1:${tsa.address().port}/tsa`,
+          kamusmTimeoutSeconds: 60
         }
       },
       exportReason: 'kamusm',
@@ -559,13 +573,173 @@ test('syslog export refuses retroactive timestamp when timestamping was disabled
       periodEndAt: periodEnd
     });
 
-    assert.equal(result.timestampStatus, 'evidence-gap');
-    assert.match(result.timestampError, /not continuously enabled/u);
-    assert.equal(result.timestampRequestPath, '');
-    assert.equal(result.timestampTokenPath, '');
-    assert.equal(fs.existsSync(`${result.filePath}.tsq`), false);
-    assert.equal(fs.existsSync(`${result.filePath}.tsr`), false);
+    assert.equal(result.timestampStatus, 'created');
+    assert.equal(requestCount, 1);
+    assert.equal(fs.existsSync(result.timestampRequestPath), true);
+    assert.equal(fs.readFileSync(result.timestampTokenPath, 'utf8'), 'timestamp-token');
   } finally {
+    await new Promise(resolve => tsa.close(resolve));
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('syslog export keeps a period exported while timestamping was disabled unsigned', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-disabled-export-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  let requestCount = 0;
+  const tsa = http.createServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    requestCount += 1;
+    response.writeHead(200, { 'content-type': 'application/timestamp-reply' });
+    response.end(Buffer.from('timestamp-token'));
+  });
+  await new Promise(resolve => tsa.listen(0, '127.0.0.1', resolve));
+  try {
+    const periodStart = Date.UTC(2026, 6, 8, 10, 0, 0);
+    const periodEnd = periodStart + 60 * 60 * 1000;
+    const record = syslogRecordFromSession({
+      sessionId: 'session-disabled-export',
+      clientIp: '192.168.10.56',
+      downloadBytes: 15,
+      uploadBytes: 7,
+      lastSeenAt: periodStart + 60000
+    }, {
+      id: 'auth-disabled-export',
+      method: 'voucher',
+      identity: 'voucher-disabled-export',
+      client_ip: '192.168.10.56',
+      created_at: periodStart + 30000
+    }, { enabled: true, networks: 'any' });
+    record.createdAt = periodStart + 60000;
+    db.appendSyslogLogs([record]);
+
+    const disabled = await createSyslogExportArchive({
+      db,
+      config: {
+        appName: 'G-Hotspot',
+        syslog: {
+          exportDirectory: path.join(directory, 'exports'),
+          timeZone: 'UTC',
+          timestampMode: 'disabled',
+          kamusmTimestampEnabled: false
+        }
+      },
+      exportReason: 'auto',
+      periodStartAt: periodStart,
+      periodEndAt: periodEnd
+    });
+    assert.equal(disabled.timestampStatus, 'disabled');
+
+    db.setLaw5651State('timestamp_enabled_since_at', String(periodStart), periodStart);
+    const retried = await createSyslogExportArchive({
+      db,
+      config: {
+        appName: 'G-Hotspot',
+        syslog: {
+          exportDirectory: path.join(directory, 'exports'),
+          timeZone: 'UTC',
+          kamusmTimestampEnabled: true,
+          kamusmUser: 'user',
+          kamusmPassword: 'pass',
+          kamusmUrl: `http://127.0.0.1:${tsa.address().port}/tsa`,
+          kamusmTimeoutSeconds: 60
+        }
+      },
+      exportReason: 'kamusm',
+      periodStartAt: periodStart,
+      periodEndAt: periodEnd
+    });
+
+    assert.equal(retried.id, disabled.id);
+    assert.equal(retried.reused, true);
+    assert.equal(retried.timestampStatus, 'disabled');
+    const manual = await createSyslogExportArchive({
+      db,
+      config: {
+        appName: 'G-Hotspot',
+        syslog: {
+          exportDirectory: path.join(directory, 'exports'),
+          timeZone: 'UTC',
+          kamusmTimestampEnabled: true,
+          kamusmUser: 'user',
+          kamusmPassword: 'pass',
+          kamusmUrl: `http://127.0.0.1:${tsa.address().port}/tsa`,
+          kamusmTimeoutSeconds: 60
+        }
+      },
+      exportReason: 'manual',
+      periodStartAt: periodStart,
+      periodEndAt: periodEnd
+    });
+    assert.equal(manual.id, disabled.id);
+    assert.equal(manual.timestampStatus, 'disabled');
+    assert.equal(requestCount, 0);
+  } finally {
+    await new Promise(resolve => tsa.close(resolve));
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('syslog timestamp disable export stamps pending records up to the disable time', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-disable-finalize-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  let requestCount = 0;
+  const tsa = http.createServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    requestCount += 1;
+    response.writeHead(200, { 'content-type': 'application/timestamp-reply' });
+    response.end(Buffer.from('timestamp-token'));
+  });
+  await new Promise(resolve => tsa.listen(0, '127.0.0.1', resolve));
+  try {
+    const dayStart = Date.UTC(2026, 6, 8, 0, 0, 0);
+    const disableAt = Date.UTC(2026, 6, 8, 13, 14, 15);
+    const record = syslogRecordFromSession({
+      sessionId: 'session-disable-finalize',
+      clientIp: '192.168.10.57',
+      downloadBytes: 25,
+      uploadBytes: 9,
+      lastSeenAt: disableAt - 60 * 1000
+    }, {
+      id: 'auth-disable-finalize',
+      method: 'voucher',
+      identity: 'voucher-disable-finalize',
+      client_ip: '192.168.10.57',
+      created_at: dayStart + 60 * 1000
+    }, { enabled: true, networks: 'any' });
+    record.createdAt = disableAt - 60 * 1000;
+    db.appendSyslogLogs([record]);
+    db.setLaw5651State('timestamp_enabled_since_at', String(dayStart), dayStart);
+
+    const result = await createSyslogTimestampDisableExport({
+      db,
+      config: {
+        appName: 'G-Hotspot',
+        syslog: {
+          exportDirectory: path.join(directory, 'exports'),
+          timeZone: 'UTC',
+          autoExportInterval: 'daily',
+          autoExportIntervalMinutes: 1440,
+          kamusmTimestampEnabled: true,
+          kamusmUser: 'user',
+          kamusmPassword: 'pass',
+          kamusmUrl: `http://127.0.0.1:${tsa.address().port}/tsa`,
+          kamusmTimeoutSeconds: 60
+        }
+      },
+      now: disableAt
+    });
+
+    assert.equal(result.timestampStatus, 'created');
+    assert.equal(result.periodStartAt, dayStart);
+    assert.equal(result.periodEndAt, disableAt);
+    assert.equal(result.recordCount, 1);
+    assert.equal(requestCount, 1);
+    assert.equal(fs.readFileSync(result.timestampTokenPath, 'utf8'), 'timestamp-token');
+  } finally {
+    await new Promise(resolve => tsa.close(resolve));
     db.close();
     fs.rmSync(directory, { recursive: true, force: true });
   }

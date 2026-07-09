@@ -29,7 +29,7 @@ test('admin update helper reads release versions from GitHub titles', () => {
   assert.equal(compareReleaseVersions('1.0.0', '1.0.0'), 0);
 });
 
-test('admin blocks disabling syslog timestamping after evidence logging starts', () => {
+test('admin allows disabling syslog timestamping after evidence logging starts', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-admin-timestamp-'));
   const db = new HotspotDatabase(path.join(directory, 'test.db'));
   try {
@@ -52,10 +52,10 @@ test('admin blocks disabling syslog timestamping after evidence logging starts',
       startedAt: now,
       createdAt: now
     }]);
-    assert.throws(() => assertSyslogTimestampDisableAllowed(
+    assert.equal(assertSyslogTimestampDisableAllowed(
       { SYSLOG_TIMESTAMP_MODE: 'disabled' },
       { db, config: { syslog: { timestampMode: 'kamusm' } } }
-    ), error => error?.code === 'syslog_timestamp_disable_blocked' && error?.statusCode === 409);
+    ), true);
     assert.equal(assertSyslogTimestampDisableAllowed(
       { SYSLOG_TIMESTAMP_MODE: 'rfc3161' },
       { db, config: { syslog: { timestampMode: 'kamusm' } } }

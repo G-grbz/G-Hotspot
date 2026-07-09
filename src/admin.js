@@ -7,7 +7,13 @@ import {
   listGatewayInterfaces, listGatewayNetworkChoices, listGatewaySessions, readGatewayInterfaceTrafficCounters
 } from './services/opnsense.js';
 import {
-  createSyslogExportArchive, syslogCsv, syslogFileDate, syslogRecordFromSession, syslogStorageStatus
+  createSyslogExportArchive,
+  createSyslogTimestampDisableExport,
+  observeSyslogTimestampModeState,
+  syslogCsv,
+  syslogFileDate,
+  syslogRecordFromSession,
+  syslogStorageStatus
 } from './services/syslog.js';
 import { getSettings, getTrafficLogSettings, saveSettings, saveTrafficLogSettings } from './settings.js';
 import { sendMail } from './services/smtp.js';
@@ -147,23 +153,40 @@ export function publicIpCandidate(value) {
   return ip && !isPrivateOrSpecialIp(ip) ? ip : '';
 }
 
-export function assertSyslogTimestampDisableAllowed(input = {}, { db = null, config = {} } = {}) {
-  if (!Object.hasOwn(input || {}, 'SYSLOG_TIMESTAMP_MODE')) return true;
-  const nextMode = String(input.SYSLOG_TIMESTAMP_MODE || '').trim().toLowerCase();
-  if (nextMode !== 'disabled') return true;
-  const syslogConfig = config.syslog || config.law5651 || {};
-  const currentMode = String(
+function normalizedSyslogTimestampMode(value, fallback = 'disabled') {
+  const mode = String(value || '').trim().toLowerCase();
+  return mode || fallback;
+}
+
+function configuredSyslogTimestampMode(syslogConfig = {}) {
+  return normalizedSyslogTimestampMode(
     syslogConfig.timestampMode ||
-    (syslogConfig.kamusmTimestampEnabled ? 'kamusm' : 'disabled')
-  ).trim().toLowerCase();
-  if (!currentMode || currentMode === 'disabled') return true;
-  const summary = typeof db?.law5651Summary === 'function' ? db.law5651Summary() : null;
-  if (Number(summary?.count || 0) <= 0) return true;
-  throw new HttpError(
-    409,
-    'Timestamp provider cannot be disabled after syslog evidence logging has started. Create a new installation/evidence chain if timestamping must be stopped.',
-    'syslog_timestamp_disable_blocked'
+      (syslogConfig.kamusmTimestampEnabled ? 'kamusm' : ''),
+    'disabled'
   );
+}
+
+function requestedSyslogTimestampMode(input = {}, currentMode = 'disabled') {
+  if (!Object.hasOwn(input || {}, 'SYSLOG_TIMESTAMP_MODE')) return currentMode;
+  return normalizedSyslogTimestampMode(input.SYSLOG_TIMESTAMP_MODE, 'disabled');
+}
+
+function syslogTimestampModeTransition(input = {}, { config = {} } = {}) {
+  const syslogConfig = config.syslog || config.law5651 || {};
+  const currentMode = configuredSyslogTimestampMode(syslogConfig);
+  const nextMode = requestedSyslogTimestampMode(input, currentMode);
+  return {
+    currentMode,
+    nextMode,
+    disabling: currentMode !== 'disabled' && nextMode === 'disabled',
+    enabling: currentMode === 'disabled' && nextMode !== 'disabled'
+  };
+}
+
+export function assertSyslogTimestampDisableAllowed(input = {}, { db = null, config = {} } = {}) {
+  void db;
+  void config;
+  return true;
 }
 
 export function authorizationLeaseSeconds(runtimeConfig, authorization) {
@@ -1506,8 +1529,42 @@ export function createAdminController({
 
     if (request.method === 'PUT' && path === '/api/admin/settings') {
       const { value } = await readJson(request, 256 * 1024);
-      assertSyslogTimestampDisableAllowed(value.settings || {}, { db, config });
-      const result = saveSettings(value.settings);
+      const settingsInput = value.settings || {};
+      const timestampTransition = syslogTimestampModeTransition(settingsInput, { config });
+      const timestampTransitionAt = Date.now();
+      let syslogTimestampDisableExport = null;
+      let syslogTimestampWarning = '';
+      if (timestampTransition.disabling && value.syslogTimestampStampExisting === true) {
+        try {
+          syslogTimestampDisableExport = await createSyslogTimestampDisableExport({
+            db,
+            config,
+            now: timestampTransitionAt
+          });
+        } catch (error) {
+          syslogTimestampWarning = error.message;
+        }
+      }
+      assertSyslogTimestampDisableAllowed(settingsInput, { db, config });
+      let result;
+      try {
+        result = saveSettings(settingsInput);
+      } catch (error) {
+        throw new HttpError(400, error.message, error.code || 'invalid_settings');
+      }
+      try {
+        if (timestampTransition.disabling) {
+          observeSyslogTimestampModeState(db, {
+            syslog: { timestampMode: 'disabled', kamusmTimestampEnabled: false }
+          }, timestampTransitionAt);
+        } else if (timestampTransition.enabling) {
+          observeSyslogTimestampModeState(db, {
+            syslog: { timestampMode: timestampTransition.nextMode }
+          }, timestampTransitionAt);
+        }
+      } catch (error) {
+        syslogTimestampWarning = syslogTimestampWarning || error.message;
+      }
       const accessDurationChanged = result.saved.some(key => /_ACCESS_DURATION_(VALUE|UNIT)$/u.test(key));
       const accessDurationRefresh = accessDurationChanged
         ? normalizeActiveAuthorizationDurations(db, config, { limit: 5000 })
@@ -1561,7 +1618,10 @@ export function createAdminController({
         accessDurationRefresh,
         accessDurationExpiry,
         bandwidthWarning,
-        bandwidthWarningCode
+        bandwidthWarningCode,
+        syslogTimestampTransition: timestampTransition,
+        syslogTimestampDisableExport,
+        syslogTimestampWarning
       });
       sendJson(response, 200, {
         ok: true,
@@ -1570,14 +1630,17 @@ export function createAdminController({
         accessDurationExpiry,
         bandwidthWarning,
         bandwidthWarningCode,
+        syslogTimestampTransition: timestampTransition,
+        syslogTimestampDisableExport,
+        syslogTimestampWarning,
         appName: config.appName,
         defaultLanguage: config.defaultLanguage,
-        gatewayMode: config.gateway.mode,
-        emailEnabled: config.smtp.enabled,
-        nviEnabled: config.nvi.enabled,
-        whatsappEnabled: config.whatsapp.enabled,
-        telegramEnabled: config.telegram.enabled,
-        smsEnabled: config.sms.enabled
+        gatewayMode: config.gateway?.mode || '',
+        emailEnabled: Boolean(config.smtp?.enabled),
+        nviEnabled: Boolean(config.nvi?.enabled),
+        whatsappEnabled: Boolean(config.whatsapp?.enabled),
+        telegramEnabled: Boolean(config.telegram?.enabled),
+        smsEnabled: Boolean(config.sms?.enabled)
       });
       return true;
     }

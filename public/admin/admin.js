@@ -3775,11 +3775,30 @@ async function saveSettings(event) {
   const button = $('#saveSettingsButton');
   syncDerivedSettings();
   const values = collectSettingValuesFromDom();
+  const currentTimestampMode = String(state.settings?.values?.SYSLOG_TIMESTAMP_MODE || 'disabled').toLowerCase();
+  const nextTimestampMode = String(values.SYSLOG_TIMESTAMP_MODE || currentTimestampMode || 'disabled').toLowerCase();
+  let syslogTimestampStampExisting = false;
+  if (currentTimestampMode !== 'disabled' && nextTimestampMode === 'disabled') {
+    const timestampDisableChoice = await openActionConfirmModal({
+      eyebrow: 'SYSLOG TIMESTAMP',
+      title: 'Disable syslog timestamp',
+      message: 'Timestamping is being disabled. Stamp current syslog records before disabling?',
+      confirmLabel: 'Stamp and disable',
+      confirmValue: 'stamp',
+      alternateLabel: 'Disable without timestamp',
+      alternateValue: 'skip',
+      cancelLabel: 'Cancel disable',
+      cancelValue: 'cancel',
+      danger: true
+    });
+    if (timestampDisableChoice === 'cancel') return;
+    syslogTimestampStampExisting = timestampDisableChoice === 'stamp';
+  }
   setButtonBusy(button, true, 'Saving…');
   try {
     const result = await api('/api/admin/settings', {
       method: 'PUT',
-      body: JSON.stringify({ settings: values })
+      body: JSON.stringify({ settings: values, syslogTimestampStampExisting })
     });
     state.appName = result.appName;
     state.gatewayMode = result.gatewayMode;
@@ -3797,6 +3816,9 @@ async function saveSettings(event) {
           error: result.bandwidthWarning
         });
       toast(message, 'error');
+    }
+    if (result.syslogTimestampWarning) {
+      toast(t('Syslog timestamp warning: {error}', { error: result.syslogTimestampWarning }), 'error');
     }
     await loadSettings();
     await refreshSystemAlerts();
@@ -3895,6 +3917,9 @@ function closeVoucherModal() {
 
 let adminApprovalDecisionResolver = null;
 let actionConfirmResolver = null;
+let actionConfirmCancelValue = false;
+let actionConfirmSubmitValue = true;
+let actionConfirmAlternateValue = false;
 
 function closeAdminApprovalDecisionModal(value = null) {
   $('#adminApprovalDecisionModal').classList.add('hidden');
@@ -3922,11 +3947,12 @@ function openAdminApprovalDecisionModal(action) {
   });
 }
 
-function closeActionConfirmModal(value = false) {
+function closeActionConfirmModal(value = actionConfirmCancelValue) {
   $('#actionConfirmModal').classList.add('hidden');
+  $('#actionConfirmAlternate')?.classList.add('hidden');
   const resolver = actionConfirmResolver;
   actionConfirmResolver = null;
-  if (resolver) resolver(Boolean(value));
+  if (resolver) resolver(value);
 }
 
 function openActionConfirmModal({
@@ -3934,15 +3960,29 @@ function openActionConfirmModal({
   title = 'Confirm action',
   message = '',
   confirmLabel = 'Confirm',
+  confirmValue = true,
+  alternateLabel = '',
+  alternateValue = false,
+  cancelLabel = 'Cancel',
+  cancelValue = false,
   danger = false
 } = {}) {
   const modal = $('#actionConfirmModal');
   const card = modal.querySelector('.modal-card');
+  const alternate = $('#actionConfirmAlternate');
   card.classList.toggle('danger', Boolean(danger));
+  actionConfirmCancelValue = cancelValue;
+  actionConfirmSubmitValue = confirmValue;
+  actionConfirmAlternateValue = alternateValue;
   setPlainText('#actionConfirmEyebrow', t(eyebrow));
   setPlainText('#actionConfirmTitle', t(title));
   setPlainText('#actionConfirmMessage', t(message));
   setPlainText('#actionConfirmSubmit', t(confirmLabel));
+  setPlainText('#actionConfirmCancel', t(cancelLabel));
+  if (alternate) {
+    alternate.classList.toggle('hidden', !alternateLabel);
+    setPlainText(alternate, alternateLabel ? t(alternateLabel) : '');
+  }
   modal.classList.remove('hidden');
   setTimeout(() => $('#actionConfirmSubmit').focus(), 40);
   return new Promise(resolve => {
@@ -4109,7 +4149,7 @@ $$('[data-close-decision-modal]').forEach(button =>
   button.addEventListener('click', () => closeAdminApprovalDecisionModal(null))
 );
 $$('[data-close-action-confirm]').forEach(button =>
-  button.addEventListener('click', () => closeActionConfirmModal(false))
+  button.addEventListener('click', () => closeActionConfirmModal())
 );
 $$('[data-close-template-placeholders]').forEach(button =>
   button.addEventListener('click', closeTemplatePlaceholderModal)
@@ -4129,7 +4169,8 @@ $('#adminApprovalDecisionForm').addEventListener('submit', event => {
   event.preventDefault();
   closeAdminApprovalDecisionModal($('#adminApprovalDecisionMessage').value);
 });
-$('#actionConfirmSubmit').addEventListener('click', () => closeActionConfirmModal(true));
+$('#actionConfirmAlternate').addEventListener('click', () => closeActionConfirmModal(actionConfirmAlternateValue));
+$('#actionConfirmSubmit').addEventListener('click', () => closeActionConfirmModal(actionConfirmSubmitValue));
 
 $('#sessionSearch').addEventListener('input', debounce(loadSessions));
 $('#sessionMethod').addEventListener('change', loadSessions);

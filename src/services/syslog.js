@@ -1,6 +1,7 @@
 import {
   createLaw5651AutoExporter,
   createLaw5651ExportArchive,
+  createLaw5651TimestampDisableExport,
   createLaw5651HealthGuard,
   createLaw5651SyslogServer,
   assertLaw5651PortalWritable,
@@ -9,7 +10,8 @@ import {
   law5651IsoDate,
   law5651RecordFromSession,
   law5651RecordsFromSyslog,
-  law5651StorageStatus
+  law5651StorageStatus,
+  observeLaw5651TimestampModeState
 } from './law5651.js';
 
 function compatibleConfig(config = {}) {
@@ -37,6 +39,17 @@ export async function createSyslogExportArchive(options = {}) {
     ...options,
     config: compatibleConfig(options.config)
   });
+}
+
+export async function createSyslogTimestampDisableExport(options = {}) {
+  return createLaw5651TimestampDisableExport({
+    ...options,
+    config: compatibleConfig(options.config)
+  });
+}
+
+export function observeSyslogTimestampModeState(db, config = {}, now = Date.now()) {
+  observeLaw5651TimestampModeState(db, compatibleConfig(config).law5651, now);
 }
 
 export function createSyslogAutoExporter(options = {}) {

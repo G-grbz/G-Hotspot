@@ -520,6 +520,15 @@ function timestampAttemptMatchesInterval(row = {}, interval = null, timeZone = '
   return periodEnd - periodStart === interval.intervalMs;
 }
 
+function exportTimestampStatus(row = {}) {
+  row = row || {};
+  return String(row.timestamp_status || row.timestampStatus || '').trim().toLowerCase();
+}
+
+function timestampDisabledExport(row = {}) {
+  return exportTimestampStatus(row) === 'disabled';
+}
+
 function timestampRuntimeMode(lawConfig = {}) {
   const mode = selectedTimestampMode(lawConfig);
   if (mode === 'disabled') return 'disabled';
@@ -620,8 +629,8 @@ function observeTimestampModeState(db, lawConfig = {}, now = Date.now()) {
   }
 }
 
-function intervalsOverlap(leftStart, leftEnd, rightStart, rightEnd) {
-  return leftStart < rightEnd && rightStart < leftEnd;
+export function observeLaw5651TimestampModeState(db, lawConfig = {}, now = Date.now()) {
+  observeTimestampModeState(db, lawConfig, now);
 }
 
 function timestampEvidenceGap(db, lawConfig = {}, periodStartAt = null, periodEndAt = null, now = Date.now()) {
@@ -629,20 +638,9 @@ function timestampEvidenceGap(db, lawConfig = {}, periodStartAt = null, periodEn
   const periodStart = Math.trunc(Number(periodStartAt));
   const periodEnd = Math.trunc(Number(periodEndAt));
   if (!Number.isFinite(periodStart) || !Number.isFinite(periodEnd) || periodEnd <= periodStart) return null;
-  const enabledSince = Math.trunc(Number(law5651StateValue(db, TIMESTAMP_ENABLED_SINCE_STATE)) || 0);
-  if (!enabledSince || periodStart < enabledSince) {
-    return {
-      startAt: periodStart,
-      endAt: Math.min(periodEnd, enabledSince || Math.trunc(Number(now) || Date.now())),
-      reason: 'timestamp_not_continuously_enabled'
-    };
-  }
-  const intervals = timestampDisabledIntervals(db);
-  const openDisabledSince = Math.trunc(Number(law5651StateValue(db, TIMESTAMP_DISABLED_SINCE_STATE)) || 0);
-  if (openDisabledSince > 0) {
-    intervals.push({ startAt: openDisabledSince, endAt: Math.trunc(Number(now) || Date.now()) });
-  }
-  return intervals.find(item => intervalsOverlap(periodStart, periodEnd, item.startAt, item.endAt)) || null;
+  void db;
+  void now;
+  return null;
 }
 
 function evidenceGapTimestamp(lawConfig = {}, gap = {}) {
@@ -699,7 +697,7 @@ function nextAutomaticTimestampAllowedAt(
 function automaticExportSatisfied(db, existing, lawConfig = {}) {
   if (!existing) return false;
   if (timestampEnabled(lawConfig)) {
-    const timestampStatus = String(existing.timestamp_status || '').trim().toLowerCase();
+    const timestampStatus = exportTimestampStatus(existing);
     if (timestampStatus === TIMESTAMP_EVIDENCE_GAP_STATUS) {
       const gap = timestampEvidenceGap(
         db,
@@ -708,6 +706,8 @@ function automaticExportSatisfied(db, existing, lawConfig = {}) {
         existing.period_end_at
       );
       if (!gap) return false;
+    } else if (timestampDisabledExport(existing)) {
+      // Already exported while timestamping was off; keep it unsigned but still verify the archive below.
     } else if (timestampStatus !== 'created') {
       return false;
     }
@@ -1688,9 +1688,10 @@ export async function createLaw5651ExportArchive({
     throw new Error('Syslog export period is invalid');
   }
   const safeReason = String(exportReason || 'manual').replace(/[^a-z0-9_-]/giu, '-').toLowerCase();
-  if (hasPeriod && AUTO_EXPORT_REASONS.includes(safeReason)) {
+  if (hasPeriod) {
     const existing = findAutomaticExportByPeriod(db, periodStart, periodEnd);
-    if (automaticExportSatisfied(db, existing, lawConfig)) {
+    const shouldReuseExisting = AUTO_EXPORT_REASONS.includes(safeReason) || timestampDisabledExport(existing);
+    if (shouldReuseExisting && automaticExportSatisfied(db, existing, lawConfig)) {
       return law5651ExportResultFromRow(existing);
     }
   }
@@ -1804,6 +1805,48 @@ export async function createLaw5651ExportArchive({
     backupError: '',
     backupResults: []
   };
+}
+
+export async function createLaw5651TimestampDisableExport({
+  db,
+  config,
+  now = Date.now(),
+  logger = console,
+  notificationSender = null
+}) {
+  const lawConfig = config.law5651 || config.syslog || {};
+  if (!timestampEnabled(lawConfig)) return null;
+  const current = Math.trunc(Number(now) || Date.now());
+  const timeZone = lawConfig.timeZone || 'UTC';
+  const interval = autoExportInterval(lawConfig);
+  const previous = latestAutomaticExport(db);
+  const first = db.listLaw5651Logs({
+    limit: 1,
+    order: 'asc',
+    createdBefore: current
+  }).rows[0] || null;
+  if (!first) return null;
+  const previousEnd = Math.trunc(Number(previous?.period_end_at));
+  let periodStart = Number.isFinite(previousEnd) && previousEnd > 0
+    ? previousEnd
+    : Math.trunc(Number(first.created_at));
+  if (interval.daily) periodStart = previousEnd > 0 ? previousEnd : localDayStartAt(periodStart, timeZone);
+  if (!Number.isFinite(periodStart) || periodStart >= current) return null;
+  const pending = db.listLaw5651Logs({
+    limit: 1,
+    createdFrom: periodStart,
+    createdBefore: current
+  }).total;
+  if (pending <= 0) return null;
+  return createLaw5651ExportArchive({
+    db,
+    config,
+    exportReason: autoExportReason(lawConfig),
+    periodStartAt: periodStart,
+    periodEndAt: current,
+    logger,
+    notificationSender
+  });
 }
 
 function firstDailyExportStart(db, closedEnd, timeZone) {
