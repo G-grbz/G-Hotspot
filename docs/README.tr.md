@@ -31,7 +31,7 @@ Bu repodaki mevcut durum için net sınırlar:
 - Veritabanı: Node.js yerleşik `node:sqlite`
 - Varsayılan gateway modu: `mock`
 - Üretim gateway modu: `opnsense-api`
-- Lisans: AGPL-3.0-only
+- Lisans: G-Hotspot Noncommercial Source-Available License 1.0
 - Harici runtime npm bağımlılığı yoktur.
 
 Canlı test durumu:
