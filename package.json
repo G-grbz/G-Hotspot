@@ -20,5 +20,5 @@
     "test": "node src/setup.js --auto && node --test",
     "check": "node --check src/server.js && node --check src/cli.js && node --check src/config.js && node --check src/db.js && node --check src/system.js && node --check src/about.js && node --check src/appearance.js && node --check src/lib/env.js && node --check src/lib/languages.js && node --check src/lib/network.js && node --check src/services/access.js && node --check src/services/deliveryGuard.js && node --check src/services/notifications.js && node --check src/services/opnsense.js && node --check src/services/opnsenseTemplate.js && node --check src/services/quotas.js && node --check src/services/smtp.js && node --check src/services/whatsapp.js && node --check src/services/telegram.js && node --check src/services/sms.js && node --check src/services/nvi.js && node --check src/services/law5651.js && node --check src/services/syslog.js && node --check src/services/trafficLogs.js && node --check src/settings.js && node --check src/i18n.js && node --check src/admin.js && node --check public/i18n.js && node --check public/terms.js && node --check public/app.js && node --check public/session.js && node --check public/install.js && node --check public/admin/admin.js"
   },
-  "license": "AGPL-3.0-only"
+  "license": "LicenseRef-G-Hotspot-NC-1.0"
 }

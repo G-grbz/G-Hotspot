@@ -26,7 +26,7 @@ export function projectAbout() {
     name: packageJson.name || 'g-hotspot',
     displayName: 'G-Hotspot',
     version: packageJson.version || '',
-    license: packageJson.license || 'AGPL-3.0-only',
+    license: packageJson.license || 'LicenseRef-G-Hotspot-NC-1.0',
     source: repositoryUrl(packageJson.repository) ||
       githubUrl ||
       'Complete corresponding source is included with this distribution.',

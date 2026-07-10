@@ -1057,7 +1057,7 @@ function renderProjectAttribution(about = state.about || {}) {
   const username = about.githubUsername ? ` (${about.githubUsername})` : ' (G-grbz)';
   const versionValue = about.version || APP_VERSION;
   const version = versionValue ? ` v${versionValue}` : '';
-  const license = about.license || 'AGPL-3.0-only';
+  const license = about.license || 'G-Hotspot Noncommercial Source-Available License 1.0';
   const source = String(about.githubUrl || about.source || '').trim();
   for (const target of targets) {
     const label = document.createElement('span');
@@ -1083,7 +1083,7 @@ async function loadProjectAttribution() {
     state.about = {
       displayName: 'G-Hotspot',
       version: APP_VERSION,
-      license: 'AGPL-3.0-only',
+      license: 'LicenseRef-G-Hotspot-NC-1.0',
       author: 'Gökhan GÜRBÜZ',
       githubUsername: 'G-grbz',
       githubUrl: 'https://github.com/G-grbz',

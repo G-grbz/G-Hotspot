@@ -29,7 +29,7 @@ Türkçe: G-Hotspot, OPNsense captive portal için hazırlanmış hafif bir Node
 * Version: `1.0.0`
 * Runtime: Node.js `>=24.0.0`
 * Database: built-in `node:sqlite`
-* License: AGPL-3.0-only
+* License: G-Hotspot Noncommercial Source-Available License 1.0
 * Default gateway mode: `mock`
 * Production gateway mode: `opnsense-api`
 

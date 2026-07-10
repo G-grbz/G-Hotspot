@@ -7,12 +7,12 @@ test('project about metadata exposes AGPL license and attribution', () => {
   const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   const about = projectAbout();
 
-  assert.equal(packageJson.license, 'AGPL-3.0-only');
+  assert.equal(packageJson.license, 'LicenseRef-G-Hotspot-NC-1.0');
   assert.equal(packageJson.author.name, 'Gökhan GÜRBÜZ');
   assert.equal(packageJson.author.url, 'https://github.com/G-grbz');
   assert.equal(about.name, packageJson.name);
   assert.equal(about.version, packageJson.version);
-  assert.equal(about.license, 'AGPL-3.0-only');
+  assert.equal(about.license, 'LicenseRef-G-Hotspot-NC-1.0');
   assert.equal(about.author, 'Gökhan GÜRBÜZ');
   assert.equal(about.githubUsername, 'G-grbz');
   assert.equal(about.githubUrl, 'https://github.com/G-grbz');
