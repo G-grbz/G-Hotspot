@@ -129,8 +129,7 @@ WhatsApp ayarları için [Türkçe dokümantasyona](docs/README.tr.md) bakın.
 
 ## License and Attribution
 
-G-Hotspot is licensed under the GNU Affero General Public License v3.0 only
-(`AGPL-3.0-only`). Keep the `LICENSE` and `NOTICE` files with all copies and
+G-Hotspot is licensed under the G-Hotspot Noncommercial Source-Available License 1.0. Keep the `LICENSE` and `NOTICE` files with all copies and
 modified versions.
 
 Original project attribution: Gökhan GÜRBÜZ, GitHub username `G-grbz`,
