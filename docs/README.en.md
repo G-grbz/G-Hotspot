@@ -31,7 +31,7 @@ Current repository state:
 - Database: built-in Node.js `node:sqlite`
 - Default gateway mode: `mock`
 - Production gateway mode: `opnsense-api`
-- License: AGPL-3.0-only
+- License: G-Hotspot Noncommercial Source-Available License 1.0
 - No external runtime npm dependency.
 
 Live-test status:
