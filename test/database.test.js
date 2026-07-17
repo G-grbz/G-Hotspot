@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { HotspotDatabase } from '../src/db.js';
+import { DatabaseSync } from 'node:sqlite';
+import { HotspotDatabase, deviceOsFromUserAgent } from '../src/db.js';
 import {
   appendTrafficLogFileRecords,
   cleanupTrafficLogFile,
@@ -14,6 +15,130 @@ import {
   trafficLogRecordFromInterfaceCounters,
   trafficLogRecordFromSession
 } from '../src/services/trafficLogs.js';
+
+test('device OS can be inferred from browser user agents', () => {
+  assert.equal(
+    deviceOsFromUserAgent(
+      'Mozilla/5.0 (Linux; Android 14; 23049PCD8G) AppleWebKit/537.36 Chrome/125.0 Mobile Safari/537.36'
+    ),
+    'android'
+  );
+  assert.equal(deviceOsFromUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X)'), 'ios');
+  assert.equal(deviceOsFromUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64)'), 'windows');
+  assert.equal(deviceOsFromUserAgent(''), '');
+});
+
+test('syslog records are stored in a separate syslog database', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-split-'));
+  const databasePath = path.join(directory, 'hotspot.db');
+  const syslogPath = path.join(directory, 'syslog.db');
+  const db = new HotspotDatabase(databasePath);
+  const now = Date.UTC(2026, 6, 13, 10, 0, 0);
+  try {
+    assert.equal(db.syslogFilePath, syslogPath);
+    assert.equal(fs.existsSync(syslogPath), true);
+    assert.equal(
+      db.db.prepare("SELECT COUNT(*) count FROM sqlite_master WHERE type='table' AND name='law5651_logs'").get().count,
+      0
+    );
+
+    const result = db.appendLaw5651Logs([{
+      dedupeKey: 'syslog-split-flow',
+      kind: 'flow',
+      source: 'opnsense-filterlog',
+      clientIp: '172.16.2.120',
+      sourceIp: '172.16.2.120',
+      destinationIp: '8.8.8.8',
+      protocol: 'udp',
+      serviceType: 'firewall-pass-out',
+      startedAt: now,
+      downloadBytes: 42,
+      uploadBytes: 12,
+      createdAt: now
+    }]);
+    assert.equal(result.inserted, 1);
+    db.recordLaw5651Event({
+      eventType: 'receiver_started',
+      severity: 'info',
+      message: 'Receiver started',
+      createdAt: now
+    });
+    db.setLaw5651State('checkpoint', 'ok', now);
+
+    assert.equal(db.syslogDb.prepare('SELECT COUNT(*) count FROM law5651_logs').get().count, 1);
+    assert.equal(db.syslogDb.prepare('SELECT COUNT(*) count FROM law5651_events').get().count, 1);
+    assert.equal(db.getLaw5651State('checkpoint').value, 'ok');
+    assert.equal(db.listActivity({ kind: 'syslog' })[0].action, 'receiver_started');
+    assert.equal(db.syslogDatabaseMaintenanceStats().path, syslogPath);
+  } finally {
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('legacy law5651 tables migrate from hotspot database to syslog database', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-migrate-'));
+  const databasePath = path.join(directory, 'hotspot.db');
+  const legacy = new DatabaseSync(databasePath);
+  const now = Date.UTC(2026, 6, 13, 11, 0, 0);
+  legacy.exec(`
+    CREATE TABLE law5651_logs (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      id TEXT NOT NULL UNIQUE,
+      dedupe_key TEXT NOT NULL UNIQUE,
+      kind TEXT NOT NULL CHECK (kind IN ('session', 'flow')),
+      source TEXT NOT NULL,
+      network TEXT,
+      client_ip TEXT NOT NULL,
+      client_mac TEXT,
+      subscriber_id TEXT,
+      source_ip TEXT NOT NULL,
+      source_port TEXT,
+      destination_ip TEXT,
+      destination_port TEXT,
+      protocol TEXT,
+      service_type TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER,
+      download_bytes INTEGER NOT NULL DEFAULT 0,
+      upload_bytes INTEGER NOT NULL DEFAULT 0,
+      raw_json TEXT,
+      previous_hash TEXT NOT NULL,
+      record_hash TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL
+    ) STRICT;
+    INSERT INTO law5651_logs
+      (id, dedupe_key, kind, source, client_ip, source_ip, service_type, started_at,
+       download_bytes, upload_bytes, previous_hash, record_hash, created_at)
+    VALUES
+      ('legacy-log-1', 'legacy-dedupe-1', 'flow', 'opnsense-filterlog', '172.16.2.121',
+       '172.16.2.121', 'firewall-pass-out', ${now}, 100, 20, '${'0'.repeat(64)}',
+       '${'1'.repeat(64)}', ${now});
+
+    CREATE TABLE law5651_state (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_at INTEGER NOT NULL
+    ) STRICT;
+    INSERT INTO law5651_state(key, value, updated_at)
+    VALUES ('legacy-checkpoint', 'ready', ${now});
+  `);
+  legacy.close();
+
+  const db = new HotspotDatabase(databasePath);
+  try {
+    assert.equal(db.listLaw5651Logs().total, 1);
+    assert.equal(db.getLaw5651State('legacy-checkpoint').value, 'ready');
+    assert.equal(
+      db.db.prepare("SELECT COUNT(*) count FROM sqlite_master WHERE type='table' AND name LIKE 'law5651_%'").get().count,
+      0
+    );
+    assert.equal(db.syslogDb.prepare('SELECT COUNT(*) count FROM law5651_logs').get().count, 1);
+  } finally {
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test('voucher can be claimed only up to max uses', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-'));
@@ -160,6 +285,139 @@ test('phone-based challenges and authorizations are supported', () => {
       expiresAt: Date.now() + 60000, redirectUrl: '', gatewayResponse: {}, error: ''
     });
     assert.equal(nviAuthorization.method, 'nvi');
+  } finally {
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('dashboard groups active devices by inferred operating system', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-'));
+  const db = new HotspotDatabase(path.join(directory, 'test.db'));
+  const now = Date.now();
+  const saveActiveDevice = ({ identity, clientIp, deviceName, deviceOs = '', expiresAt = now + 60000 }) => {
+    const authorization = db.saveAuthorization({
+      method: 'email',
+      identity,
+      clientIp,
+      clientMac: '',
+      gatewayMode: 'mock',
+      gatewaySessionId: `${clientIp}-session`,
+      status: 'active',
+      expiresAt,
+      redirectUrl: '',
+      gatewayResponse: {},
+      error: '',
+      deviceOs
+    });
+    db.updateAuthorizationUsage(authorization.id, {
+      downloadBytes: 0,
+      uploadBytes: 0,
+      lastSeenAt: now,
+      sampledAt: now,
+      deviceName
+    });
+    return authorization;
+  };
+
+  try {
+    saveActiveDevice({ identity: 'win@example.com', clientIp: '192.0.2.11', deviceName: 'DESKTOP-LOBBY' });
+    saveActiveDevice({ identity: 'android@example.com', clientIp: '192.0.2.12', deviceName: 'xiaomi-13t-pro' });
+    saveActiveDevice({ identity: 'linux@example.com', clientIp: '192.0.2.13', deviceName: 'ubuntu-workstation' });
+    saveActiveDevice({ identity: 'ios@example.com', clientIp: '192.0.2.14', deviceName: 'iPhone12' });
+    saveActiveDevice({
+      identity: 'voucher@example.com',
+      clientIp: '192.0.2.16',
+      deviceName: 'gh-voucher-acc76b7a-0799-421e-b090-c3d585907222',
+      deviceOs: 'android'
+    });
+    saveActiveDevice({
+      identity: 'expired@example.com',
+      clientIp: '192.0.2.15',
+      deviceName: 'MacBook-Pro',
+      expiresAt: now - 1000
+    });
+
+    const distribution = db.dashboard(now).deviceOs;
+    const counts = new Map(distribution.rows.map(row => [row.os, row.count]));
+    assert.equal(distribution.total, 5);
+    assert.equal(counts.get('windows'), 1);
+    assert.equal(counts.get('android'), 2);
+    assert.equal(counts.get('linux'), 1);
+    assert.equal(counts.get('ios'), 1);
+    assert.equal(counts.has('macos'), false);
+    assert.deepEqual(
+      distribution.rows.find(row => row.os === 'android').devices,
+      ['xiaomi-13t-pro', '192.0.2.16']
+    );
+  } finally {
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('device OS learned for a session is reused for legacy authorizations with the same MAC', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-'));
+  const databasePath = path.join(directory, 'test.db');
+  let db = new HotspotDatabase(databasePath);
+  const now = Date.now();
+  const saveAuthorization = ({ identity, clientIp, clientMac, deviceOs = '' }) => db.saveAuthorization({
+    method: 'email',
+    identity,
+    clientIp,
+    clientMac,
+    gatewayMode: 'mock',
+    gatewaySessionId: `${identity}-session`,
+    status: 'active',
+    expiresAt: now + 60000,
+    redirectUrl: '',
+    gatewayResponse: {},
+    error: '',
+    deviceOs
+  });
+
+  try {
+    const legacy = saveAuthorization({
+      identity: 'legacy@example.com',
+      clientIp: '192.0.2.21',
+      clientMac: 'AA:BB:CC:DD:EE:FF'
+    });
+    const known = saveAuthorization({
+      identity: 'known@example.com',
+      clientIp: '192.0.2.22',
+      clientMac: 'AA:BB:CC:DD:EE:FF',
+      deviceOs: 'android'
+    });
+
+    assert.equal(db.getAuthorization(legacy.id).device_os, null);
+    assert.equal(db.rememberAuthorizationDeviceOs(known.id, 'windows'), 'android');
+    assert.equal(db.getAuthorization(legacy.id).device_os, 'android');
+
+    const learned = saveAuthorization({
+      identity: 'learned@example.com',
+      clientIp: '192.0.2.23',
+      clientMac: '11:22:33:44:55:66'
+    });
+    assert.equal(db.rememberAuthorizationDeviceOs(learned.id, 'ios'), 'ios');
+    assert.equal(db.getAuthorization(learned.id).device_os, 'ios');
+
+    const migrationLegacy = saveAuthorization({
+      identity: 'migration-legacy@example.com',
+      clientIp: '192.0.2.24',
+      clientMac: '22:33:44:55:66:77'
+    });
+    saveAuthorization({
+      identity: 'migration-known@example.com',
+      clientIp: '192.0.2.25',
+      clientMac: '22:33:44:55:66:77',
+      deviceOs: 'windows'
+    });
+    assert.equal(db.getAuthorization(migrationLegacy.id).device_os, null);
+
+    db.close();
+    db = new HotspotDatabase(databasePath);
+    assert.equal(db.getAuthorization(legacy.id).device_os, 'android');
+    assert.equal(db.getAuthorization(migrationLegacy.id).device_os, 'windows');
   } finally {
     db.close();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -444,9 +702,8 @@ test('operational traffic logs can be listed, aggregated and expired', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-'));
   const db = new HotspotDatabase(path.join(directory, 'test.db'));
   const now = Date.UTC(2026, 5, 27, 10, 0, 0);
-  const dayStart = new Date(now);
-  dayStart.setHours(0, 0, 0, 0);
-  const currentRecordAt = dayStart.getTime() + 2 * 60 * 60 * 1000;
+  const currentRecordAt = now - 40 * 60 * 1000;
+  const secondRecordAt = now - 20 * 60 * 1000;
   try {
     const result = db.appendTrafficLogs([
       {
@@ -490,8 +747,8 @@ test('operational traffic logs can be listed, aggregated and expired', () => {
         protocol: 'udp',
         serviceType: 'firewall-pass-out',
         direction: 'outgoing',
-        startedAt: currentRecordAt + 60 * 60 * 1000,
-        endedAt: currentRecordAt + 60 * 60 * 1000,
+        startedAt: secondRecordAt,
+        endedAt: secondRecordAt,
         downloadBytes: 500,
         uploadBytes: 150,
         rawJson: JSON.stringify({
@@ -499,7 +756,7 @@ test('operational traffic logs can be listed, aggregated and expired', () => {
           cumulativeDownloadBytes: 1500,
           cumulativeUploadBytes: 350
         }),
-        createdAt: currentRecordAt + 60 * 60 * 1000
+        createdAt: secondRecordAt
       },
       {
         dedupeKey: 'flow-live',
@@ -546,14 +803,14 @@ test('operational traffic logs can be listed, aggregated and expired', () => {
       skipped: 1
     });
 
-    const daily = db.trafficLogSeries({ period: 'daily', now });
-    assert.equal(daily.source, 'traffic_rollups');
-    assert.equal(daily.summary.totalDownloadBytes, 1100);
-    assert.equal(daily.summary.totalUploadBytes, 1350);
-    assert.equal(daily.points.find(point => point.startAt === currentRecordAt).records, 1);
-    assert.equal(daily.points.find(point => point.startAt === currentRecordAt + 60 * 60 * 1000).downloadBytes, 500);
+    const series = db.trafficLogSeries({ period: '60m', now });
+    assert.equal(series.source, 'traffic_rollups');
+    assert.equal(series.summary.totalDownloadBytes, 1100);
+    assert.equal(series.summary.totalUploadBytes, 1350);
+    assert.equal(series.points.find(point => point.startAt === currentRecordAt).records, 1);
+    assert.equal(series.points.find(point => point.startAt === secondRecordAt).downloadBytes, 500);
 
-    const filtered = db.listTrafficLogs({ search: 'dns.google', period: 'daily', now });
+    const filtered = db.listTrafficLogs({ search: 'dns.google', period: '60m', now });
     assert.equal(filtered.total, 2);
     assert.equal(filtered.rows[0].destination_domain, 'dns.google');
     assert.equal(filtered.rows[0].effective_download_bytes, 500);
@@ -564,7 +821,7 @@ test('operational traffic logs can be listed, aggregated and expired', () => {
     assert.equal(filtered.summary.liveDownloadBps, 0);
     assert.equal(filtered.summary.liveUploadBps, 0);
 
-    const live = db.listTrafficLogs({ period: 'daily', now });
+    const live = db.listTrafficLogs({ period: '60m', now });
     assert.equal(live.summary.liveWindowSeconds, 60);
     assert.equal(live.summary.liveRecords, 1);
     assert.equal(live.summary.liveDownloadBps, 10);
@@ -575,15 +832,19 @@ test('operational traffic logs can be listed, aggregated and expired', () => {
       sourcePort: '5353',
       destinationIp: '8.8.8.8',
       destinationPort: '53',
-      period: 'daily',
+      period: '60m',
       now
     });
     assert.equal(endpointFiltered.total, 2);
     assert.equal(endpointFiltered.summary.downloadBytes, 500);
-    assert.equal(db.listTrafficLogs({ destinationPort: '9999', period: 'daily', now }).total, 0);
+    assert.equal(db.listTrafficLogs({ destinationPort: '9999', period: '60m', now }).total, 0);
 
-    assert.equal(db.cleanupTrafficLogs(1, now), 1);
-    assert.equal(db.listTrafficLogs({ period: 'monthly', now }).total, 3);
+    const cleanup = db.cleanupTrafficLogsDetailed(60, now);
+    assert.equal(cleanup.deleted, 1);
+    assert.equal(cleanup.retentionMinutes, 60);
+    assert.equal(cleanup.deletedRollups, Object.values(cleanup.rollups).reduce((sum, value) => sum + value, 0));
+    assert.equal(db.cleanupTrafficLogs(60, now), 0);
+    assert.equal(db.listTrafficLogs({ period: '60m', now }).total, 3);
   } finally {
     db.close();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -666,13 +927,13 @@ test('traffic rollups drive dashboard series and top sites', () => {
       }
     ]);
 
-    const series = db.trafficLogSeries({ period: 'hourly', now });
+    const series = db.trafficLogSeries({ period: '60m', now });
     assert.equal(series.source, 'traffic_rollups');
     assert.equal(series.summary.records, 4);
     assert.equal(series.summary.totalDownloadBytes, 850);
     assert.equal(series.summary.totalUploadBytes, 110);
 
-    const topSites = db.topTrafficLogSites({ hours: 6, now });
+    const topSites = db.topTrafficLogSites({ minutes: 60, now });
     assert.equal(topSites.source, 'traffic_rollups');
     assert.equal(topSites.totalSites, 2);
     assert.equal(topSites.totalVisits, 3);
@@ -680,12 +941,12 @@ test('traffic rollups drive dashboard series and top sites', () => {
     assert.equal(topSites.rows[0].clients, 2);
     assert.equal(topSites.rows[0].totalBytes, 350);
 
-    const topBandwidthSites = db.topTrafficLogSites({ hours: 6, sort: 'bytes', now });
+    const topBandwidthSites = db.topTrafficLogSites({ minutes: 60, sort: 'bytes', now });
     assert.equal(topBandwidthSites.sort, 'bytes');
     assert.deepEqual(topBandwidthSites.rows.map(row => row.site), ['other.example', 'example.com']);
     assert.equal(topBandwidthSites.rows[0].totalBytes, 550);
 
-    const topClients = db.topTrafficLogClients({ hours: 6, now });
+    const topClients = db.topTrafficLogClients({ minutes: 60, now });
     assert.equal(topClients.totalClients, 3);
     assert.deepEqual(topClients.rows.map(row => row.clientIp), ['172.16.2.40', '172.16.2.41', '172.16.2.42']);
     assert.equal(topClients.rows[0].totalBytes, 770);
@@ -738,18 +999,18 @@ test('traffic rollups drive dashboard series and top sites', () => {
         createdAt: now - 4 * 60 * 1000
       }
     ]);
-    const scopedTopClients = db.topTrafficLogClients({ hours: 6, networks: '172.16.2.0/24', now });
+    const scopedTopClients = db.topTrafficLogClients({ minutes: 60, networks: '172.16.2.0/24', now });
     assert.deepEqual(scopedTopClients.rows.map(row => row.clientIp), ['172.16.2.40', '172.16.2.41', '172.16.2.42']);
     assert.equal(scopedTopClients.rows[0].source, 'sessions');
     assert.equal(scopedTopClients.rows[0].totalBytes, 910);
-    const allOpnsenseClients = db.topTrafficLogClients({ hours: 6, networks: 'any', excludedInterfaces: ['wan'], now });
+    const allOpnsenseClients = db.topTrafficLogClients({ minutes: 60, networks: 'any', excludedInterfaces: ['wan'], now });
     assert.equal(allOpnsenseClients.rows.some(row => row.clientIp === '10.10.10.25'), true);
     assert.equal(allOpnsenseClients.rows.some(row => row.clientIp === '192.168.1.144'), false);
 
     db.db.prepare('DELETE FROM traffic_log_client_detail_minute_rollups').run();
     db.setRuntimeState('traffic_log_rollups_version', 'v1', now);
     db.ensureTrafficLogRollups({ now });
-    const migratedClients = db.topTrafficLogClients({ hours: 6, networks: 'any', excludedInterfaces: ['wan'], now });
+    const migratedClients = db.topTrafficLogClients({ minutes: 60, networks: 'any', excludedInterfaces: ['wan'], now });
     assert.equal(migratedClients.rows.some(row => row.clientIp === '10.10.10.25'), true);
     assert.equal(migratedClients.rows.some(row => row.clientIp === '192.168.1.144'), false);
   } finally {
@@ -765,7 +1026,7 @@ test('operational traffic file logs can be filtered and expired', () => {
     databasePath: path.join(directory, 'hotspot.db'),
     trafficLogs: {
       enabled: true,
-      retentionDays: 30,
+      retentionMinutes: 60,
       resolveDomains: false,
       liveRefreshSeconds: 5
     }
@@ -859,13 +1120,13 @@ test('operational traffic file logs can be filtered and expired', () => {
     assert.equal(filtered.summary.liveDownloadBps, 0);
     assert.equal(filtered.summary.liveUploadBps, 0);
 
-    const live = listTrafficLogFileRecords(config, { period: 'daily', now });
+    const live = listTrafficLogFileRecords(config, { period: '60m', now });
     assert.equal(live.summary.liveWindowSeconds, 60);
     assert.equal(live.summary.liveRecords, 1);
     assert.equal(live.summary.liveDownloadBps, 2);
     assert.equal(live.summary.liveUploadBps, 4);
 
-    const series = trafficLogFileSeries(config, { period: 'daily', now });
+    const series = trafficLogFileSeries(config, { period: '60m', now });
     assert.equal(series.source, 'traffic_log_file');
     assert.equal(series.summary.totalDownloadBytes, 620);
     assert.equal(series.summary.totalUploadBytes, 315);
@@ -873,16 +1134,16 @@ test('operational traffic file logs can be filtered and expired', () => {
     assert.equal(series.summary.liveClients, 1);
     assert.equal(series.points.reduce((sum, point) => sum + point.records, 0), 2);
 
-    const topSites = topTrafficLogFileSites(config, { hours: 6, now });
+    const topSites = topTrafficLogFileSites(config, { minutes: 60, now });
     assert.deepEqual(topSites.rows.map(row => row.site), ['dns.google', 'dns.quad9.net']);
     assert.equal(topSites.totalVisits, 2);
 
-    const topBandwidthSites = topTrafficLogFileSites(config, { hours: 6, sort: 'bytes', now });
+    const topBandwidthSites = topTrafficLogFileSites(config, { minutes: 60, sort: 'bytes', now });
     assert.equal(topBandwidthSites.sort, 'bytes');
     assert.deepEqual(topBandwidthSites.rows.map(row => row.site), ['dns.google', 'dns.quad9.net']);
     assert.equal(topBandwidthSites.rows[0].totalBytes, 575);
 
-    const topClients = topTrafficLogFileClients(config, { hours: 6, now });
+    const topClients = topTrafficLogFileClients(config, { minutes: 60, now });
     assert.equal(topClients.totalClients, 2);
     assert.deepEqual(topClients.rows.map(row => row.clientIp), ['172.16.2.21', '172.16.2.22']);
     assert.equal(topClients.rows[0].totalBytes, 575);
@@ -918,14 +1179,14 @@ test('operational traffic file logs can be filtered and expired', () => {
       rawJson: JSON.stringify({ interface: 'lan' }),
       createdAt: now - 19 * 60 * 1000
     }], { now });
-    const scopedTopClients = topTrafficLogFileClients(config, { hours: 6, networks: '172.16.2.0/24', now });
+    const scopedTopClients = topTrafficLogFileClients(config, { minutes: 60, networks: '172.16.2.0/24', now });
     assert.deepEqual(scopedTopClients.rows.map(row => row.clientIp), ['172.16.2.21', '172.16.2.22']);
-    const allOpnsenseClients = topTrafficLogFileClients(config, { hours: 6, networks: 'any', excludedInterfaces: ['wan'], now });
+    const allOpnsenseClients = topTrafficLogFileClients(config, { minutes: 60, networks: 'any', excludedInterfaces: ['wan'], now });
     assert.equal(allOpnsenseClients.rows.some(row => row.clientIp === '10.10.10.25'), true);
     assert.equal(allOpnsenseClients.rows.some(row => row.clientIp === '192.168.1.144'), false);
 
-    assert.equal(cleanupTrafficLogFile(config, 1, now).deleted, 1);
-    assert.equal(listTrafficLogFileRecords(config, { period: 'monthly', now }).total, 4);
+    assert.equal(cleanupTrafficLogFile(config, 60, now).deleted, 1);
+    assert.equal(listTrafficLogFileRecords(config, { period: '60m', now }).total, 4);
     appendTrafficLogFileRecords(config, [{
       dedupeKey: 'traffic-file-after-index',
       kind: 'flow',
@@ -942,7 +1203,7 @@ test('operational traffic file logs can be filtered and expired', () => {
       uploadBytes: 20,
       createdAt: now - 5 * 1000
     }], { now });
-    const updated = listTrafficLogFileRecords(config, { period: 'monthly', now });
+    const updated = listTrafficLogFileRecords(config, { period: '60m', now });
     assert.equal(updated.total, 5);
     assert.equal(updated.rows[0].dedupe_key, 'traffic-file-after-index');
   } finally {
@@ -957,7 +1218,7 @@ test('operational traffic file series prefers WAN interface counters for totals'
     databasePath: path.join(directory, 'hotspot.db'),
     trafficLogs: {
       enabled: true,
-      retentionDays: 30,
+      retentionMinutes: 60,
       resolveDomains: false,
       liveRefreshSeconds: 5
     }
@@ -987,28 +1248,28 @@ test('operational traffic file series prefers WAN interface counters for totals'
       ...samples.map(sample => trafficLogRecordFromInterfaceCounters(sample, { enabled: true }))
     ], { now });
 
-    const series = trafficLogFileSeries(config, { period: 'daily', now });
+    const series = trafficLogFileSeries(config, { period: '60m', now });
     assert.equal(series.source, 'traffic_log_wan_interface');
     assert.equal(series.interfaceName, 'wan');
     assert.equal(series.summary.totalDownloadBytes, 2000);
     assert.equal(series.summary.totalUploadBytes, 700);
     assert.equal(series.points.reduce((sum, point) => sum + point.records, 0), 3);
 
-    const hourly = trafficLogFileSeries(config, { period: 'hourly', now });
-    assert.equal(hourly.period, 'hourly');
-    assert.equal(hourly.bucket, '5min');
-    assert.equal(hourly.points.length, 12);
-    assert.equal(hourly.summary.totalDownloadBytes, 2000);
+    const fifteenMinutes = trafficLogFileSeries(config, { period: '15m', now });
+    assert.equal(fifteenMinutes.period, '15m');
+    assert.equal(fifteenMinutes.bucket, 'minute');
+    assert.equal(fifteenMinutes.points.length, 15);
+    assert.equal(fifteenMinutes.summary.totalDownloadBytes, 500);
 
-    const sixHours = trafficLogFileSeries(config, { period: '6h', now });
-    assert.equal(sixHours.period, '6h');
-    assert.equal(sixHours.bucket, '30min');
-    assert.equal(sixHours.points.length, 12);
+    const thirtyMinutes = trafficLogFileSeries(config, { period: '30m', now });
+    assert.equal(thirtyMinutes.period, '30m');
+    assert.equal(thirtyMinutes.bucket, 'minute');
+    assert.equal(thirtyMinutes.points.length, 30);
 
-    const twelveHours = trafficLogFileSeries(config, { period: '12h', now });
-    assert.equal(twelveHours.period, '12h');
-    assert.equal(twelveHours.bucket, 'hour');
-    assert.equal(twelveHours.points.length, 12);
+    const fortyFiveMinutes = trafficLogFileSeries(config, { period: '45m', now });
+    assert.equal(fortyFiveMinutes.period, '45m');
+    assert.equal(fortyFiveMinutes.bucket, 'minute');
+    assert.equal(fortyFiveMinutes.points.length, 45);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -1081,6 +1342,10 @@ test('database vacuum compacts free pages and reports maintenance stats', () => 
 
     const before = db.databaseMaintenanceStats();
     assert.ok(before.freelistCount > 0);
+    const checkpoint = db.checkpointDatabase('TRUNCATE');
+    assert.equal(checkpoint.ok, true);
+    assert.equal(checkpoint.mode, 'TRUNCATE');
+    assert.ok(checkpoint.after.totalFileBytes <= checkpoint.before.totalFileBytes);
     const result = db.vacuumDatabase();
     assert.equal(result.ok, true);
     assert.equal(result.before.path, path.join(directory, 'hotspot.db'));

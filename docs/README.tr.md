@@ -26,7 +26,7 @@ Bu doküman GitHub için teknik kurulum, üretim notları, OPNsense API yetkiler
 
 Bu repodaki mevcut durum için net sınırlar:
 
-- Uygulama sürümü: `1.0.0`
+- Uygulama sürümü: `1.1.0`
 - Node.js gereksinimi: `>=24.0.0`
 - Veritabanı: Node.js yerleşik `node:sqlite`
 - Varsayılan gateway modu: `mock`
@@ -824,7 +824,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/USER/g-hotspot/data
+ReadWritePaths=/home/USER/g-hotspot/data /home/USER/g-hotspot/android/app
 
 [Install]
 WantedBy=default.target
@@ -840,7 +840,7 @@ systemctl --user enable --now g-hotspot
 journalctl --user -u g-hotspot -f
 ```
 
-Sistem servisi olarak çalıştıracaksanız kullanıcı, dizin izinleri ve `ReadWritePaths` değerlerini kendi kurulumunuza göre düzenleyin.
+Sistem servisi olarak çalıştıracaksanız kullanıcı, dizin izinleri ve `ReadWritePaths` değerlerini kendi kurulumunuza göre düzenleyin. Android APK üretme özelliği için servis kullanıcısının proje dizinindeki `android/app` yoluna yazabilmesi gerekir; Gradle çalışma dosyaları sistemin geçici dizininde oluşturulur. Üretici özel debug imza anahtarını `android/app/.android` altında kalıcı tutar; sonraki APK dosyalarının kurulu uygulamayı güncelleyebilmesi için bu dizini koruyun.
 
 ## Güvenlik ve gizlilik
 

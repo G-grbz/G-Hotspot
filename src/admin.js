@@ -1,5 +1,7 @@
 import { generateSecret, generateVoucherCode, keyedHash, normalizeIp, normalizeVoucher, safeEqualHex } from './lib/security.js';
-import { HttpError, getClientIp, readJson, sendJson } from './lib/http.js';
+import { HttpError, getClientIp, readBody, readJson, sendJson } from './lib/http.js';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
 import { isIP } from 'node:net';
 import {
   authorizeGateway, deleteGatewayKeaDhcpLease, disconnectGatewaySession, ensureGatewayBandwidthLimits,
@@ -25,6 +27,14 @@ import {
   normalizeActiveAuthorizationDurations
 } from './services/access.js';
 import { sendAdminApprovalNotification, sendSystemNotification } from './services/notifications.js';
+import { queueAndroidSystemNotification } from './services/androidNotifications.js';
+import {
+  GOOGLE_SERVICES_MAX_BYTES,
+  androidBuildStatus,
+  androidProjectPaths,
+  saveGoogleServicesConfig,
+  startAndroidBuild
+} from './services/androidBuild.js';
 import {
   appearanceAssets, deleteAppearanceAsset, saveAppearanceAsset, saveAppearanceAssetChunk
 } from './appearance.js';
@@ -48,7 +58,10 @@ import {
   trafficLogRecordFromSession,
   trafficLogSettings
 } from './services/trafficLogs.js';
-import { OPNSENSE_TEMPLATE_DEFAULTS, createOpnsenseTemplateZip } from './services/opnsenseTemplate.js';
+import {
+  OPNSENSE_TEMPLATE_DEFAULTS,
+  createOpnsenseTemplateZip
+} from './services/opnsenseTemplate.js';
 import { projectAbout } from './about.js';
 
 const GATEWAY_COUNTER_INHERIT_GRACE_MS = 5000;
@@ -63,6 +76,12 @@ const RELEASE_REPOSITORY = {
   url: 'https://github.com/G-grbz/G-Hotspot',
   futureUrl: 'https://github.com/G-grbz/G-Hotspot'
 };
+
+function gatewayProviderName(gateway = config.gateway) {
+  // TODO(pfSense): Restore the pfSense label when the provider is enabled again.
+  // if (gateway?.mode === 'pfsense-api') return 'pfSense';
+  return 'OPNsense';
+}
 
 function cookieValue(request, name) {
   const cookies = String(request.headers.cookie || '').split(';');
@@ -218,13 +237,18 @@ function ipListField(row, names) {
 
 function buildArpLookup(rows) {
   const ipToMac = new Map();
+  const ipToDeviceName = new Map();
+  const macToDeviceName = new Map();
   for (const row of rows) {
-    if (!isIpv4(row.clientIp)) continue;
     const mac = normalizedMac(row.clientMac);
-    if (!mac) continue;
-    ipToMac.set(row.clientIp, mac);
+    const deviceName = textField(row, ['deviceName', 'hostname', 'hostName']);
+    if (isIpv4(row.clientIp)) {
+      if (mac) ipToMac.set(row.clientIp, mac);
+      if (deviceName && !ipToDeviceName.has(row.clientIp)) ipToDeviceName.set(row.clientIp, deviceName);
+    }
+    if (mac && deviceName && !macToDeviceName.has(mac)) macToDeviceName.set(mac, deviceName);
   }
-  return { ipToMac };
+  return { ipToMac, ipToDeviceName, macToDeviceName };
 }
 
 function normalizeGatewaySession(row) {
@@ -307,7 +331,7 @@ function gatewaySessionStartedBeforeAuthorization(row, authorization) {
 }
 
 function periodParam(value) {
-  return ['hourly', '6h', '12h', 'daily', 'weekly', 'monthly'].includes(value) ? value : 'daily';
+  return ['15m', '30m', '45m', '60m'].includes(value) ? value : '60m';
 }
 
 export function releaseVersion(value) {
@@ -427,7 +451,7 @@ function trafficLogQuery(url, { limit = 150, offset = 0, order = 'desc' } = {}) 
   return {
     search: url.searchParams.get('search') || '',
     kind: url.searchParams.get('kind') || '',
-    period: periodParam(url.searchParams.get('period') || 'daily'),
+    period: periodParam(url.searchParams.get('period') || '60m'),
     sourceIp: url.searchParams.get('sourceIp') || '',
     sourcePort: url.searchParams.get('sourcePort') || '',
     destinationIp: url.searchParams.get('destinationIp') || '',
@@ -497,7 +521,8 @@ export function createAdminController({
   syslogReceiverStatus = () => null,
   syslogAutoExportStatus = () => null,
   syslogHealthStatus = () => null,
-  releaseFetcher = globalThis.fetch
+  releaseFetcher = globalThis.fetch,
+  projectRoot = process.cwd()
 }) {
   if (!config.syslog && config.law5651) config.syslog = config.law5651;
   if (!config.law5651 && config.syslog) config.law5651 = config.syslog;
@@ -574,13 +599,17 @@ export function createAdminController({
     return [config.gateway?.shaperInterface || 'wan'];
   }
 
-  function cleanupTrafficLogFileIfDue(storageConfig, retentionDays, now = Date.now()) {
+  function gatewayTrafficInterfaceName() {
+    return config.gateway?.shaperInterface || 'wan';
+  }
+
+  function cleanupTrafficLogFileIfDue(storageConfig, retentionMinutes, now = Date.now()) {
     const settings = trafficLogSettings(storageConfig);
     if (now - trafficLogFileCleanupState.lastRunAt < TRAFFIC_LOG_FILE_CLEANUP_INTERVAL_MS) {
       return { deleted: 0, kept: 0, skipped: true, filePath: settings.logFile };
     }
     trafficLogFileCleanupState.lastRunAt = now;
-    return cleanupTrafficLogFile(storageConfig, retentionDays, now);
+    return cleanupTrafficLogFile(storageConfig, retentionMinutes, now);
   }
 
   function listTrafficLogs(options = {}) {
@@ -619,29 +648,29 @@ export function createAdminController({
       : { period, source: 'disabled', points: [], summary: {} };
   }
 
-  function dashboardTopSites(hours, now = Date.now()) {
+  function dashboardTopSites(minutes, now = Date.now()) {
     const storageConfig = trafficLogStorageConfig();
     const settings = trafficLogSettings(storageConfig);
-    if (db.topTrafficLogSites) return db.topTrafficLogSites({ hours, limit: 10, now });
+    if (db.topTrafficLogSites) return db.topTrafficLogSites({ minutes, limit: 10, now });
     return settings.enabled
-      ? topTrafficLogFileSites(storageConfig, { hours, limit: 10, now })
-      : { source: 'disabled', hours: 6, limit: 10, rows: [], totalVisits: 0, totalSites: 0 };
+      ? topTrafficLogFileSites(storageConfig, { minutes, limit: 10, now })
+      : { source: 'disabled', minutes: 60, limit: 10, rows: [], totalVisits: 0, totalSites: 0 };
   }
 
-  function dashboardTopBandwidthClients(hours, now = Date.now()) {
+  function dashboardTopBandwidthClients(minutes, now = Date.now()) {
     const storageConfig = trafficLogStorageConfig();
     const settings = trafficLogSettings(storageConfig);
     const networks = localTrafficClientNetworks();
     const excludedInterfaces = localTrafficExcludedInterfaces();
-    if (db.topTrafficLogClients) return db.topTrafficLogClients({ hours, limit: 10, networks, excludedInterfaces, now });
+    if (db.topTrafficLogClients) return db.topTrafficLogClients({ minutes, limit: 10, networks, excludedInterfaces, now });
     return settings.enabled
-      ? topTrafficLogFileClients(storageConfig, { hours, limit: 10, networks, excludedInterfaces, now })
-      : { source: 'disabled', hours: 6, limit: 10, rows: [], totalRecords: 0, totalClients: 0 };
+      ? topTrafficLogFileClients(storageConfig, { minutes, limit: 10, networks, excludedInterfaces, now })
+      : { source: 'disabled', minutes: 60, limit: 10, rows: [], totalRecords: 0, totalClients: 0 };
   }
 
   async function gatewayLiveInterfaceTraffic() {
-    if (config.gateway.mode !== 'opnsense-api') {
-      return { liveSource: 'gateway_interface_unavailable', liveError: 'OPNsense API mode is not active.' };
+    if (config.gateway.mode === 'mock') {
+      return { liveSource: 'gateway_interface_unavailable', liveError: 'A real gateway mode is not active.' };
     }
     const now = Date.now();
     if (now - gatewayTrafficState.checkedAt < 3000) {
@@ -649,7 +678,7 @@ export function createAdminController({
     }
     gatewayTrafficState.checkedAt = now;
     try {
-      const sample = await readGatewayInterfaceTrafficCounters(config.gateway, config.gateway.shaperInterface || 'wan');
+      const sample = await readGatewayInterfaceTrafficCounters(config.gateway, gatewayTrafficInterfaceName());
       gatewayTrafficState.previous = gatewayTrafficState.current;
       gatewayTrafficState.current = sample;
       gatewayTrafficState.error = '';
@@ -784,7 +813,9 @@ export function createAdminController({
   }
 
   function systemNotification(eventType, severity, message, detail = {}) {
-    return sendSystemNotification(config, { eventType, severity, message, detail })
+    return sendSystemNotification(config, { eventType, severity, message, detail }, {
+      androidNotifier: payload => queueAndroidSystemNotification(db, config, payload)
+    })
       .catch(error => {
         console.warn(`System notification failed: ${error.message}`);
         return { sent: 0, failed: 1, error: error.message };
@@ -831,11 +862,16 @@ export function createAdminController({
 
   async function notifyOpnsenseConnectionLost(error) {
     if (db.getRuntimeState('opnsense_connection_lost_notified')?.value === 'true') return;
-    const result = await systemNotification('opnsense_connection_lost', 'error', 'OPNsense connection lost.', {
-      error: error.message,
-      gatewayMode: config.gateway.mode,
-      gatewayBaseUrl: config.gateway.baseUrl || ''
-    });
+    const result = await systemNotification(
+      'opnsense_connection_lost',
+      'error',
+      `${gatewayProviderName(config.gateway)} connection lost.`,
+      {
+        error: error.message,
+        gatewayMode: config.gateway.mode,
+        gatewayBaseUrl: config.gateway.baseUrl || ''
+      }
+    );
     if (!result?.skipped) {
       db.setRuntimeState('opnsense_connection_lost_notified', 'true');
     }
@@ -1115,13 +1151,13 @@ export function createAdminController({
     try {
       arpRows = await listGatewayArpEntries(config.gateway);
     } catch (error) {
-      console.warn(`OPNsense ARP table could not be read: ${error.message}`);
+      console.warn(`${gatewayProviderName(config.gateway)} ARP table could not be read: ${error.message}`);
     }
     let dhcpRows = [];
     try {
       dhcpRows = await listGatewayDhcpLeases(config.gateway);
     } catch (error) {
-      console.warn(`OPNsense DHCP leases could not be read: ${error.message}`);
+      console.warn(`${gatewayProviderName(config.gateway)} DHCP leases could not be read: ${error.message}`);
     }
     const arpLookup = buildArpLookup([...arpRows, ...dhcpRows]);
     let matched = 0;
@@ -1135,9 +1171,9 @@ export function createAdminController({
     const syslogRecords = [];
     const trafficSettings = trafficLogSettings(config);
     const trafficRecords = [];
-    if (trafficSettings.enabled && config.gateway.mode === 'opnsense-api') {
+    if (trafficSettings.enabled && config.gateway.mode !== 'mock') {
       try {
-        const sample = await readGatewayInterfaceTrafficCounters(config.gateway, config.gateway.shaperInterface || 'wan');
+        const sample = await readGatewayInterfaceTrafficCounters(config.gateway, gatewayTrafficInterfaceName());
         gatewayTrafficState.previous = gatewayTrafficState.current;
         gatewayTrafficState.current = sample;
         gatewayTrafficState.checkedAt = sample.sampledAt || Date.now();
@@ -1151,7 +1187,7 @@ export function createAdminController({
         const warningAt = Date.now();
         if (warningAt - interfaceCounterLogState.lastWarningAt > 60 * 1000) {
           interfaceCounterLogState.lastWarningAt = warningAt;
-          console.warn(`OPNsense interface traffic counters could not be logged: ${error.message}`);
+          console.warn(`${gatewayProviderName(config.gateway)} interface traffic counters could not be logged: ${error.message}`);
         }
       }
     }
@@ -1193,7 +1229,7 @@ export function createAdminController({
               await notifyAccessExpired(authorization);
             }
           } catch (error) {
-            console.warn(`Expired OPNsense session could not be disconnected: ${error.message}`);
+            console.warn(`Expired ${gatewayProviderName(config.gateway)} session could not be disconnected: ${error.message}`);
           }
         }
         matched += 1;
@@ -1204,7 +1240,7 @@ export function createAdminController({
         staleIpAction = await repairStaleIpSession(row, authorization, arpLookup);
       } catch (error) {
         staleIpFailed += 1;
-        console.warn(`Stale OPNsense session could not be repaired: ${error.message}`);
+        console.warn(`Stale ${gatewayProviderName(config.gateway)} session could not be repaired: ${error.message}`);
         matched += 1;
         continue;
       }
@@ -1226,6 +1262,7 @@ export function createAdminController({
         downloadBytes: usageDownloadBytes,
         uploadBytes: usageUploadBytes,
         clientMac: usageClientMac(row, authorization, arpLookup),
+        deviceName: usageDeviceName(row, authorization, arpLookup),
         sampledAt,
         allowDecrease: Boolean(quota?.resetAt)
       });
@@ -1262,12 +1299,12 @@ export function createAdminController({
       const databaseResult = db.appendTrafficLogs(enrichedTrafficRecords);
       const storageConfig = trafficLogStorageConfig();
       const fileResult = appendTrafficLogFileRecords(storageConfig, enrichedTrafficRecords);
-      const fileCleanup = cleanupTrafficLogFileIfDue(storageConfig, trafficSettings.retentionDays);
+      const fileCleanup = cleanupTrafficLogFileIfDue(storageConfig, trafficSettings.retentionMinutes);
       traffic = {
         enabled: true,
         eligible: trafficRecords.length,
         ...databaseResult,
-        deletedExpired: db.cleanupTrafficLogs(trafficSettings.retentionDays),
+        deletedExpired: db.cleanupTrafficLogs(trafficSettings.retentionMinutes),
         file: {
           inserted: fileResult.inserted,
           skipped: fileResult.skipped,
@@ -1331,6 +1368,29 @@ export function createAdminController({
     return rowMac;
   }
 
+  function usageDeviceName(row, authorization, arpLookup) {
+    const rowName = textField(row, ['deviceName', 'hostname', 'hostName']);
+    if (rowName) return rowName;
+    const ips = [
+      row.clientIp,
+      authorization.client_ip,
+      ...(Array.isArray(row.clientIps) ? row.clientIps : [])
+    ].filter((ip, index, list) => isIpv4(ip) && list.indexOf(ip) === index);
+    for (const ip of ips) {
+      const name = arpLookup.ipToDeviceName.get(ip);
+      if (name) return name;
+    }
+    const macs = [
+      normalizedMac(row.clientMac),
+      normalizedMac(authorization.client_mac)
+    ].filter((mac, index, list) => mac && list.indexOf(mac) === index);
+    for (const mac of macs) {
+      const name = arpLookup.macToDeviceName.get(mac);
+      if (name) return name;
+    }
+    return '';
+  }
+
   async function repairStaleIpSession(row, authorization, arpLookup) {
     if (!row.sessionId || !isIpv4(row.clientIp)) return '';
     const authorizationMac = normalizedMac(authorization.client_mac);
@@ -1381,7 +1441,7 @@ export function createAdminController({
         }
       } catch (error) {
         failed += 1;
-        console.warn(`Expired OPNsense session could not be disconnected: ${error.message}`);
+        console.warn(`Expired ${gatewayProviderName(config.gateway)} session could not be disconnected: ${error.message}`);
       }
     }
     return {
@@ -1404,6 +1464,286 @@ export function createAdminController({
       console.warn(`Admin approval notification failed: ${error.message}`);
       return { sent: 0, failed: 1, error: error.message };
     }
+  }
+
+  function androidDevicePublic(row) {
+    return {
+      id: row.id,
+      adminUser: row.admin_user,
+      name: row.name || '',
+      appVersion: row.app_version || '',
+      platformVersion: row.platform_version || '',
+      clientIp: row.client_ip || '',
+      enabled: Boolean(row.enabled),
+      status: row.status || (row.enabled ? 'approved' : 'disabled'),
+      pairingCodeHint: row.pairing_code_hint || '',
+      approvedAt: row.approved_at == null ? null : Number(row.approved_at),
+      approvedBy: row.approved_by || '',
+      createdAt: Number(row.created_at || 0),
+      updatedAt: Number(row.updated_at || 0),
+      lastSeenAt: row.last_seen_at == null ? null : Number(row.last_seen_at)
+    };
+  }
+
+  function androidTokenFromRequest(request) {
+    const header = request.headers['x-gh-android-token'];
+    return typeof header === 'string' ? header.trim() : '';
+  }
+
+  function androidTokenHash(token) {
+    return token ? keyedHash(config.appSecret, token) : '';
+  }
+
+  function normalizeAndroidPairingCode(value) {
+    return String(value || '').toUpperCase().replace(/[^A-Z0-9]/gu, '').slice(0, 16);
+  }
+
+  function generateAndroidPairingCode() {
+    return generateVoucherCode().replaceAll('-', '').slice(0, 8);
+  }
+
+  function publicServerBaseUrl(request) {
+    return opnsenseTemplateDefaultTargetUrl(request).replace(/\/$/u, '');
+  }
+
+  function androidPairingUri(request, code) {
+    return `ghotspot://pair?server=${encodeURIComponent(publicServerBaseUrl(request))}&code=${encodeURIComponent(code)}`;
+  }
+
+  function androidPairingQrDataUri(value) {
+    try {
+      const result = spawnSync('qrencode', ['-t', 'SVG', '-o', '-', '-m', '1'], {
+        input: String(value || ''),
+        encoding: 'utf8',
+        timeout: 2000,
+        maxBuffer: 128 * 1024
+      });
+      if (result.status !== 0 || !result.stdout) return '';
+      return `data:image/svg+xml;base64,${Buffer.from(result.stdout, 'utf8').toString('base64')}`;
+    } catch {
+      return '';
+    }
+  }
+
+  async function registerAndroidDevice(request, session) {
+    const { value } = await readJson(request);
+    const suppliedToken = androidTokenFromRequest(request);
+    const existing = suppliedToken
+      ? db.getAndroidDeviceByTokenHash(androidTokenHash(suppliedToken))
+      : null;
+    const name = adminApprovalMessage(value.name || value.deviceName, 'Android');
+    const metadata = {
+      adminUser: session.username,
+      name,
+      appVersion: String(value.appVersion || '').slice(0, 40),
+      platformVersion: String(value.platformVersion || '').slice(0, 80),
+      userAgent: String(request.headers['user-agent'] || '').slice(0, 300),
+      clientIp: getClientIp(request, config.trustProxy)
+    };
+    if (existing) {
+      const device = db.updateAndroidDevice(existing.id, metadata);
+      audit(request, session, 'android_device_registered', 'android_device', device.id, {
+        reused: true,
+        name: device.name || ''
+      });
+      return { device, token: suppliedToken };
+    }
+    const token = generateSecret(32);
+    const device = db.createAndroidDevice({
+      ...metadata,
+      tokenHash: androidTokenHash(token)
+    });
+    audit(request, session, 'android_device_registered', 'android_device', device.id, {
+      reused: false,
+      name: device.name || ''
+    });
+    return { device, token };
+  }
+
+  function createAndroidPairingCode(request, session) {
+    let code = '';
+    let pairingCode = null;
+    for (let attempts = 0; attempts < 5 && !pairingCode; attempts += 1) {
+      code = generateAndroidPairingCode();
+      try {
+        pairingCode = db.createAndroidPairingCode({
+          codeHash: androidTokenHash(normalizeAndroidPairingCode(code)),
+          codeHint: code.slice(-4),
+          createdBy: session.username,
+          expiresAt: Date.now() + 10 * 60 * 1000
+        });
+      } catch {
+        pairingCode = null;
+      }
+    }
+    if (!pairingCode) throw new HttpError(500, 'Android pairing code could not be created', 'android_pairing_failed');
+    audit(request, session, 'android_pairing_code_created', 'android_pairing', pairingCode.id, {
+      codeHint: pairingCode.code_hint
+    });
+    const pairingUri = androidPairingUri(request, code);
+    return {
+      id: pairingCode.id,
+      code,
+      codeHint: pairingCode.code_hint,
+      expiresAt: Number(pairingCode.expires_at),
+      pairingUri,
+      qrDataUri: androidPairingQrDataUri(pairingUri),
+      serverUrl: publicServerBaseUrl(request)
+    };
+  }
+
+  function approveAndroidDevice(request, session, id) {
+    const device = db.approveAndroidDevice(id, { adminUser: session.username });
+    if (!device) throw new HttpError(404, 'Pending Android device not found', 'android_device_not_found');
+    audit(request, session, 'android_device_approved', 'android_device', id, {
+      name: device.name || '',
+      pairingCodeHint: device.pairing_code_hint || ''
+    });
+    return device;
+  }
+
+  function rejectAndroidDevice(request, session, id) {
+    const current = db.getAndroidDevice(id);
+    if (!current || current.status !== 'pending') {
+      throw new HttpError(404, 'Pending Android device not found', 'android_device_not_found');
+    }
+    const device = db.disableAndroidDevice(id);
+    audit(request, session, 'android_device_rejected', 'android_device', id, {
+      name: device.name || '',
+      pairingCodeHint: device.pairing_code_hint || ''
+    });
+    return device;
+  }
+
+  async function decideAdminApproval({ request, session, id, action, value = {} }) {
+    const approvalRequest = db.getAdminApprovalRequest(id);
+    if (!approvalRequest) throw new HttpError(404, 'Admin approval request not found', 'admin_approval_not_found');
+    if (approvalRequest.status !== 'pending') {
+      throw new HttpError(409, 'Admin approval request is no longer pending', 'admin_approval_not_pending');
+    }
+    if (Number(approvalRequest.request_expires_at) < Date.now()) {
+      db.expireAdminApprovalRequests();
+      throw new HttpError(410, 'Admin approval request has expired', 'admin_approval_expired');
+    }
+
+    if (action === 'approve') {
+      const message = adminApprovalMessage(value.message, config.adminApproval.approveText);
+      let result;
+      try {
+        result = await grantAccess({
+          db,
+          config,
+          method: 'admin-approval',
+          identity: approvalRequest.identity,
+          clientIp: approvalRequest.client_ip,
+          clientMac: approvalRequest.client_mac,
+          duration: config.adminApproval.accessDuration,
+          redirectUrl: approvalRequest.redirect_url,
+          deviceOs: approvalRequest.device_os
+        });
+      } catch (error) {
+        const failed = db.decideAdminApprovalRequest(id, {
+          status: 'failed',
+          adminUser: session.username,
+          message,
+          authorizationId: error.authorizationId || '',
+          error: error.message
+        }) || db.getAdminApprovalRequest(id);
+        db.dismissAndroidNotificationsForAdminApprovalRequest(id);
+        audit(request, session, 'admin_approval_failed', 'admin_approval', id, {
+          clientIp: approvalRequest.client_ip,
+          error: error.message
+        });
+        return {
+          statusCode: error.code === 'quota_exceeded' ? 429 : 502,
+          body: {
+            ok: false,
+            request: failed,
+            error: error.code === 'quota_exceeded' ? 'quota_exceeded' : 'gateway_failed',
+            message: error.message,
+            retryAt: error.retryAt || null
+          }
+        };
+      }
+      const decided = db.decideAdminApprovalRequest(id, {
+        status: 'approved',
+        adminUser: session.username,
+        message,
+        authorizationId: result.authorizationId
+      });
+      if (!decided) throw new HttpError(409, 'Admin approval request is no longer pending', 'admin_approval_not_pending');
+      await notifyUserVerified(result, {
+        method: 'admin-approval',
+        identity: approvalRequest.identity,
+        clientIp: approvalRequest.client_ip,
+        clientMac: approvalRequest.client_mac
+      });
+      const notification = await notifyAdminApprovalDecision(decided, {
+        status: 'approved',
+        message,
+        decidedAt: decided.decided_at,
+        expiresAt: result.expiresAt
+      });
+      db.dismissAndroidNotificationsForAdminApprovalRequest(id);
+      audit(request, session, 'admin_approval_approved', 'admin_approval', id, {
+        clientIp: approvalRequest.client_ip,
+        authorizationId: result.authorizationId,
+        notification
+      });
+      return { statusCode: 200, body: { ok: true, request: decided, authorization: result, notification } };
+    }
+
+    const message = adminApprovalMessage(value.message, config.adminApproval.rejectText);
+    const decided = db.decideAdminApprovalRequest(id, {
+      status: 'rejected',
+      adminUser: session.username,
+      message
+    });
+    if (!decided) throw new HttpError(409, 'Admin approval request is no longer pending', 'admin_approval_not_pending');
+    const notification = await notifyAdminApprovalDecision(decided, {
+      status: 'rejected',
+      message,
+      decidedAt: decided.decided_at
+    });
+    db.dismissAndroidNotificationsForAdminApprovalRequest(id);
+    audit(request, session, 'admin_approval_rejected', 'admin_approval', id, {
+      clientIp: approvalRequest.client_ip,
+      notification
+    });
+    return { statusCode: 200, body: { ok: true, request: decided, notification } };
+  }
+
+  async function decideAdminApprovalFromAndroid({ request, device, id, action, message = '' }) {
+    const session = { username: device.admin_user || 'android' };
+    return decideAdminApproval({
+      request,
+      session,
+      id,
+      action,
+      value: { message }
+    });
+  }
+
+  function createAndroidAdminSession(device) {
+    if (!config.admin.enabled) throw new HttpError(503, 'Admin panel is not configured', 'admin_disabled');
+    if (!device || device.status !== 'approved' || !device.enabled) {
+      throw new HttpError(403, 'Android device approval is required', 'android_device_pending');
+    }
+    const sessionTtl = config.admin.sessionHours * 60 * 60 * 1000;
+    const token = generateSecret(32);
+    const session = {
+      username: device.admin_user || config.admin.username,
+      csrfToken: generateSecret(24),
+      expiresAt: Date.now() + sessionTtl
+    };
+    sessions.set(keyedHash(config.appSecret, token), session);
+    return {
+      cookieName: COOKIE_NAME,
+      token,
+      maxAge: Math.floor(sessionTtl / 1000),
+      csrfToken: session.csrfToken,
+      user: session.username
+    };
   }
 
   async function latestReleaseStatus({ refresh = false } = {}) {
@@ -1487,6 +1827,129 @@ export function createAdminController({
       return true;
     }
 
+    if (request.method === 'GET' && path === '/api/admin/android/app-build') {
+      sendJson(response, 200, androidBuildStatus({ projectRoot }));
+      return true;
+    }
+
+    if (request.method === 'PUT' && path === '/api/admin/android/firebase-config') {
+      const current = androidBuildStatus({ projectRoot });
+      if (current.state === 'running') {
+        throw new HttpError(409, 'Wait for the current Android APK build to finish', 'android_build_running');
+      }
+      const raw = await readBody(request, GOOGLE_SERVICES_MAX_BYTES);
+      let firebase;
+      try {
+        firebase = saveGoogleServicesConfig(raw, { projectRoot });
+      } catch (error) {
+        const statusCode = error.code === 'android_google_services_too_large' ? 413 : 400;
+        throw new HttpError(statusCode, error.message, error.code || 'android_google_services_invalid');
+      }
+      audit(request, session, 'android_firebase_config_updated', 'android_app', firebase.packageName, {
+        projectId: firebase.projectId,
+        appId: firebase.appId
+      });
+      sendJson(response, 200, {
+        ok: true,
+        ...androidBuildStatus({ projectRoot })
+      });
+      return true;
+    }
+
+    if (request.method === 'POST' && path === '/api/admin/android/app-build') {
+      let build;
+      try {
+        build = startAndroidBuild({ projectRoot });
+      } catch (error) {
+        const statusCode = error.code === 'android_build_running' ? 409 : 400;
+        throw new HttpError(statusCode, error.message, error.code || 'android_build_failed');
+      }
+      audit(request, session, 'android_apk_build_started', 'android_app', build.id, {
+        projectId: build.config?.projectId || ''
+      });
+      sendJson(response, 202, { ok: true, ...build });
+      return true;
+    }
+
+    if (request.method === 'GET' && path === '/api/admin/android/app-build/apk') {
+      const build = androidBuildStatus({ projectRoot });
+      const apkFile = androidProjectPaths(projectRoot).apkFile;
+      if (!build.apk.ready || !fs.existsSync(apkFile)) {
+        throw new HttpError(409, 'Build the APK with the current Firebase configuration first', 'android_apk_not_ready');
+      }
+      const apk = fs.readFileSync(apkFile);
+      response.writeHead(200, {
+        'content-type': 'application/vnd.android.package-archive',
+        'content-disposition': 'attachment; filename="g-hotspot.apk"',
+        'content-length': apk.length,
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff'
+      });
+      response.end(apk);
+      return true;
+    }
+
+    if (request.method === 'POST' && path === '/api/admin/android/devices/register') {
+      const result = await registerAndroidDevice(request, session);
+      sendJson(response, 200, {
+        ok: true,
+        token: result.token,
+        pollIntervalSeconds: config.notifications?.androidPollIntervalSeconds || 20,
+        device: androidDevicePublic(result.device)
+      });
+      return true;
+    }
+
+    if (request.method === 'POST' && path === '/api/admin/android/pairing-codes') {
+      sendJson(response, 201, {
+        ok: true,
+        pairing: createAndroidPairingCode(request, session)
+      });
+      return true;
+    }
+
+    if (request.method === 'GET' && path === '/api/admin/android/devices') {
+      const result = db.listAndroidDevices({
+        enabled: url.searchParams.get('enabled') === '' || url.searchParams.get('enabled') == null
+          ? null
+          : url.searchParams.get('enabled') !== '0',
+        status: url.searchParams.get('status') || '',
+        limit: integerParam(url.searchParams.get('limit'), 100, { min: 1, max: 500 }),
+        offset: integerParam(url.searchParams.get('offset'), 0, { min: 0, max: 100000 })
+      });
+      sendJson(response, 200, {
+        rows: result.rows.map(androidDevicePublic),
+        total: result.total
+      });
+      return true;
+    }
+
+    const androidApproveMatch = path.match(/^\/api\/admin\/android\/devices\/([^/]+)\/approve$/u);
+    if (request.method === 'POST' && androidApproveMatch) {
+      const id = decodeURIComponent(androidApproveMatch[1]);
+      sendJson(response, 200, { ok: true, device: androidDevicePublic(approveAndroidDevice(request, session, id)) });
+      return true;
+    }
+
+    const androidRejectMatch = path.match(/^\/api\/admin\/android\/devices\/([^/]+)\/reject$/u);
+    if (request.method === 'POST' && androidRejectMatch) {
+      const id = decodeURIComponent(androidRejectMatch[1]);
+      sendJson(response, 200, { ok: true, device: androidDevicePublic(rejectAndroidDevice(request, session, id)) });
+      return true;
+    }
+
+    const androidDeviceMatch = path.match(/^\/api\/admin\/android\/devices\/([^/]+)$/u);
+    if (request.method === 'DELETE' && androidDeviceMatch) {
+      const id = decodeURIComponent(androidDeviceMatch[1]);
+      const device = db.disableAndroidDevice(id);
+      if (!device) throw new HttpError(404, 'Android device not found', 'android_device_not_found');
+      audit(request, session, 'android_device_disabled', 'android_device', id, {
+        name: device.name || ''
+      });
+      sendJson(response, 200, { ok: true, device: androidDevicePublic(device) });
+      return true;
+    }
+
     if (request.method === 'GET' && path === '/api/admin/releases/latest') {
       sendJson(response, 200, await latestReleaseStatus({
         refresh: url.searchParams.get('refresh') === '1'
@@ -1498,6 +1961,7 @@ export function createAdminController({
       sendJson(response, 200, {
         defaults: {
           ...OPNSENSE_TEMPLATE_DEFAULTS,
+          gatewayMode: config.gateway.mode,
           targetUrl: opnsenseTemplateDefaultTargetUrl(request)
         }
       });
@@ -1508,11 +1972,14 @@ export function createAdminController({
       const { value } = await readJson(request, 16 * 1024);
       let archive;
       try {
-        archive = createOpnsenseTemplateZip(value.template || value);
+        archive = createOpnsenseTemplateZip({
+          ...(value.template || value),
+          gatewayMode: config.gateway.mode
+        });
       } catch (error) {
         throw new HttpError(400, error.message, error.code || 'invalid_opnsense_template');
       }
-      audit(request, session, 'opnsense_template_created', 'opnsense_template', 'index.html', {
+      audit(request, session, 'opnsense_template_created', 'opnsense_template', archive.entryName || 'index.html', {
         filename: archive.filename,
         bytes: archive.buffer.length
       });
@@ -1702,14 +2169,24 @@ export function createAdminController({
     }
 
     if (request.method === 'GET' && path === '/api/admin/dashboard') {
-      const period = periodParam(url.searchParams.get('trafficPeriod') || 'daily');
-      const topSitesHours = integerParam(url.searchParams.get('topSitesHours'), 6, { min: 1, max: 24 });
-      const topBandwidthHours = integerParam(url.searchParams.get('topBandwidthHours'), topSitesHours, { min: 1, max: 24 });
+      const period = periodParam(url.searchParams.get('trafficPeriod') || '60m');
+      const legacyTopSitesMinutes = Number(url.searchParams.get('topSitesHours') || 0) * 60;
+      const legacyTopBandwidthMinutes = Number(url.searchParams.get('topBandwidthHours') || 0) * 60;
+      const topSitesMinutes = integerParam(
+        url.searchParams.get('topSitesMinutes') || legacyTopSitesMinutes || 60,
+        60,
+        { min: 15, max: 60 }
+      );
+      const topBandwidthMinutes = integerParam(
+        url.searchParams.get('topBandwidthMinutes') || legacyTopBandwidthMinutes || topSitesMinutes,
+        topSitesMinutes,
+        { min: 15, max: 60 }
+      );
       sendJson(response, 200, {
         ...db.dashboard(),
         traffic: dashboardTrafficSeries(period),
-        topSites: dashboardTopSites(topSitesHours),
-        topBandwidthClients: dashboardTopBandwidthClients(topBandwidthHours),
+        topSites: dashboardTopSites(topSitesMinutes),
+        topBandwidthClients: dashboardTopBandwidthClients(topBandwidthMinutes),
         trafficLogSettings: trafficLogSettings(trafficLogStorageConfig())
       });
       return true;
@@ -1717,7 +2194,7 @@ export function createAdminController({
 
     if (request.method === 'GET' && path === '/api/admin/traffic/series') {
       sendJson(response, 200, {
-        ...dashboardTrafficSeries(periodParam(url.searchParams.get('period') || 'daily')),
+        ...dashboardTrafficSeries(periodParam(url.searchParams.get('period') || '60m')),
         settings: trafficLogSettings(trafficLogStorageConfig())
       });
       return true;
@@ -1790,97 +2267,15 @@ export function createAdminController({
     if (request.method === 'POST' && adminApprovalDecisionMatch) {
       const id = decodeURIComponent(adminApprovalDecisionMatch[1]);
       const action = adminApprovalDecisionMatch[2];
-      const approvalRequest = db.getAdminApprovalRequest(id);
-      if (!approvalRequest) throw new HttpError(404, 'Admin approval request not found', 'admin_approval_not_found');
-      if (approvalRequest.status !== 'pending') {
-        throw new HttpError(409, 'Admin approval request is no longer pending', 'admin_approval_not_pending');
-      }
-      if (Number(approvalRequest.request_expires_at) < Date.now()) {
-        db.expireAdminApprovalRequests();
-        throw new HttpError(410, 'Admin approval request has expired', 'admin_approval_expired');
-      }
-
       const { value } = await readJson(request);
-      if (action === 'approve') {
-        const message = adminApprovalMessage(value.message, config.adminApproval.approveText);
-        let result;
-        try {
-          result = await grantAccess({
-            db,
-            config,
-            method: 'admin-approval',
-            identity: approvalRequest.identity,
-            clientIp: approvalRequest.client_ip,
-            clientMac: approvalRequest.client_mac,
-            duration: config.adminApproval.accessDuration,
-            redirectUrl: approvalRequest.redirect_url
-          });
-        } catch (error) {
-          const failed = db.decideAdminApprovalRequest(id, {
-            status: 'failed',
-            adminUser: session.username,
-            message,
-            authorizationId: error.authorizationId || '',
-            error: error.message
-          }) || db.getAdminApprovalRequest(id);
-          audit(request, session, 'admin_approval_failed', 'admin_approval', id, {
-            clientIp: approvalRequest.client_ip,
-            error: error.message
-          });
-          sendJson(response, error.code === 'quota_exceeded' ? 429 : 502, {
-            ok: false,
-            request: failed,
-            error: error.code === 'quota_exceeded' ? 'quota_exceeded' : 'gateway_failed',
-            message: error.message,
-            retryAt: error.retryAt || null
-          });
-          return true;
-        }
-        const decided = db.decideAdminApprovalRequest(id, {
-          status: 'approved',
-          adminUser: session.username,
-          message,
-          authorizationId: result.authorizationId
-        });
-        if (!decided) throw new HttpError(409, 'Admin approval request is no longer pending', 'admin_approval_not_pending');
-        await notifyUserVerified(result, {
-          method: 'admin-approval',
-          identity: approvalRequest.identity,
-          clientIp: approvalRequest.client_ip,
-          clientMac: approvalRequest.client_mac
-        });
-        const notification = await notifyAdminApprovalDecision(decided, {
-          status: 'approved',
-          message,
-          decidedAt: decided.decided_at,
-          expiresAt: result.expiresAt
-        });
-        audit(request, session, 'admin_approval_approved', 'admin_approval', id, {
-          clientIp: approvalRequest.client_ip,
-          authorizationId: result.authorizationId,
-          notification
-        });
-        sendJson(response, 200, { ok: true, request: decided, authorization: result, notification });
-        return true;
-      }
-
-      const message = adminApprovalMessage(value.message, config.adminApproval.rejectText);
-      const decided = db.decideAdminApprovalRequest(id, {
-        status: 'rejected',
-        adminUser: session.username,
-        message
+      const result = await decideAdminApproval({
+        request,
+        session,
+        id,
+        action,
+        value
       });
-      if (!decided) throw new HttpError(409, 'Admin approval request is no longer pending', 'admin_approval_not_pending');
-      const notification = await notifyAdminApprovalDecision(decided, {
-        status: 'rejected',
-        message,
-        decidedAt: decided.decided_at
-      });
-      audit(request, session, 'admin_approval_rejected', 'admin_approval', id, {
-        clientIp: approvalRequest.client_ip,
-        notification
-      });
-      sendJson(response, 200, { ok: true, request: decided, notification });
+      sendJson(response, result.statusCode, result.body);
       return true;
     }
 
@@ -1978,19 +2373,41 @@ export function createAdminController({
     if (request.method === 'PUT' && path === '/api/admin/traffic-logs/settings') {
       const { value } = await readJson(request);
       const result = saveTrafficLogSettings(value.settings || {});
-      const deletedExpired = db.cleanupTrafficLogs(config.trafficLogs.retentionDays);
-      const fileCleanup = cleanupTrafficLogFile(trafficLogStorageConfig(), config.trafficLogs.retentionDays);
+      const storageConfig = trafficLogStorageConfig();
+      const savedTrafficSettings = getTrafficLogSettings();
+      const runtimeSettings = trafficLogSettings({
+        ...storageConfig,
+        trafficLogs: {
+          ...(storageConfig.trafficLogs || {}),
+          enabled: String(savedTrafficSettings.values.TRAFFIC_LOGS_ENABLED) === 'true',
+          retentionMinutes: savedTrafficSettings.values.TRAFFIC_LOGS_RETENTION_MINUTES,
+          resolveDomains: String(savedTrafficSettings.values.TRAFFIC_LOGS_RESOLVE_DOMAINS) === 'true',
+          liveRefreshSeconds: savedTrafficSettings.values.TRAFFIC_LOGS_LIVE_REFRESH_SECONDS
+        }
+      });
+      const cleanup = db.cleanupTrafficLogsDetailed
+        ? db.cleanupTrafficLogsDetailed(runtimeSettings.retentionMinutes)
+        : { deleted: db.cleanupTrafficLogs(runtimeSettings.retentionMinutes), deletedRollups: 0, rollups: {} };
+      const fileCleanup = cleanupTrafficLogFile(storageConfig, runtimeSettings.retentionMinutes);
+      const maintenance = (cleanup.deleted || cleanup.deletedRollups || fileCleanup.deleted) && db.checkpointDatabase
+        ? db.checkpointDatabase('TRUNCATE')
+        : db.databaseMaintenanceStats?.();
       audit(request, session, 'traffic_logs_settings_updated', 'traffic_logs', '', {
         keys: result.saved,
-        deletedExpired,
-        fileDeletedExpired: fileCleanup.deleted
+        deletedExpired: cleanup.deleted,
+        cleanup,
+        fileCleanup,
+        maintenance
       });
       sendJson(response, 200, {
         ok: true,
         ...result,
-        deletedExpired,
+        deletedExpired: cleanup.deleted,
+        cleanup,
         fileDeletedExpired: fileCleanup.deleted,
-        runtime: trafficLogSettings(trafficLogStorageConfig())
+        fileCleanup,
+        maintenance,
+        runtime: runtimeSettings
       });
       return true;
     }
@@ -2014,6 +2431,8 @@ export function createAdminController({
         timeZone: config.syslog.timeZone,
         retentionDays: config.syslog.retentionDays,
         exportDirectory: config.syslog.exportDirectory,
+        exportZipEnabled: Boolean(config.syslog.exportZipEnabled),
+        exportDeleteSourceAfterZip: Boolean(config.syslog.exportDeleteSourceAfterZip),
         timestampConfigured: timestampEnabled,
         timestampMode,
         timestampProfile,
@@ -2058,12 +2477,17 @@ export function createAdminController({
       try {
         sendJson(response, 200, {
           choices: await listGatewayNetworkChoices(config.gateway),
+          providerName: gatewayProviderName(config.gateway),
+          gatewayMode: config.gateway.mode,
           error: ''
         });
       } catch (error) {
         sendJson(response, 200, {
           choices: [],
-          error: 'OPNsense networks could not be discovered automatically. You can enter networks manually.'
+          providerName: gatewayProviderName(config.gateway),
+          gatewayMode: config.gateway.mode,
+          errorKey: '{provider} networks could not be discovered automatically. You can enter networks manually.',
+          errorVariables: { provider: gatewayProviderName(config.gateway) }
         });
       }
       return true;
@@ -2073,12 +2497,17 @@ export function createAdminController({
       try {
         sendJson(response, 200, {
           interfaces: await listGatewayInterfaces(config.gateway),
+          providerName: gatewayProviderName(config.gateway),
+          gatewayMode: config.gateway.mode,
           error: ''
         });
       } catch (error) {
         sendJson(response, 200, {
           interfaces: [],
-          error: 'OPNsense interfaces could not be discovered automatically. You can enter the interface manually.'
+          providerName: gatewayProviderName(config.gateway),
+          gatewayMode: config.gateway.mode,
+          errorKey: '{provider} interfaces could not be discovered automatically. You can enter the interface manually.',
+          errorVariables: { provider: gatewayProviderName(config.gateway) }
         });
       }
       return true;
@@ -2106,9 +2535,11 @@ export function createAdminController({
       return true;
     }
 
-    if (request.method === 'POST' && ['/api/admin/syslog/vacuum', '/api/admin/5651/vacuum'].includes(path)) {
-      const result = db.vacuumDatabase();
-      audit(request, session, 'syslog_vacuum', 'database', db.filePath, {
+    if (request.method === 'POST' && ['/api/admin/syslog/vacuum', '/api/admin/5651/vacuum', '/api/admin/traffic-logs/vacuum'].includes(path)) {
+      const trafficVacuum = path === '/api/admin/traffic-logs/vacuum';
+      const result = trafficVacuum ? db.vacuumDatabase() : db.vacuumSyslogDatabase();
+      const action = trafficVacuum ? 'traffic_logs_vacuum' : 'syslog_vacuum';
+      audit(request, session, action, 'database', result.before?.path || db.filePath, {
         durationMs: result.durationMs,
         reclaimedBytes: result.reclaimedBytes,
         backupPath: result.backupPath,
@@ -2229,5 +2660,5 @@ export function createAdminController({
     throw new HttpError(404, 'Admin API endpoint not found', 'not_found');
   }
 
-  return { handle, syncUsage, expireAuthorizations };
+  return { handle, syncUsage, expireAuthorizations, decideAdminApprovalFromAndroid, createAndroidAdminSession };
 }

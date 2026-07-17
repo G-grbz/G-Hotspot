@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { inflateRawSync } from 'node:zlib';
 import { HotspotDatabase } from '../src/db.js';
 import {
   createSyslogAutoExporter,
@@ -17,8 +18,39 @@ import {
   syslogRecordFromSession,
   syslogRecordsFromMessage
 } from '../src/services/syslog.js';
-import { timedatectlNtpStatus } from '../src/services/law5651.js';
+import {
+  cleanupExpiredLaw5651ExportFiles,
+  timedatectlNtpStatus,
+  trafficLogRecordsFromSyslogMessage
+} from '../src/services/law5651.js';
 import { ipv4InNetworkList } from '../src/lib/network.js';
+
+function readZipEntries(archivePath) {
+  const buffer = fs.readFileSync(archivePath);
+  const entries = new Map();
+  let offset = 0;
+  while (offset + 4 <= buffer.length && buffer.readUInt32LE(offset) === 0x04034b50) {
+    const method = buffer.readUInt16LE(offset + 8);
+    const compressedSize = buffer.readUInt32LE(offset + 18);
+    const uncompressedSize = buffer.readUInt32LE(offset + 22);
+    const nameLength = buffer.readUInt16LE(offset + 26);
+    const extraLength = buffer.readUInt16LE(offset + 28);
+    const nameStart = offset + 30;
+    const nameEnd = nameStart + nameLength;
+    const dataStart = nameEnd + extraLength;
+    const dataEnd = dataStart + compressedSize;
+    const name = buffer.subarray(nameStart, nameEnd).toString('utf8');
+    const compressed = buffer.subarray(dataStart, dataEnd);
+    let data;
+    if (method === 8) data = inflateRawSync(compressed);
+    else if (method === 0) data = compressed;
+    else throw new Error(`Unsupported ZIP method ${method}`);
+    assert.equal(data.length, uncompressedSize);
+    entries.set(name, data);
+    offset = dataEnd;
+  }
+  return entries;
+}
 
 test('syslog records are scoped by network and chained with hashes', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-'));
@@ -234,6 +266,44 @@ test('syslog parser records firewall flows for selected networks', () => {
   assert.equal(records[0].downloadBytes, 0);
 });
 
+test('operational traffic parser can require the configured client network scope', () => {
+  const wanMessage = [
+    '<134>1 2026-06-26T16:45:00Z opnsense filterlog[70765]:',
+    '100,0,,123,wan,match,pass,out,4,0x0,,64,1,0,none,17,udp,60,192.168.1.144,157.240.234.60,39660,443,0'
+  ].join(' ') + '\n';
+  const guestMessage = [
+    '<134>1 2026-06-26T16:45:00Z opnsense filterlog[70765]:',
+    '100,0,,123,igb1,match,pass,out,4,0x0,,64,1,0,none,6,tcp,60,172.16.2.2,8.8.8.8,54321,443,0,S,1,0,65535,,mss'
+  ].join(' ') + '\n';
+  const legacyWan = trafficLogRecordsFromSyslogMessage(
+    wanMessage,
+    { networks: '172.16.2.0/24' },
+    { enabled: true },
+    1782492300000,
+    'legacy'
+  );
+  assert.equal(legacyWan.length, 1);
+
+  const scopedWan = trafficLogRecordsFromSyslogMessage(
+    wanMessage,
+    { networks: '172.16.2.0/24', requireTrafficNetworkScope: true },
+    { enabled: true },
+    1782492300000,
+    'scoped-wan'
+  );
+  assert.equal(scopedWan.length, 0);
+
+  const scopedGuest = trafficLogRecordsFromSyslogMessage(
+    guestMessage,
+    { networks: '172.16.2.0/24', requireTrafficNetworkScope: true },
+    { enabled: true },
+    1782492300000,
+    'scoped-guest'
+  );
+  assert.equal(scopedGuest.length, 1);
+  assert.equal(scopedGuest[0].clientIp, '172.16.2.2');
+});
+
 test('syslog parser enriches firewall flows with client MAC lookup', () => {
   const message = [
     '<134>1 2026-06-26T16:45:00Z opnsense filterlog[70765]:',
@@ -370,6 +440,122 @@ test('syslog export writes a daily log file', async () => {
     assert.match(body, /"clientIp":"192\.168\.10\.50"/u);
     assert.equal(result.manifestPath, result.filePath);
   } finally {
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('syslog export can create a ZIP archive and keep source files', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-export-zip-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  try {
+    const record = syslogRecordFromSession({
+      sessionId: 'session-zip',
+      clientIp: '192.168.10.60',
+      downloadBytes: 10,
+      uploadBytes: 5,
+      lastSeenAt: 1760000060000
+    }, {
+      id: 'auth-zip',
+      method: 'voucher',
+      identity: 'voucher-zip',
+      client_ip: '192.168.10.60',
+      created_at: 1760000000000
+    }, { enabled: true, networks: 'any' });
+    db.appendSyslogLogs([record]);
+    const result = await createSyslogExportArchive({
+      db,
+      config: {
+        appName: 'G-Hotspot',
+        syslog: {
+          exportDirectory: path.join(directory, 'exports'),
+          timeZone: 'UTC',
+          exportZipEnabled: true,
+          exportDeleteSourceAfterZip: false
+        }
+      }
+    });
+
+    assert.match(result.filePath, /\.zip$/u);
+    assert.equal(fs.existsSync(result.filePath), true);
+    assert.equal(fs.existsSync(result.sourceFilePath), true);
+    assert.equal(result.sourceFilesDeleted, false);
+    assert.deepEqual(result.archiveEntries, [path.basename(result.sourceFilePath)]);
+    const entries = readZipEntries(result.filePath);
+    const body = entries.get(path.basename(result.sourceFilePath)).toString('utf8');
+    assert.match(body, /# G-Hotspot 5651 daily syslog/u);
+    assert.match(body, /"clientIp":"192\.168\.10\.60"/u);
+    assert.equal(db.syslogSummary().lastExport.filePath, result.filePath);
+  } finally {
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('syslog ZIP export can include timestamp files and delete sources', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-export-zip-delete-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  const tsa = http.createServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    response.writeHead(200, { 'content-type': 'application/timestamp-reply' });
+    response.end(Buffer.from('timestamp-token'));
+  });
+  await new Promise(resolve => tsa.listen(0, '127.0.0.1', resolve));
+  try {
+    const periodStart = Date.UTC(2025, 9, 9, 0, 0, 0);
+    const periodEnd = Date.UTC(2025, 9, 10, 0, 0, 0);
+    const record = syslogRecordFromSession({
+      sessionId: 'session-zip-delete',
+      clientIp: '192.168.10.61',
+      downloadBytes: 15,
+      uploadBytes: 7,
+      lastSeenAt: periodStart + 60_000
+    }, {
+      id: 'auth-zip-delete',
+      method: 'voucher',
+      identity: 'voucher-zip-delete',
+      client_ip: '192.168.10.61',
+      created_at: periodStart + 30_000
+    }, { enabled: true, networks: 'any' });
+    record.createdAt = periodStart + 60_000;
+    db.appendSyslogLogs([record]);
+    db.setLaw5651State('timestamp_enabled_since_at', String(periodStart - 60_000), periodStart - 60_000);
+    const result = await createSyslogExportArchive({
+      db,
+      config: {
+        appName: 'G-Hotspot',
+        syslog: {
+          exportDirectory: path.join(directory, 'exports'),
+          timeZone: 'UTC',
+          timestampMode: 'rfc3161',
+          timestampUrl: `http://127.0.0.1:${tsa.address().port}/tsa`,
+          timestampTimeoutSeconds: 60,
+          exportZipEnabled: true,
+          exportDeleteSourceAfterZip: true
+        }
+      },
+      periodStartAt: periodStart,
+      periodEndAt: periodEnd
+    });
+
+    assert.equal(result.timestampStatus, 'created');
+    assert.match(result.filePath, /2025-10-09\.zip$/u);
+    assert.equal(fs.existsSync(result.filePath), true);
+    assert.equal(fs.existsSync(result.sourceFilePath), false);
+    assert.equal(fs.existsSync(result.timestampRequestPath), false);
+    assert.equal(fs.existsSync(result.timestampTokenPath), false);
+    assert.equal(result.sourceFilesDeleted, true);
+    assert.deepEqual(result.archiveEntries.sort(), [
+      path.basename(result.sourceFilePath),
+      path.basename(result.timestampRequestPath),
+      path.basename(result.timestampTokenPath)
+    ].sort());
+    const entries = readZipEntries(result.filePath);
+    assert.match(entries.get(path.basename(result.sourceFilePath)).toString('utf8'), /"clientIp":"192\.168\.10\.61"/u);
+    assert.equal(entries.get(path.basename(result.timestampTokenPath)).toString('utf8'), 'timestamp-token');
+    assert.equal(db.syslogSummary().lastExport.filePath, result.filePath);
+  } finally {
+    await new Promise(resolve => tsa.close(resolve));
     db.close();
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -1291,6 +1477,95 @@ test('syslog retention cleanup keeps old records when archive file is missing', 
     assert.equal(db.listSyslogLogs().rows.length, 1);
   } finally {
     db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('syslog export retention removes expired ZIP artifacts from the configured directory', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-retention-files-zip-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  const exportDirectory = path.join(directory, 'exports');
+  const oldZip = path.join(exportDirectory, '2024-01-01.zip');
+  const oldLog = path.join(exportDirectory, '2024-01-01.log');
+  const oldTsq = `${oldLog}.tsq`;
+  const oldTsr = `${oldLog}.tsr`;
+  const recentZip = path.join(exportDirectory, '2026-07-13.zip');
+  try {
+    fs.mkdirSync(exportDirectory, { recursive: true });
+    fs.writeFileSync(oldZip, 'old zip');
+    fs.writeFileSync(oldLog, 'old log');
+    fs.writeFileSync(oldTsq, 'old tsq');
+    fs.writeFileSync(oldTsr, 'old tsr');
+    fs.writeFileSync(recentZip, 'recent zip');
+    db.createLaw5651Export({
+      exportReason: 'auto',
+      periodStartAt: Date.UTC(2024, 0, 1, 0, 0, 0),
+      periodEndAt: Date.UTC(2024, 0, 2, 0, 0, 0),
+      filePath: oldZip,
+      manifestPath: oldZip,
+      timestampRequestPath: oldTsq,
+      timestampTokenPath: oldTsr,
+      recordCount: 0,
+      exportHash: createHash('sha256').update(fs.readFileSync(oldZip)).digest('hex'),
+      timestampStatus: 'created'
+    });
+    const result = cleanupExpiredLaw5651ExportFiles({
+      db,
+      config: {
+        syslog: {
+          exportDirectory,
+          exportZipEnabled: true,
+          retentionDays: 730
+        }
+      },
+      now: Date.UTC(2026, 6, 13, 0, 0, 0),
+      logger: { warn() {} }
+    });
+    assert.equal(result.deletedFiles, 4);
+    assert.equal(fs.existsSync(oldZip), false);
+    assert.equal(fs.existsSync(oldLog), false);
+    assert.equal(fs.existsSync(oldTsq), false);
+    assert.equal(fs.existsSync(oldTsr), false);
+    assert.equal(fs.existsSync(recentZip), true);
+  } finally {
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('syslog export retention removes expired log timestamp sidecars when ZIP is disabled', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-retention-files-plain-'));
+  const exportDirectory = path.join(directory, 'exports');
+  const oldLog = path.join(exportDirectory, '2024-01-01.log');
+  const oldTsq = `${oldLog}.tsq`;
+  const oldTsr = `${oldLog}.tsr`;
+  const oldZip = path.join(exportDirectory, '2024-01-01.zip');
+  const recentLog = path.join(exportDirectory, '2026-07-13.log');
+  try {
+    fs.mkdirSync(exportDirectory, { recursive: true });
+    for (const filePath of [oldLog, oldTsq, oldTsr, oldZip]) {
+      fs.writeFileSync(filePath, path.basename(filePath));
+      fs.utimesSync(filePath, new Date(Date.UTC(2024, 0, 1)), new Date(Date.UTC(2024, 0, 1)));
+    }
+    fs.writeFileSync(recentLog, 'recent log');
+    const result = cleanupExpiredLaw5651ExportFiles({
+      config: {
+        syslog: {
+          exportDirectory,
+          exportZipEnabled: false,
+          retentionDays: 730
+        }
+      },
+      now: Date.UTC(2026, 6, 13, 0, 0, 0),
+      logger: { warn() {} }
+    });
+    assert.equal(result.deletedFiles, 3);
+    assert.equal(fs.existsSync(oldLog), false);
+    assert.equal(fs.existsSync(oldTsq), false);
+    assert.equal(fs.existsSync(oldTsr), false);
+    assert.equal(fs.existsSync(oldZip), true);
+    assert.equal(fs.existsSync(recentLog), true);
+  } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });

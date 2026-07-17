@@ -26,7 +26,7 @@ This document covers installation, production setup, OPNsense API privileges, Ke
 
 Current repository state:
 
-- Application version: `1.0.0`
+- Application version: `1.1.0`
 - Required Node.js version: `>=24.0.0`
 - Database: built-in Node.js `node:sqlite`
 - Default gateway mode: `mock`
@@ -823,7 +823,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/USER/g-hotspot/data
+ReadWritePaths=/home/USER/g-hotspot/data /home/USER/g-hotspot/android/app
 
 [Install]
 WantedBy=default.target
@@ -839,7 +839,7 @@ systemctl --user enable --now g-hotspot
 journalctl --user -u g-hotspot -f
 ```
 
-If you run it as a system service, adjust the user, directory permissions and `ReadWritePaths` for your deployment.
+If you run it as a system service, adjust the user, directory permissions and `ReadWritePaths` for your deployment. The Android APK builder needs write access to `android/app` inside the project directory; Gradle working files are created in the system temporary directory. The builder retains its private debug signing key under `android/app/.android`; keep this directory so future APKs can update the installed app.
 
 ## Security and privacy
 

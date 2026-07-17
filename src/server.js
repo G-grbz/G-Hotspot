@@ -2,7 +2,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
-import { HotspotDatabase } from './db.js';
+import { HotspotDatabase, deviceOsFromUserAgent } from './db.js';
 import { HttpError, getClientIp, readJson, sendJson, sendText, serveStatic } from './lib/http.js';
 import {
   COUNTRY_CALLING_CODES, generateOtp, generateSecret, isAllowedCountryCode, isValidEmail,
@@ -16,6 +16,11 @@ import { verifyNviIdentity } from './services/nvi.js';
 import { createDeliveryGuard } from './services/deliveryGuard.js';
 import { sendSystemNotification } from './services/notifications.js';
 import {
+  queueAndroidAdminApprovalRequest,
+  queueAndroidSystemNotification
+} from './services/androidNotifications.js';
+import { androidPushConfigured } from './services/androidPush.js';
+import {
   deleteTelegramWebhook, getTelegramUpdates, telegramAppUrl, telegramStartCommand,
   sendTelegramContactRequest, sendTelegramOtp, sendTelegramText, telegramStartUrl
 } from './services/telegram.js';
@@ -27,7 +32,7 @@ import {
 } from './services/access.js';
 import {
   authorizeGateway, deleteGatewayKeaDhcpLease, disconnectGatewaySession,
-  ensureGatewayBandwidthLimits, ensureGatewayKeaDhcpLease, listGatewayClientOwnership,
+  ensureGatewayBandwidthLimits, ensureGatewayKeaDhcpLease, listGatewayArpEntries, listGatewayClientOwnership,
   listGatewayNetworkChoices, listGatewaySessions
 } from './services/opnsense.js';
 import { createAdminController } from './admin.js';
@@ -50,6 +55,12 @@ import {
 
 const publicDir = path.resolve('public');
 const db = new HotspotDatabase(config.databasePath);
+function sendSystemNotificationWithAndroid(event, options = {}) {
+  return sendSystemNotification(config, event, {
+    ...options,
+    androidNotifier: payload => queueAndroidSystemNotification(db, config, payload)
+  });
+}
 const syslogReceiver = createSyslogServer({
   db,
   config,
@@ -58,12 +69,12 @@ const syslogReceiver = createSyslogServer({
 const syslogAutoExporter = createSyslogAutoExporter({
   db,
   config,
-  notificationSender: (event, options = {}) => sendSystemNotification(config, event, options)
+  notificationSender: sendSystemNotificationWithAndroid
 });
 const syslogHealthGuard = createSyslogHealthGuard({
   db,
   config,
-  notificationSender: (event, options = {}) => sendSystemNotification(config, event, options)
+  notificationSender: sendSystemNotificationWithAndroid
 });
 const admin = createAdminController({
   db,
@@ -87,6 +98,54 @@ function cookieValue(request, name) {
     if (key === name) return decodeURIComponent(rest.join('='));
   }
   return '';
+}
+
+function androidBearerToken(request) {
+  const authorization = String(request.headers.authorization || '');
+  const bearer = authorization.match(/^Bearer\s+(.+)$/iu);
+  if (bearer) return bearer[1].trim();
+  return String(request.headers['x-gh-android-token'] || '').trim();
+}
+
+function requireAndroidDevice(request, { allowPending = false } = {}) {
+  const token = androidBearerToken(request);
+  if (!token) throw new HttpError(401, 'Android device token required', 'android_token_required');
+  const device = db.getAndroidDeviceByTokenHash(keyedHash(config.appSecret, token));
+  if (!device || device.status === 'disabled' || (!allowPending && (!device.enabled || device.status !== 'approved'))) {
+    throw new HttpError(401, 'Android device is not registered', 'android_device_unauthorized');
+  }
+  if (device.status === 'pending') return device;
+  return db.touchAndroidDevice(device.id) || device;
+}
+
+function integerQuery(value, fallback, { min = 0, max = 1000000 } = {}) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function normalizeAndroidPairingCode(value) {
+  return String(value || '').toUpperCase().replace(/[^A-Z0-9]/gu, '').slice(0, 16);
+}
+
+function androidDevicePublic(row) {
+  return {
+    id: row.id,
+    name: row.name || '',
+    appVersion: row.app_version || '',
+    platformVersion: row.platform_version || '',
+    status: row.status || (row.enabled ? 'approved' : 'disabled'),
+    enabled: Boolean(row.enabled),
+    approvedAt: row.approved_at == null ? null : Number(row.approved_at),
+    approvedBy: row.approved_by || '',
+    createdAt: Number(row.created_at || 0),
+    updatedAt: Number(row.updated_at || 0),
+    lastSeenAt: row.last_seen_at == null ? null : Number(row.last_seen_at)
+  };
+}
+
+function androidPushEnabledForDevice(device) {
+  return Boolean(device?.fcm_token && androidPushConfigured(config));
 }
 
 function setUserSessionCookie(response, authorization) {
@@ -251,19 +310,19 @@ async function gatewayClientOwnership(context = 'restoring session') {
 async function requestClientMac(url, clientIp) {
   const providedClientMac = queryClientMac(url);
   if (providedClientMac) return providedClientMac;
-  if (config.gateway.mode !== 'opnsense-api' || !clientIp) return '';
+  if (config.gateway.mode === 'mock' || !clientIp) return '';
   return (await gatewayClientOwnership('resolving portal client MAC')).ipToMac.get(clientIp) || '';
 }
 
 async function syslogClientIdentityRows() {
-  if (config.gateway.mode !== 'opnsense-api') return [];
+  if (config.gateway.mode === 'mock') return [];
   return (await listGatewayClientOwnership(config.gateway, {
     context: 'refreshing syslog client MAC cache'
   })).rows;
 }
 
 async function existingGatewaySessionForClient(authorization, clientIp, clientMac = '') {
-  if (config.gateway.mode !== 'opnsense-api') return null;
+  if (config.gateway.mode === 'mock') return null;
   const userName = gatewayUserName(authorization);
   const gatewaySessionId = authorization.gateway_session_id || '';
   try {
@@ -283,7 +342,7 @@ async function existingGatewaySessionForClient(authorization, clientIp, clientMa
       return db.getAuthorization(authorization.id);
     }
   } catch (error) {
-    console.warn(`Existing OPNsense session lookup failed for ${clientIp}: ${error.message}`);
+    console.warn(`Existing gateway session lookup failed for ${clientIp}: ${error.message}`);
   }
   return null;
 }
@@ -396,7 +455,7 @@ async function closeConflictingAuthorizationForIp(clientIp, currentClientMac, sk
   const conflict = db.getActiveAuthorizationForClient(clientIp);
   if (!conflict || conflict.id === skipId) return true;
   const conflictMac = normalizeMac(conflict.client_mac);
-  if (config.gateway.mode === 'opnsense-api' && currentClientMac && conflictMac && currentClientMac !== conflictMac) {
+  if (config.gateway.mode !== 'mock' && currentClientMac && conflictMac && currentClientMac !== conflictMac) {
     await disconnectAuthorizationGatewaySession(conflict, 'session_ip_mac_mismatch');
     return true;
   }
@@ -415,7 +474,7 @@ async function restoreAuthorizationForClient(
 
   const authorizationMac = normalizeMac(authorization.client_mac);
   let currentClientMac = normalizeMac(confirmedClientMac);
-  if (config.gateway.mode === 'opnsense-api') {
+  if (config.gateway.mode !== 'mock') {
     const resolvedOwnership = ownership || await gatewayClientOwnership();
     if (!currentClientMac) currentClientMac = resolvedOwnership.ipToMac.get(clientIp) || '';
     if (authorization.client_ip === clientIp) {
@@ -472,8 +531,8 @@ async function currentAuthorization(request, url = null, { allowQuotaBlocked = f
   const clientIp = getClientIp(request, config.trustProxy);
   const now = Date.now();
   const claimedClientMac = queryClientMac(url);
-  let confirmedClientMac = config.gateway.mode === 'opnsense-api' ? '' : claimedClientMac;
-  let confirmedClientMacLoaded = config.gateway.mode !== 'opnsense-api';
+  let confirmedClientMac = config.gateway.mode !== 'mock' ? '' : claimedClientMac;
+  let confirmedClientMacLoaded = config.gateway.mode === 'mock';
   let ownership = null;
   let ownershipLoaded = false;
   async function getOwnership() {
@@ -503,24 +562,24 @@ async function currentAuthorization(request, url = null, { allowQuotaBlocked = f
         if (allowQuotaBlocked &&
             isActiveAuthorization(effectiveAuthorization, now) &&
             effectiveAuthorization.client_ip === clientIp) {
-          return effectiveAuthorization;
+          return rememberRequestDeviceOs(request, effectiveAuthorization);
         }
       } else if (isUsableAuthorization(effectiveAuthorization, now)) {
-        if (config.gateway.mode === 'opnsense-api' &&
+        if (config.gateway.mode !== 'mock' &&
             effectiveAuthorization.client_ip === clientIp &&
             effectiveAuthorization.gateway_session_id &&
             effectiveAuthorization.client_mac) {
           queueAuthorizationMaintenance(effectiveAuthorization);
-          return effectiveAuthorization;
+          return rememberRequestDeviceOs(request, effectiveAuthorization);
         }
         const restored = await restoreAuthorizationForClient(
           effectiveAuthorization,
           clientIp,
           await getConfirmedClientMac(),
-          config.gateway.mode === 'opnsense-api' ? await getOwnership() : null,
+          config.gateway.mode !== 'mock' ? await getOwnership() : null,
           { allowIpMove: config.gateway.cookieIpMoveEnabled }
         );
-        if (restored) return restored;
+        if (restored) return rememberRequestDeviceOs(request, restored);
       }
     }
   }
@@ -529,14 +588,16 @@ async function currentAuthorization(request, url = null, { allowQuotaBlocked = f
   const direct = db.getActiveAuthorizationForClient(clientIp, now);
   if (direct) {
     const effectiveDirect = authorizationWithEffectiveAccess(config, direct);
-    if (authorizationQuotaBlocked(effectiveDirect, now)) return allowQuotaBlocked ? effectiveDirect : null;
+    if (authorizationQuotaBlocked(effectiveDirect, now)) {
+      return allowQuotaBlocked ? rememberRequestDeviceOs(request, effectiveDirect) : null;
+    }
     const restored = await restoreAuthorizationForClient(
       effectiveDirect,
       clientIp,
       await getConfirmedClientMac(),
-      config.gateway.mode === 'opnsense-api' ? await getOwnership() : null
+      config.gateway.mode !== 'mock' ? await getOwnership() : null
     );
-    if (restored?.client_ip === clientIp) return restored;
+    if (restored?.client_ip === clientIp) return rememberRequestDeviceOs(request, restored);
     return null;
   }
 
@@ -625,6 +686,15 @@ function authorizationPublic(row) {
   };
 }
 
+function authorizationGatewayLogin(row) {
+  try {
+    const gatewayResponse = JSON.parse(row?.gateway_response_json || 'null');
+    return gatewayResponse?.gatewayLogin || null;
+  } catch {
+    return null;
+  }
+}
+
 function sendAccessResult(response, statusCode, result) {
   const authorization = db.getAuthorization(result.authorizationId);
   setUserSessionCookie(response, authorization);
@@ -633,7 +703,7 @@ function sendAccessResult(response, statusCode, result) {
 
 async function notifyUserVerified(result, { method, identity, clientIp, clientMac = '' } = {}) {
   try {
-    await sendSystemNotification(config, {
+    await sendSystemNotificationWithAndroid({
       eventType: 'user_verified',
       severity: 'info',
       message: 'User verification completed.',
@@ -652,7 +722,7 @@ async function notifyUserVerified(result, { method, identity, clientIp, clientMa
 }
 
 function notifySystemStartup() {
-  sendSystemNotification(config, {
+  sendSystemNotificationWithAndroid({
     eventType: 'system_startup',
     severity: 'info',
     message: 'System startup detected.',
@@ -896,6 +966,20 @@ function adminApprovalPublic(row) {
   };
 }
 
+function requestDeviceOs(request) {
+  return deviceOsFromUserAgent(request.headers?.['user-agent']);
+}
+
+function rememberRequestDeviceOs(request, authorization) {
+  if (!authorization) return authorization;
+  const detected = requestDeviceOs(request);
+  if (!detected) return authorization;
+  const remembered = db.rememberAuthorizationDeviceOs(authorization.id, detected);
+  return remembered && authorization.device_os !== remembered
+    ? { ...authorization, device_os: remembered }
+    : authorization;
+}
+
 async function handleAdminApprovalRequest(request, response) {
   if (!config.adminApproval.enabled) {
     throw new HttpError(503, 'Admin approval verification is not configured', 'admin_approval_disabled');
@@ -926,8 +1010,10 @@ async function handleAdminApprovalRequest(request, response) {
       clientMac: cleanMac(value.clientMac),
       redirectUrl: sanitizeRedirectUrl(value.redirectUrl),
       expiresAt: Date.now() + config.adminApproval.requestTtlMinutes * 60 * 1000,
-      language
+      language,
+      deviceOs: requestDeviceOs(request)
     });
+    queueAndroidAdminApprovalRequest(db, config, approvalRequest);
     sendJson(response, 201, adminApprovalPublic(approvalRequest));
   } catch (error) {
     releaseIpRequestInterval('admin-approval', clientIp, cooldownClaimedAt);
@@ -947,7 +1033,8 @@ function sendApprovedAdminApprovalStatus(request, response, approvalRequest) {
     authorizationId: authorization?.id || approvalRequest.authorization_id || '',
     expiresAt: authorization ? Number(authorization.expires_at) : Number(approvalRequest.access_expires_at || 0),
     redirectUrl: authorization?.redirect_url || approvalRequest.redirect_url || '',
-    sessionUrl: '/session'
+    sessionUrl: '/session',
+    gatewayLogin: authorizationGatewayLogin(authorization)
   });
 }
 
@@ -997,7 +1084,8 @@ async function completeChallenge(challenge, method, identity) {
           telegram: config.telegram.accessDuration,
           nvi: config.nvi.accessDuration
         }[method],
-        redirectUrl: challenge.redirect_url
+        redirectUrl: challenge.redirect_url,
+        deviceOs: challenge.device_os
       });
       const detail = accessGrantDetail(result);
       const current = db.getChallenge(challenge.id);
@@ -1042,7 +1130,8 @@ async function handleVoucher(request, response) {
       clientIp,
       clientMac: cleanMac(value.clientMac),
       durationMinutes: Number(claim.voucher.duration_minutes),
-      redirectUrl
+      redirectUrl,
+      deviceOs: requestDeviceOs(request)
     });
     await notifyUserVerified(result, {
       method: 'voucher',
@@ -1076,7 +1165,8 @@ async function handleEmailRequest(request, response) {
       clientIp,
       clientMac: cleanMac(value.clientMac),
       redirectUrl: sanitizeRedirectUrl(value.redirectUrl),
-      expiresAt: Date.now() + OTP_TTL_MS
+      expiresAt: Date.now() + OTP_TTL_MS,
+      deviceOs: requestDeviceOs(request)
     });
   } catch (error) {
     releaseIpRequestInterval('email', clientIp, cooldownClaimedAt);
@@ -1115,7 +1205,8 @@ async function handleSmsRequest(request, response) {
       clientIp,
       clientMac: cleanMac(value.clientMac),
       redirectUrl: sanitizeRedirectUrl(value.redirectUrl),
-      expiresAt: Date.now() + config.sms.otpMinutes * 60 * 1000
+      expiresAt: Date.now() + config.sms.otpMinutes * 60 * 1000,
+      deviceOs: requestDeviceOs(request)
     });
   } catch (error) {
     releaseIpRequestInterval('sms', clientIp, cooldownClaimedAt);
@@ -1160,6 +1251,7 @@ async function handleSmsVerify(request, response) {
       expiresAt: Number(authorization.expires_at),
       redirectUrl: authorization.redirect_url || '',
       sessionUrl: '/session',
+      gatewayLogin: authorizationGatewayLogin(authorization),
       challenge: challengePublic(challenge)
     });
     return;
@@ -1225,7 +1317,8 @@ async function handleNviRequest(request, response) {
       clientMac: cleanMac(value.clientMac),
       redirectUrl: sanitizeRedirectUrl(value.redirectUrl),
       expiresAt: Date.now() + (smsRequired ? config.sms.otpMinutes * 60 * 1000 : OTP_TTL_MS),
-      language
+      language,
+      deviceOs: requestDeviceOs(request)
     });
   } catch (error) {
     releaseIpRequestInterval('nvi', clientIp, cooldownClaimedAt);
@@ -1278,6 +1371,7 @@ async function handleNviVerify(request, response) {
       expiresAt: Number(authorization.expires_at),
       redirectUrl: authorization.redirect_url || '',
       sessionUrl: '/session',
+      gatewayLogin: authorizationGatewayLogin(authorization),
       challenge: challengePublic(challenge)
     });
     return;
@@ -1314,6 +1408,7 @@ async function handleEmailVerify(request, response) {
       expiresAt: Number(authorization.expires_at),
       redirectUrl: authorization.redirect_url || '',
       sessionUrl: '/session',
+      gatewayLogin: authorizationGatewayLogin(authorization),
       challenge: challengePublic(challenge)
     });
     return;
@@ -1349,7 +1444,8 @@ async function handleWhatsAppRequest(request, response) {
       clientIp,
       clientMac: cleanMac(value.clientMac),
       redirectUrl: sanitizeRedirectUrl(value.redirectUrl),
-      expiresAt: Date.now() + WHATSAPP_TTL_MS
+      expiresAt: Date.now() + WHATSAPP_TTL_MS,
+      deviceOs: requestDeviceOs(request)
     });
   } catch (error) {
     releaseIpRequestInterval('whatsapp', clientIp, cooldownClaimedAt);
@@ -1394,6 +1490,7 @@ async function handleWhatsAppVerify(request, response) {
       expiresAt: Number(authorization.expires_at),
       redirectUrl: authorization.redirect_url || '',
       sessionUrl: '/session',
+      gatewayLogin: authorizationGatewayLogin(authorization),
       challenge: challengePublic(challenge)
     });
     return;
@@ -1432,7 +1529,8 @@ async function handleTelegramRequest(request, response) {
       clientMac: cleanMac(value.clientMac),
       redirectUrl: sanitizeRedirectUrl(value.redirectUrl),
       expiresAt: Date.now() + config.telegram.otpMinutes * 60 * 1000,
-      language
+      language,
+      deviceOs: requestDeviceOs(request)
     });
   } catch (error) {
     releaseIpRequestInterval('telegram', clientIp, cooldownClaimedAt);
@@ -1514,6 +1612,7 @@ async function handleTelegramVerify(request, response) {
       expiresAt: Number(authorization.expires_at),
       redirectUrl: authorization.redirect_url || '',
       sessionUrl: '/session',
+      gatewayLogin: authorizationGatewayLogin(authorization),
       challenge: challengePublic(challenge)
     });
     return;
@@ -1729,17 +1828,19 @@ async function handleInstallRoute(request, response, url) {
     try {
       gateway = installOpnsenseGateway(value.settings || value);
     } catch (error) {
-      throw new HttpError(400, error.message, error.code || 'invalid_opnsense_settings');
+      throw new HttpError(400, error.message, error.code || 'invalid_gateway_settings');
     }
     try {
+      // TODO(pfSense): Restore the ARP-only test branch when pfSense support resumes.
       const sessions = await listGatewaySessions(gateway);
       sendJson(response, 200, {
         ok: true,
+        gatewayMode: gateway.mode,
         zoneId: Number(gateway.zoneId || 0),
         sessions: sessions.length
       });
     } catch (error) {
-      throw new HttpError(502, error.message, error.code || 'opnsense_test_failed');
+      throw new HttpError(502, error.message, error.code || 'gateway_test_failed');
     }
     return true;
   }
@@ -1751,7 +1852,7 @@ async function handleInstallRoute(request, response, url) {
     try {
       gateway = installOpnsenseGateway(value.settings || value);
     } catch (error) {
-      throw new HttpError(400, error.message, error.code || 'invalid_opnsense_settings');
+      throw new HttpError(400, error.message, error.code || 'invalid_gateway_settings');
     }
     try {
       sendJson(response, 200, {
@@ -1820,6 +1921,112 @@ async function route(request, response) {
   }
 
   if (await admin.handle(request, response, url)) return;
+  if (request.method === 'POST' && url.pathname === '/api/android/pairing/claim') {
+    const { value } = await readJson(request);
+    const code = normalizeAndroidPairingCode(value.code);
+    if (!code) throw new HttpError(400, 'Android pairing code is required', 'android_pairing_code_required');
+    const pairing = db.getActiveAndroidPairingCodeByHash(keyedHash(config.appSecret, code));
+    if (!pairing) throw new HttpError(404, 'Android pairing code is invalid or expired', 'android_pairing_not_found');
+    if (pairing.claimed_device_id) {
+      throw new HttpError(409, 'Android pairing code was already used', 'android_pairing_already_used');
+    }
+    const token = generateSecret(32);
+    const device = db.createAndroidDevice({
+      tokenHash: keyedHash(config.appSecret, token),
+      adminUser: 'pending',
+      name: String(value.name || value.deviceName || 'Android').replace(/\s+/gu, ' ').trim().slice(0, 80),
+      appVersion: String(value.appVersion || '').slice(0, 40),
+      platformVersion: String(value.platformVersion || '').slice(0, 80),
+      userAgent: String(request.headers['user-agent'] || '').slice(0, 300),
+      clientIp: getClientIp(request, config.trustProxy),
+      status: 'pending',
+      pairingCodeHint: pairing.code_hint,
+      fcmToken: String(value.fcmToken || '').trim().slice(0, 4096)
+    });
+    const claimed = db.claimAndroidPairingCode(pairing.id, device.id);
+    if (!claimed) {
+      db.disableAndroidDevice(device.id);
+      throw new HttpError(409, 'Android pairing code was already used', 'android_pairing_already_used');
+    }
+    sendJson(response, 201, {
+      ok: true,
+      token,
+      pollIntervalSeconds: config.notifications?.androidPollIntervalSeconds || 20,
+      pushEnabled: androidPushEnabledForDevice(device),
+      device: androidDevicePublic(device)
+    });
+    return;
+  }
+  if (request.method === 'GET' && url.pathname === '/api/android/pairing/status') {
+    const device = requireAndroidDevice(request, { allowPending: true });
+    sendJson(response, 200, {
+      ok: true,
+      pollIntervalSeconds: config.notifications?.androidPollIntervalSeconds || 20,
+      pushEnabled: androidPushEnabledForDevice(device),
+      device: androidDevicePublic(device)
+    });
+    return;
+  }
+  if (request.method === 'POST' && url.pathname === '/api/android/push-token') {
+    const device = requireAndroidDevice(request, { allowPending: true });
+    const { value } = await readJson(request);
+    const fcmToken = String(value.fcmToken || '').trim();
+    if (fcmToken.length < 20 || fcmToken.length > 4096) {
+      throw new HttpError(400, 'A valid Firebase token is required', 'android_fcm_token_invalid');
+    }
+    const updated = db.setAndroidDevicePushToken(device.id, fcmToken);
+    sendJson(response, 200, {
+      ok: true,
+      pushEnabled: androidPushEnabledForDevice(updated)
+    });
+    return;
+  }
+  if (request.method === 'POST' && url.pathname === '/api/android/admin-session') {
+    const device = requireAndroidDevice(request);
+    sendJson(response, 200, {
+      ok: true,
+      session: admin.createAndroidAdminSession(device)
+    });
+    return;
+  }
+  if (request.method === 'GET' && url.pathname === '/api/android/notifications') {
+    const device = requireAndroidDevice(request);
+    const notifications = db.listAndroidNotifications(device.id, {
+      since: integerQuery(url.searchParams.get('since'), 0, { min: 0 }),
+      limit: integerQuery(url.searchParams.get('limit'), 50, { min: 1, max: 100 })
+    });
+    sendJson(response, 200, {
+      ok: true,
+      serverTime: Date.now(),
+      pollIntervalSeconds: config.notifications?.androidPollIntervalSeconds || 20,
+      pushEnabled: androidPushEnabledForDevice(device),
+      notifications
+    });
+    return;
+  }
+  const androidDeliveredMatch = url.pathname.match(/^\/api\/android\/notifications\/([^/]+)\/delivered$/u);
+  if (request.method === 'POST' && androidDeliveredMatch) {
+    const device = requireAndroidDevice(request);
+    const id = decodeURIComponent(androidDeliveredMatch[1]);
+    const notification = db.markAndroidNotificationDelivered(id, device.id);
+    if (!notification) throw new HttpError(404, 'Android notification not found', 'android_notification_not_found');
+    sendJson(response, 200, { ok: true, notification });
+    return;
+  }
+  const androidApprovalMatch = url.pathname.match(/^\/api\/android\/admin-approval\/requests\/([^/]+)\/(approve|reject)$/u);
+  if (request.method === 'POST' && androidApprovalMatch) {
+    const device = requireAndroidDevice(request);
+    const { value } = await readJson(request);
+    const result = await admin.decideAdminApprovalFromAndroid({
+      request,
+      device,
+      id: decodeURIComponent(androidApprovalMatch[1]),
+      action: androidApprovalMatch[2],
+      message: value.message
+    });
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
   if (request.method === 'GET' && url.pathname === '/favicon.ico') {
     if (serveStatic(response, publicDir, '/img/favicon.ico')) return;
   }
@@ -1907,7 +2114,7 @@ async function route(request, response) {
       try {
         await disconnectGatewaySession(config.gateway, authorization.gateway_session_id);
       } catch (error) {
-        console.warn(`User session could not be disconnected from OPNsense: ${error.message}`);
+        console.warn(`User session could not be disconnected from the gateway: ${error.message}`);
         throw new HttpError(502, `Gateway disconnect failed: ${error.message}`, 'gateway_disconnect_failed');
       }
     }
@@ -2012,12 +2219,12 @@ const authorizationExpiryTimer = setInterval(runAuthorizationExpiry, 30 * 1000);
 authorizationExpiryTimer.unref();
 let usageSyncRunning = false;
 const usageSyncTimer = setInterval(() => {
-  if (config.gateway.mode !== 'opnsense-api') return;
+  if (config.gateway.mode === 'mock') return;
   if (!config.gateway.syncEnabled) return;
   if (usageSyncRunning) return;
   usageSyncRunning = true;
   admin.syncUsage()
-    .catch(error => console.warn(`OPNsense usage sync failed: ${error.message}`))
+    .catch(error => console.warn(`Gateway usage sync failed: ${error.message}`))
     .finally(() => { usageSyncRunning = false; });
 }, Math.max(5, Number(config.gateway.syncIntervalSeconds || 10)) * 1000);
 usageSyncTimer.unref();

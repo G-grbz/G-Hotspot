@@ -223,8 +223,12 @@ function render() {
   document.querySelector('#identity').textContent = session.identity || '';
   document.querySelector('#gatewayStatus').textContent =
     session.gatewayConnected ? t('Connected') : t('Disconnected');
-  document.querySelector('#gatewayMode').textContent =
-    session.gatewayMode === 'opnsense-api' ? 'OPNsense API' : t('Mock / test mode');
+  document.querySelector('#gatewayMode').textContent = {
+    'opnsense-api': 'OPNsense API',
+    // TODO(pfSense): Restore the session label when pfSense support resumes.
+    // 'pfsense-api': 'pfSense API',
+    mock: t('Mock / test mode')
+  }[session.gatewayMode] || session.gatewayMode || t('Mock / test mode');
   document.querySelector('#startedAt').textContent = formatDate(session.createdAt);
   document.querySelector('#expiresAt').textContent =
     session.unlimited ? t('No expiration') : formatDate(session.expiresAt);
@@ -290,9 +294,17 @@ document.addEventListener('gh:language', () => {
   if (session) render();
 });
 
+async function preloadPortalFonts() {
+  if (!document.fonts?.load) return;
+  const families = ['Manrope', 'Roboto Condensed', 'Satisfy'];
+  const sample = 'G-Hotspot ABCÇĞİÖŞÜ abcçğıöşü 0123456789';
+  await Promise.allSettled(families.map(family => document.fonts.load(`400 1em "${family}"`, sample)));
+}
+
 (async function init() {
   try {
     await i18n.ready;
+    await preloadPortalFonts();
     const configResponse = await fetch('/api/v1/config', { cache: 'no-store' });
     const config = await configResponse.json();
     portalConfig = config;

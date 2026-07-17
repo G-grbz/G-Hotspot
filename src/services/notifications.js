@@ -23,7 +23,7 @@ const DEFAULT_ENABLED_NOTIFICATION_SETTINGS = new Set([
   'SyslogKamusmFailure',
   'AdminApproval'
 ]);
-const SYSTEM_NOTIFICATION_CHANNELS = ['email', 'sms', 'telegram'];
+const SYSTEM_NOTIFICATION_CHANNELS = ['email', 'sms', 'telegram', 'android'];
 const ADMIN_APPROVAL_NOTIFICATION_CHANNELS = ['email', 'sms'];
 const DEFAULT_SYSLOG_EMAIL_TEMPLATE = [
   '{appName} system notification',
@@ -556,7 +556,11 @@ export async function sendAdminApprovalNotification(config, request, decision = 
   };
 }
 
-export async function sendSystemNotification(config, event, { logger = console, channels = null } = {}) {
+export async function sendSystemNotification(config, event, {
+  logger = console,
+  channels = null,
+  androidNotifier = null
+} = {}) {
   const channelSet = new Set(enabledSystemNotificationChannels(config, event, channels));
   if (!channelSet.size) {
     return { sent: 0, skipped: true, reason: 'disabled' };
@@ -619,6 +623,22 @@ export async function sendSystemNotification(config, event, { logger = console, 
     for (const chatId of recipients(notifications.telegramRecipients)) {
       tasks.push(sendTelegramText(config.telegram, { chatId, text }));
     }
+  }
+
+  if (channelSet.has('android') && notifications.androidEnabled && typeof androidNotifier === 'function') {
+    const template = isSyslogNotificationEvent(event)
+      ? (notifications.syslogAndroidTemplate || notifications.syslogTelegramTemplate || DEFAULT_SYSLOG_TELEGRAM_TEMPLATE)
+      : (notifications.systemAndroidTemplate || notifications.systemTelegramTemplate || DEFAULT_SYSTEM_EVENT_TELEGRAM_TEMPLATE);
+    const body = renderSystemNotificationTemplate(
+      template,
+      config,
+      event
+    ).slice(0, 1000);
+    tasks.push(Promise.resolve(androidNotifier({
+      title: notificationSubject(config, event),
+      body,
+      event
+    })));
   }
 
   if (!tasks.length) return { sent: 0, skipped: true, reason: 'no_recipients_or_channels' };

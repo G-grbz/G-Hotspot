@@ -6,7 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>G-Hotspot Install</title>
   <link rel="icon" href="/img/favicon.ico" sizes="any">
-  <link rel="stylesheet" href="/install.css">
+  <link rel="stylesheet" href="/fonts.css?v=1.1.0">
+  <link rel="stylesheet" href="/install.css?v=1.1.0">
 </head>
 <body class="i18n-loading">
   <main class="install-shell">
@@ -89,13 +90,28 @@
               <input type="radio" name="GATEWAY_MODE" value="opnsense-api">
               <span>OPNsense API</span>
             </label>
+            <!--
+              TODO(pfSense): Restore this option after the pfSense integration is completed.
+              <label>
+                <input type="radio" name="GATEWAY_MODE" value="pfsense-api">
+                <span>pfSense API</span>
+              </label>
+            -->
           </div>
           </fieldset>
 
           <fieldset id="opnsenseFields" class="hidden">
-          <legend>OPNsense API</legend>
+          <legend>Gateway API</legend>
           <label for="opnsenseBaseUrl">Base URL</label>
           <input id="opnsenseBaseUrl" name="OPNSENSE_BASE_URL" placeholder="https://192.168.1.1" inputmode="url" spellcheck="false">
+          <!--
+            TODO(pfSense): Restore the captive portal URL field with the pfSense gateway option.
+            <div id="pfsensePortalUrlRow" class="hidden">
+              <label for="opnsenseCaptivePortalUrl">pfSense captive portal URL</label>
+              <input id="opnsenseCaptivePortalUrl" name="OPNSENSE_CAPTIVE_PORTAL_URL" placeholder="http://192.168.1.1:8000/index.php" inputmode="url" spellcheck="false">
+              <small>Leave empty if pfSense serves captive portal login from the base URL.</small>
+            </div>
+          -->
 
           <div class="field-grid">
             <div>
@@ -126,7 +142,7 @@
         </section>
 
         <section class="wizard-step hidden" data-step="2">
-          <fieldset>
+          <fieldset id="opnsenseZoneFields">
             <legend>Captive Portal Zones</legend>
             <label for="opnsenseZoneMap">Client network zone map</label>
             <textarea id="opnsenseZoneMap" name="OPNSENSE_ZONE_MAP" placeholder="172.16.2.0/24=0&#10;172.16.3.0/24=1"></textarea>
@@ -152,6 +168,6 @@
   </main>
 
   <script src="/i18n.js"></script>
-  <script src="/install.js"></script>
+  <script src="/install.js?v=1.1.0"></script>
 </body>
 </html>

@@ -18,6 +18,7 @@ const TRAFFIC_LOG_DEDUPE_TAIL_BYTES = 16 * 1024 * 1024;
 const TRAFFIC_LOG_EFFECTIVE_LOOKBACK_MS = 48 * 60 * 60 * 1000;
 const LIVE_TRAFFIC_WINDOW_MS = 60 * 1000;
 const INTERFACE_COUNTER_SOURCE = 'opnsense-interface-counter';
+const TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES = [15, 30, 45, 60];
 const domainCache = new Map();
 const fileDedupeCaches = new Map();
 const fileRowCaches = new Map();
@@ -56,6 +57,23 @@ function trafficEnabled(settings = {}) {
   return settings.enabled !== false;
 }
 
+export function normalizeTrafficLogRetentionMinutes(value, fallback = 60) {
+  const parsed = Math.trunc(Number(value));
+  const minutes = Number.isFinite(parsed) ? parsed : fallback;
+  if (minutes <= TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES[0]) return TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES[0];
+  return TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES.find(option => minutes <= option) ||
+    TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES.at(-1);
+}
+
+function trafficLogRetentionMinutesFromSettings(settings = {}) {
+  if (settings.retentionMinutes != null) return normalizeTrafficLogRetentionMinutes(settings.retentionMinutes);
+  if (settings.retention_minutes != null) return normalizeTrafficLogRetentionMinutes(settings.retention_minutes);
+  if (settings.retentionDays != null) {
+    return normalizeTrafficLogRetentionMinutes(Number(settings.retentionDays) * 24 * 60);
+  }
+  return normalizeTrafficLogRetentionMinutes();
+}
+
 function inferDirection({ clientIp = '', sourceIp = '', destinationIp = '', kind = '' }) {
   if (sourceIp && sourceIp === clientIp) return 'outgoing';
   if (destinationIp && destinationIp === clientIp) return 'incoming';
@@ -64,6 +82,7 @@ function inferDirection({ clientIp = '', sourceIp = '', destinationIp = '', kind
 
 export function trafficLogSettings(config = {}) {
   const settings = config.trafficLogs || {};
+  const retentionMinutes = trafficLogRetentionMinutesFromSettings(settings);
   const databaseDirectory = config.databasePath
     ? path.dirname(path.resolve(config.databasePath))
     : path.resolve('data');
@@ -71,7 +90,7 @@ export function trafficLogSettings(config = {}) {
   const logFile = path.join(logDirectory, TRAFFIC_LOG_FILE_NAME);
   return {
     enabled: settings.enabled !== false,
-    retentionDays: Math.max(1, Math.min(365, Math.trunc(Number(settings.retentionDays) || 30))),
+    retentionMinutes,
     resolveDomains: settings.resolveDomains !== false,
     liveRefreshSeconds: Math.max(2, Math.min(60, Math.trunc(Number(settings.liveRefreshSeconds) || 5))),
     logDirectory,
@@ -79,49 +98,26 @@ export function trafficLogSettings(config = {}) {
   };
 }
 
-function trafficLogPeriod(period = 'daily', now = Date.now()) {
-  const selected = ['hourly', '6h', '12h', 'daily', 'weekly', 'monthly'].includes(period) ? period : 'daily';
+function trafficLogPeriod(period = '60m', now = Date.now()) {
+  const selected = ['15m', '30m', '45m', '60m'].includes(period) ? period : '60m';
   const current = Math.trunc(Number(now) || Date.now());
   const rolling = {
-    hourly: { bucket: '5min', bucketMs: 5 * 60 * 1000, count: 12 },
-    '6h': { bucket: '30min', bucketMs: 30 * 60 * 1000, count: 12 },
-    '12h': { bucket: 'hour', bucketMs: 60 * 60 * 1000, count: 12 }
+    '15m': { bucket: 'minute', bucketMs: 60 * 1000, count: 15 },
+    '30m': { bucket: 'minute', bucketMs: 60 * 1000, count: 30 },
+    '45m': { bucket: 'minute', bucketMs: 60 * 1000, count: 45 },
+    '60m': { bucket: 'minute', bucketMs: 60 * 1000, count: 60 }
   }[selected];
-  if (rolling) {
-    const endAt = Math.ceil((current + 1) / rolling.bucketMs) * rolling.bucketMs;
-    return {
-      period: selected,
-      ...rolling,
-      startAt: endAt - rolling.count * rolling.bucketMs,
-      endAt
-    };
-  }
-  const dayStart = new Date(Math.trunc(Number(now) || Date.now()));
-  dayStart.setHours(0, 0, 0, 0);
-  const dayStartAt = dayStart.getTime();
-  if (selected === 'daily') {
-    return {
-      period: selected,
-      bucket: 'hour',
-      bucketMs: 60 * 60 * 1000,
-      count: 24,
-      startAt: dayStartAt,
-      endAt: dayStartAt + 24 * 60 * 60 * 1000
-    };
-  }
-  const count = selected === 'weekly' ? 7 : 30;
+  const endAt = Math.ceil((current + 1) / rolling.bucketMs) * rolling.bucketMs;
   return {
     period: selected,
-    bucket: 'day',
-    bucketMs: 24 * 60 * 60 * 1000,
-    count,
-    startAt: dayStartAt - (count - 1) * 24 * 60 * 60 * 1000,
-    endAt: dayStartAt + 24 * 60 * 60 * 1000
+    ...rolling,
+    startAt: endAt - rolling.count * rolling.bucketMs,
+    endAt
   };
 }
 
 function trafficLogPointLabel(date, bucket) {
-  if (['5min', '30min', 'hour'].includes(bucket)) {
+  if (['minute', '5min', '30min', 'hour'].includes(bucket)) {
     return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
   }
   return [
@@ -585,6 +581,13 @@ function readTrafficLogFileRows(filePath) {
   return rows;
 }
 
+function clearTrafficLogFileCaches(filePath) {
+  fileDedupeCaches.delete(filePath);
+  fileRowCaches.delete(filePath);
+  fileIndexCaches.delete(filePath);
+  fileWindowIndexCaches.delete(filePath);
+}
+
 function seedDedupeCache(filePath) {
   if (fileDedupeCaches.has(filePath)) return fileDedupeCaches.get(filePath);
   const keys = new Set();
@@ -641,27 +644,49 @@ export function appendTrafficLogFileRecords(config = {}, records = [], { now = D
   return { enabled: true, inserted: lines.length, skipped, filePath };
 }
 
-export function cleanupTrafficLogFile(config = {}, retentionDays = 30, now = Date.now()) {
+export function cleanupTrafficLogFile(config = {}, retentionMinutes = 60, now = Date.now()) {
   const { directory, filePath } = trafficLogFilePaths(config);
   if (!fs.existsSync(filePath)) return { deleted: 0, kept: 0, filePath };
-  const days = Math.max(1, Math.trunc(Number(retentionDays) || 30));
-  const cutoff = Math.trunc(Number(now) || Date.now()) - days * 24 * 60 * 60 * 1000;
-  const rows = readTrafficLogFileRows(filePath);
-  const kept = rows.filter(row => Number(row.created_at || 0) >= cutoff);
-  const deleted = rows.length - kept.length;
-  if (deleted <= 0) return { deleted: 0, kept: kept.length, filePath };
+  const minutes = normalizeTrafficLogRetentionMinutes(retentionMinutes);
+  const cutoff = Math.trunc(Number(now) || Date.now()) - minutes * 60 * 1000;
+  let kept = 0;
+  let deleted = 0;
+  scanTrafficLogFileRange(filePath, {
+    onRow: row => {
+      if (Number(row.created_at || 0) >= cutoff) kept += 1;
+      else deleted += 1;
+    }
+  });
+  if (deleted <= 0) return { deleted: 0, kept, retentionMinutes: minutes, cutoff, filePath };
+
   fs.mkdirSync(directory, { recursive: true });
   const tempPath = `${filePath}.tmp`;
-  fs.writeFileSync(tempPath, kept.map(row => JSON.stringify(row)).join('\n') + (kept.length ? '\n' : ''), {
-    mode: 0o600
-  });
+  const output = fs.openSync(tempPath, 'w', 0o600);
+  let pending = '';
+  const flush = () => {
+    if (!pending) return;
+    fs.writeSync(output, pending);
+    pending = '';
+  };
+  try {
+    scanTrafficLogFileRange(filePath, {
+      onRow: row => {
+        if (Number(row.created_at || 0) < cutoff) return;
+        pending += `${JSON.stringify(row)}\n`;
+        if (pending.length >= TRAFFIC_LOG_INDEX_CHUNK_BYTES) flush();
+      }
+    });
+    flush();
+  } catch (error) {
+    try { fs.closeSync(output); } catch {}
+    fs.rmSync(tempPath, { force: true });
+    throw error;
+  }
+  fs.closeSync(output);
   fs.renameSync(tempPath, filePath);
-  fileDedupeCaches.delete(filePath);
-  fileRowCaches.delete(filePath);
-  fileIndexCaches.delete(filePath);
-  fileWindowIndexCaches.delete(filePath);
+  clearTrafficLogFileCaches(filePath);
   seedDedupeCache(filePath);
-  return { deleted, kept: kept.length, filePath };
+  return { deleted, kept, retentionMinutes: minutes, cutoff, filePath };
 }
 
 function trafficLogCumulativeCounters(row) {
@@ -866,14 +891,14 @@ function trafficLogClientChartRowAllowed(row, { networks = 'any', excludedInterf
   return false;
 }
 
-export function topTrafficLogFileSites(config = {}, { hours = 6, limit = 10, sort = 'visits', now = Date.now() } = {}) {
+export function topTrafficLogFileSites(config = {}, { minutes = null, hours = null, limit = 10, sort = 'visits', now = Date.now() } = {}) {
   const settings = trafficLogSettings(config);
   const { filePath } = trafficLogFilePaths(config);
-  const safeHours = [1, 6, 12, 24].includes(Number(hours)) ? Number(hours) : 6;
+  const safeMinutes = normalizeTrafficLogRetentionMinutes(minutes ?? (hours == null ? 60 : Number(hours) * 60));
   const safeLimit = Math.max(1, Math.min(25, Math.trunc(Number(limit) || 10)));
   const safeSort = sort === 'bytes' ? 'bytes' : 'visits';
   const endAt = Math.trunc(Number(now) || Date.now()) + 1;
-  const startAt = endAt - safeHours * 60 * 60 * 1000;
+  const startAt = endAt - safeMinutes * 60 * 1000;
   const scanBytes = trafficLogScanBytesForWindow({ startAt, endAt });
   const index = readTrafficLogFileWindowIndex(filePath, {
     startAt,
@@ -930,7 +955,8 @@ export function topTrafficLogFileSites(config = {}, { hours = 6, limit = 10, sor
   return {
     source: 'traffic_log_file',
     logFile: settings.logFile,
-    hours: safeHours,
+    minutes: safeMinutes,
+    hours: safeMinutes / 60,
     limit: safeLimit,
     sort: safeSort,
     startAt,
@@ -944,13 +970,13 @@ export function topTrafficLogFileSites(config = {}, { hours = 6, limit = 10, sor
   };
 }
 
-export function topTrafficLogFileClients(config = {}, { hours = 6, limit = 10, networks = 'any', excludedInterfaces = [], now = Date.now() } = {}) {
+export function topTrafficLogFileClients(config = {}, { minutes = null, hours = null, limit = 10, networks = 'any', excludedInterfaces = [], now = Date.now() } = {}) {
   const settings = trafficLogSettings(config);
   const { filePath } = trafficLogFilePaths(config);
-  const safeHours = [1, 6, 12, 24].includes(Number(hours)) ? Number(hours) : 6;
+  const safeMinutes = normalizeTrafficLogRetentionMinutes(minutes ?? (hours == null ? 60 : Number(hours) * 60));
   const safeLimit = Math.max(1, Math.min(25, Math.trunc(Number(limit) || 10)));
   const endAt = Math.trunc(Number(now) || Date.now()) + 1;
-  const startAt = endAt - safeHours * 60 * 60 * 1000;
+  const startAt = endAt - safeMinutes * 60 * 1000;
   const blockedInterfaces = [...new Set(excludedInterfaces.map(value => String(value || '').trim().toLowerCase()).filter(Boolean))];
   const scanBytes = trafficLogScanBytesForWindow({ startAt, endAt });
   const index = readTrafficLogFileWindowIndex(filePath, {
@@ -1012,7 +1038,8 @@ export function topTrafficLogFileClients(config = {}, { hours = 6, limit = 10, n
   return {
     source: 'traffic_log_file',
     logFile: settings.logFile,
-    hours: safeHours,
+    minutes: safeMinutes,
+    hours: safeMinutes / 60,
     limit: safeLimit,
     networks: safeNetworkList(networks),
     excludedInterfaces: blockedInterfaces,
@@ -1030,7 +1057,7 @@ export function topTrafficLogFileClients(config = {}, { hours = 6, limit = 10, n
 export function listTrafficLogFileRecords(config = {}, {
   search = '',
   kind = '',
-  period = 'daily',
+  period = '60m',
   sourceIp = '',
   sourcePort = '',
   destinationIp = '',
@@ -1128,7 +1155,7 @@ export function listTrafficLogFileRecords(config = {}, {
   };
 }
 
-export function trafficLogFileSeries(config = {}, { period = 'daily', now = Date.now() } = {}) {
+export function trafficLogFileSeries(config = {}, { period = '60m', now = Date.now() } = {}) {
   const settings = trafficLogSettings(config);
   const { filePath } = trafficLogFilePaths(config);
   const window = trafficLogPeriod(period, now);

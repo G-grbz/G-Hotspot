@@ -11,9 +11,9 @@ const state = {
   sessionRows: [],
   sessionColumns: null,
   pendingSessionActions: {},
-  trafficPeriod: 'daily',
-  topSitesHours: 6,
-  topBandwidthHours: 6,
+  trafficPeriod: '60m',
+  topSitesMinutes: 60,
+  topBandwidthMinutes: 60,
   trafficLogSettings: null,
   trafficLogRows: [],
   trafficLogLivePaused: false,
@@ -23,6 +23,10 @@ const state = {
   releaseInfo: null,
   gatewayInterfaces: null,
   gatewayNetworks: null,
+  androidDevices: null,
+  androidPairing: null,
+  androidAppBuild: null,
+  androidAppBuildAction: '',
   adminApprovalRefreshPending: false,
   pendingAdminApprovalDecisions: {},
   lastAdminApprovalRefreshAt: 0
@@ -31,6 +35,9 @@ const state = {
 let adminPublicIpLookupPromise = null;
 let releaseCheckPromise = null;
 const buttonBusyHtml = new WeakMap();
+let androidDevicesRefreshTimer = null;
+let androidBuildRefreshTimer = null;
+let activeDashboardTooltipTarget = null;
 
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
@@ -39,7 +46,7 @@ const t = (text, variables) => i18n.t(text, variables);
 const DEFAULT_TERMS_TEXT = 'By continuing, you accept the terms of use for this guest network.';
 const DEFAULT_NETWORK_LABEL_TEXT = 'GUEST NETWORK';
 const DEFAULT_VERIFICATION_PROMPT_TEXT = 'Choose a verification method to open internet access.';
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const ADMIN_PUBLIC_IP_LOOKUP_URL = 'https://api.ipify.org?format=json';
 const SESSION_COLUMNS_STORAGE_KEY = 'gh_admin_session_columns';
 const SIDEBAR_MINI_STORAGE_KEY = 'gh_admin_sidebar_mini';
@@ -47,13 +54,21 @@ const THEME_STORAGE_KEY = 'gh_admin_theme';
 const DASHBOARD_FILTERS_STORAGE_KEY = 'gh_admin_dashboard_filters';
 const OPNSENSE_TEMPLATE_STORAGE_KEY = 'gh_admin_opnsense_template';
 const RELEASE_POPUP_STORAGE_KEY = 'gh_admin_release_popup_seen';
-const DASHBOARD_TRAFFIC_PERIODS = new Set(['hourly', '6h', '12h', 'daily', 'weekly', 'monthly']);
-const DASHBOARD_HOUR_RANGES = new Set([1, 6, 12, 24]);
+const LOGIN_USERNAME_STORAGE_KEY = 'gh_admin_login_username';
+const DASHBOARD_TRAFFIC_PERIODS = new Set(['15m', '30m', '45m', '60m']);
+const DASHBOARD_MINUTE_RANGES = new Set([15, 30, 45, 60]);
 let resetSettingsScrollOnRender = false;
 const TRAFFIC_LOG_STREAM_ICONS = {
   pause: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>',
   play: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7-11-7Z"/></svg>'
 };
+
+function gatewayProviderLabel(mode = state.gatewayMode) {
+  if (mode === 'opnsense-api') return 'OPNsense';
+  // TODO(pfSense): Restore the provider label when the admin option is enabled again.
+  // if (mode === 'pfsense-api') return 'pfSense';
+  return 'Mock';
+}
 const MB = 1024 * 1024;
 const APPEARANCE_ASSET_FALLBACK_LIMITS = {
   logo: 2 * MB,
@@ -134,7 +149,7 @@ const NOTIFICATION_TEMPLATE_PLACEHOLDERS = {
     ['method', 'Verification method.', 'voucher'],
     ['identity', 'User identity or voucher id.', 'LOBBY-001'],
     ['adminUser', 'Administrator username.', 'GkhnG'],
-    ['error', 'Failure reason when available.', 'OPNsense API request timed out'],
+    ['error', 'Failure reason when available.', 'Gateway API request timed out'],
     ['expiresAt', 'Access expiration time.', 'Jun 30, 2026 14:30']
   ],
   adminApproval: [
@@ -215,6 +230,20 @@ function positionDashboardTooltip(event) {
   tooltip.style.top = `${Math.round(Math.max(margin, top))}px`;
 }
 
+function dashboardTooltipTarget(event) {
+  return event.target.closest?.('[data-dashboard-tooltip]') || null;
+}
+
+function isTouchDashboardTooltipEvent(event) {
+  return event.pointerType === 'touch' || event.pointerType === 'pen';
+}
+
+function setActiveDashboardTooltipTarget(target) {
+  activeDashboardTooltipTarget?.classList?.remove('dashboard-tooltip-active');
+  activeDashboardTooltipTarget = target || null;
+  activeDashboardTooltipTarget?.classList?.add('dashboard-tooltip-active');
+}
+
 function showDashboardTooltip(target, event) {
   const tooltip = dashboardTooltipElement();
   const rows = dashboardTooltipRows(target);
@@ -230,11 +259,28 @@ function showDashboardTooltip(target, event) {
     ${foot ? `<div class="dashboard-tooltip__foot">${escapeHtml(foot)}</div>` : ''}
   `;
   tooltip.classList.remove('hidden');
+  tooltip.setAttribute('aria-hidden', 'false');
+  setActiveDashboardTooltipTarget(target);
   positionDashboardTooltip(event);
 }
 
 function hideDashboardTooltip() {
-  $('#dashboardTooltip')?.classList.add('hidden');
+  const tooltip = $('#dashboardTooltip');
+  tooltip?.classList.add('hidden');
+  tooltip?.setAttribute('aria-hidden', 'true');
+  setActiveDashboardTooltipTarget(null);
+}
+
+function requestAndroidAdminSessionRefresh() {
+  try {
+    if (window.GHotspotAndroid && typeof window.GHotspotAndroid.refreshAdminSession === 'function') {
+      $('#loginScreen')?.classList.add('hidden');
+      $('#adminApp')?.classList.add('hidden');
+      window.GHotspotAndroid.refreshAdminSession();
+      return true;
+    }
+  } catch {}
+  return false;
 }
 
 function api(path, options = {}) {
@@ -248,6 +294,9 @@ function api(path, options = {}) {
   }).then(async response => {
     const payload = await response.json().catch(() => ({}));
     if (response.status === 401 && path !== '/api/admin/login') {
+      if (requestAndroidAdminSessionRefresh()) {
+        throw new Error(t('Your administrator session has expired.'));
+      }
       showLogin();
       throw new Error(t('Your administrator session has expired.'));
     }
@@ -926,8 +975,33 @@ function showLogin() {
   state.csrfToken = '';
   $('#loginScreen').classList.remove('hidden');
   $('#adminApp').classList.add('hidden');
+  const username = applyStoredLoginUsername();
   lookupAdminPublicIp();
-  setTimeout(() => $('#loginPassword').focus(), 50);
+  setTimeout(() => $(username ? '#loginPassword' : '#loginUsername')?.focus(), 50);
+}
+
+function storedLoginUsername() {
+  try {
+    return localStorage.getItem(LOGIN_USERNAME_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function rememberLoginUsername(value) {
+  const username = String(value || '').trim();
+  try {
+    if (username) localStorage.setItem(LOGIN_USERNAME_STORAGE_KEY, username);
+    else localStorage.removeItem(LOGIN_USERNAME_STORAGE_KEY);
+  } catch {}
+}
+
+function applyStoredLoginUsername() {
+  const input = $('#loginUsername');
+  if (!input) return '';
+  const username = storedLoginUsername();
+  input.value = username;
+  return username;
 }
 
 function storedSidebarMini() {
@@ -988,12 +1062,12 @@ function setTheme(theme, { store = false } = {}) {
   }
 }
 
-function dashboardHourRange(value, fallback = 6) {
-  const hours = Number(value);
-  return DASHBOARD_HOUR_RANGES.has(hours) ? hours : fallback;
+function dashboardMinuteRange(value, fallback = 60) {
+  const minutes = Number(value);
+  return DASHBOARD_MINUTE_RANGES.has(minutes) ? minutes : fallback;
 }
 
-function dashboardTrafficPeriod(value, fallback = 'daily') {
+function dashboardTrafficPeriod(value, fallback = '60m') {
   return DASHBOARD_TRAFFIC_PERIODS.has(value) ? value : fallback;
 }
 
@@ -1010,8 +1084,8 @@ function saveDashboardFilters() {
   try {
     localStorage.setItem(DASHBOARD_FILTERS_STORAGE_KEY, JSON.stringify({
       trafficPeriod: dashboardTrafficPeriod(state.trafficPeriod),
-      topSitesHours: dashboardHourRange(state.topSitesHours),
-      topBandwidthHours: dashboardHourRange(state.topBandwidthHours)
+      topSitesMinutes: dashboardMinuteRange(state.topSitesMinutes),
+      topBandwidthMinutes: dashboardMinuteRange(state.topBandwidthMinutes)
     }));
   } catch {}
 }
@@ -1019,11 +1093,11 @@ function saveDashboardFilters() {
 function applyStoredDashboardFilters() {
   const stored = storedDashboardFilters();
   state.trafficPeriod = dashboardTrafficPeriod(stored.trafficPeriod, state.trafficPeriod);
-  state.topSitesHours = dashboardHourRange(stored.topSitesHours, state.topSitesHours);
-  state.topBandwidthHours = dashboardHourRange(stored.topBandwidthHours, state.topBandwidthHours);
+  state.topSitesMinutes = dashboardMinuteRange(stored.topSitesMinutes ?? Number(stored.topSitesHours || 0) * 60, state.topSitesMinutes);
+  state.topBandwidthMinutes = dashboardMinuteRange(stored.topBandwidthMinutes ?? Number(stored.topBandwidthHours || 0) * 60, state.topBandwidthMinutes);
   if ($('#trafficPeriod')) $('#trafficPeriod').value = state.trafficPeriod;
-  if ($('#topSitesRange')) $('#topSitesRange').value = String(state.topSitesHours);
-  if ($('#topBandwidthRange')) $('#topBandwidthRange').value = String(state.topBandwidthHours);
+  if ($('#topSitesRange')) $('#topSitesRange').value = String(state.topSitesMinutes);
+  if ($('#topBandwidthRange')) $('#topBandwidthRange').value = String(state.topBandwidthMinutes);
 }
 
 function showApp(session) {
@@ -1037,7 +1111,9 @@ function showApp(session) {
   setPlainText('#adminName', state.user);
   updateAdminAvatarInitial();
   setPlainText('#brandName', state.appName);
-  setTranslatedText('#gatewayMode', state.gatewayMode === 'opnsense-api' ? 'API connection active' : 'Mock / test mode');
+  setPlainText('#gatewayProviderName', `${gatewayProviderLabel(state.gatewayMode)} Gateway`);
+  setPlainText('#syncButtonLabel', `Sync ${gatewayProviderLabel(state.gatewayMode)}`);
+  setTranslatedText('#gatewayMode', state.gatewayMode === 'mock' ? 'Mock / test mode' : 'API connection active');
   document.title = `${state.appName} ${t('Administration')}`;
   updateWelcomeSyncStatus(null);
   i18n.translateDom();
@@ -1057,7 +1133,7 @@ function renderProjectAttribution(about = state.about || {}) {
   const username = about.githubUsername ? ` (${about.githubUsername})` : ' (G-grbz)';
   const versionValue = about.version || APP_VERSION;
   const version = versionValue ? ` v${versionValue}` : '';
-  const license = about.license || 'G-Hotspot Noncommercial Source-Available License 1.0';
+  const license = about.license || 'LicenseRef-G-Hotspot-NC-1.0';
   const source = String(about.githubUrl || about.source || '').trim();
   for (const target of targets) {
     const label = document.createElement('span');
@@ -1225,6 +1301,8 @@ async function openReleaseFromAvatar() {
 
 async function refreshGatewayStatus() {
   const label = $('#gatewayMode');
+  setPlainText('#gatewayProviderName', `${gatewayProviderLabel(state.gatewayMode)} Gateway`);
+  setPlainText('#syncButtonLabel', `Sync ${gatewayProviderLabel(state.gatewayMode)}`);
   setTranslatedText(label, state.gatewayMode === 'mock' ? 'Mock / test mode' : 'Connecting…');
   if (state.gatewayMode === 'mock') return;
   try {
@@ -1238,11 +1316,12 @@ async function refreshGatewayStatus() {
 }
 
 async function loadDashboard() {
+  hideDashboardTooltip();
   applyStoredDashboardFilters();
-  const selectedPeriod = $('#trafficPeriod')?.value || state.trafficPeriod || 'daily';
-  const selectedTopSitesHours = Number($('#topSitesRange')?.value || state.topSitesHours || 6);
-  const selectedTopBandwidthHours = Number($('#topBandwidthRange')?.value || state.topBandwidthHours || 6);
-  const data = await api(`/api/admin/dashboard?trafficPeriod=${encodeURIComponent(selectedPeriod)}&topSitesHours=${encodeURIComponent(selectedTopSitesHours)}&topBandwidthHours=${encodeURIComponent(selectedTopBandwidthHours)}`);
+  const selectedPeriod = $('#trafficPeriod')?.value || state.trafficPeriod || '60m';
+  const selectedTopSitesMinutes = Number($('#topSitesRange')?.value || state.topSitesMinutes || 60);
+  const selectedTopBandwidthMinutes = Number($('#topBandwidthRange')?.value || state.topBandwidthMinutes || 60);
+  const data = await api(`/api/admin/dashboard?trafficPeriod=${encodeURIComponent(selectedPeriod)}&topSitesMinutes=${encodeURIComponent(selectedTopSitesMinutes)}&topBandwidthMinutes=${encodeURIComponent(selectedTopBandwidthMinutes)}`);
   const summary = data.summary;
   setPlainText('#metricActive', summary.activeSessions.toLocaleString(i18n.locale));
   setTranslatedText('#metricToday','Total connections today: {total}',{total: summary.todaySessions.toLocaleString(i18n.locale)});
@@ -1253,15 +1332,16 @@ async function loadDashboard() {
   setPlainText('#activeNavCount', summary.activeSessions > 99 ? '99+' : summary.activeSessions);
   updateWelcomeSyncStatus(data.gateway?.lastSuccessfulSyncAt);
   state.trafficPeriod = data.traffic?.period || selectedPeriod;
-  state.topSitesHours = Number(data.topSites?.hours || selectedTopSitesHours || 6);
-  state.topBandwidthHours = Number(data.topBandwidthClients?.hours || selectedTopBandwidthHours || 6);
+  state.topSitesMinutes = Number(data.topSites?.minutes || selectedTopSitesMinutes || 60);
+  state.topBandwidthMinutes = Number(data.topBandwidthClients?.minutes || selectedTopBandwidthMinutes || 60);
   if ($('#trafficPeriod')) $('#trafficPeriod').value = state.trafficPeriod;
-  if ($('#topSitesRange')) $('#topSitesRange').value = String(state.topSitesHours);
-  if ($('#topBandwidthRange')) $('#topBandwidthRange').value = String(state.topBandwidthHours);
+  if ($('#topSitesRange')) $('#topSitesRange').value = String(state.topSitesMinutes);
+  if ($('#topBandwidthRange')) $('#topBandwidthRange').value = String(state.topBandwidthMinutes);
   saveDashboardFilters();
   renderSessionTrafficChart(data.daily);
   renderTrafficChart(data.traffic || data.daily);
   renderMethodDonut(data.methods);
+  renderDeviceOsGauge(data.deviceOs || {});
   renderTopSitesDonut(data.topSites || {});
   renderTopBandwidthDonut(data.topBandwidthClients || {});
   renderDashboardAdminApprovals(data.adminApproval || {});
@@ -1428,8 +1508,10 @@ function chartPointTitle(point) {
 }
 
 function compactChartLabel(point, index, total, bucket) {
-  if (['5min', '30min', 'hour'].includes(bucket)) {
-    const interval = total > 18 ? 3 : 2;
+  if (['minute', '5min', '30min', 'hour'].includes(bucket)) {
+    const interval = bucket === 'minute'
+      ? (total > 45 ? 10 : total > 30 ? 5 : total > 18 ? 4 : 3)
+      : (total > 18 ? 3 : 2);
     return index % interval === 0 || index === total - 1 ? point.label : '';
   }
   if (total <= 10) {
@@ -1442,10 +1524,10 @@ function compactChartLabel(point, index, total, bucket) {
 }
 
 function trafficChartSubtitle(series) {
-  if (series?.period === 'hourly') return 'Traffic for the last 1 hour';
-  if (series?.period === '6h') return 'Traffic for the last 6 hours';
-  if (series?.period === '12h') return 'Traffic for the last 12 hours';
-  return series?.bucket === 'hour' ? 'Hourly traffic for today' : 'Daily traffic for the selected period';
+  if (series?.period === '15m') return 'Traffic for the last 15 minutes';
+  if (series?.period === '30m') return 'Traffic for the last 30 minutes';
+  if (series?.period === '45m') return 'Traffic for the last 45 minutes';
+  return 'Traffic for the last 1 hour';
 }
 
 function renderTrafficSummary(series) {
@@ -1614,12 +1696,116 @@ function renderMethodDonut(methods) {
   }).join('') : `<span>${t('No verification data yet')}</span>`;
 }
 
-function topSitesPeriodLabel(hours) {
-  const value = Number(hours || 6);
-  if (value === 1) return t('Last 1 hour');
-  if (value === 6) return t('Last 6 hours');
-  if (value === 12) return t('Last 12 hours');
-  return t('Last 24 hours');
+const DEVICE_OS_COLORS = {
+  windows: '#2563eb',
+  linux: '#111827',
+  android: '#10b981',
+  ios: '#64748b',
+  macos: '#8b5cf6',
+  unknown: '#9ca3af'
+};
+
+function deviceOsClass(os) {
+  const normalized = String(os || '').trim().toLowerCase();
+  return Object.hasOwn(DEVICE_OS_COLORS, normalized) ? normalized : 'unknown';
+}
+
+function deviceOsDisplayLabel(row) {
+  return row?.label === 'Unknown' ? t('Unknown') : (row?.label || t('Unknown'));
+}
+
+function deviceOsNames(row) {
+  return Array.isArray(row?.devices)
+    ? row.devices.map(device => String(device || '').trim()).filter(Boolean)
+    : [];
+}
+
+function deviceOsNameText(row) {
+  const names = deviceOsNames(row);
+  return names.length ? names.join(', ') : t('Device names unavailable');
+}
+
+function renderDeviceOsGauge(data) {
+  const rows = (Array.isArray(data?.rows) ? data.rows : [])
+    .map(row => ({ ...row, count: Number(row.count || 0) }))
+    .filter(row => row.count > 0);
+  const total = Number(data?.total || rows.reduce((sum, row) => sum + row.count, 0));
+  const radius = 52;
+  const circumference = 2 * Math.PI * radius;
+  const rawSegmentLengths = rows.map(row => total ? (row.count / total) * circumference : 0);
+  const visibleSegmentCount = rawSegmentLengths.filter(length => length > 0).length;
+  const minSegmentLength = visibleSegmentCount > 1 ? 8 : 0;
+  const minimumLengthTotal = minSegmentLength * visibleSegmentCount;
+  const rawLengthTotal = rawSegmentLengths.reduce((sum, length) => sum + length, 0);
+  const remainingLength = Math.max(0, circumference - minimumLengthTotal);
+  const segmentLengths = rawSegmentLengths.map(length => {
+    if (!length) return 0;
+    if (!minSegmentLength || rawLengthTotal <= 0) return length;
+    return minSegmentLength + (length / rawLengthTotal) * remainingLength;
+  });
+  let offset = 0;
+  const segments = rows.map((row, index) => {
+    const count = Number(row.count || 0);
+    const percentage = total ? Math.round(count / total * 100) : 0;
+    const color = DEVICE_OS_COLORS[row.os] || DEVICE_OS_COLORS.unknown;
+    const label = deviceOsDisplayLabel(row);
+    const names = deviceOsNames(row);
+    const tooltip = dashboardTooltipAttributes({
+      title: label,
+      accent: color,
+      rows: [
+        { label: t('Devices'), value: `${count.toLocaleString(i18n.locale)} ${t('devices')}` },
+        { label: t('Share'), value: `%${percentage}` },
+        { label: t('Names'), value: names.length ? names.length.toLocaleString(i18n.locale) : t('Unknown') }
+      ],
+      foot: deviceOsNameText(row)
+    });
+    const length = segmentLengths[index] || 0;
+    const element = `<circle class="donut-segment" cx="75" cy="75" r="${radius}" stroke="${color}" stroke-dasharray="${length} ${circumference - length}" stroke-dashoffset="${-offset}" ${tooltip}/>`;
+    offset += length;
+    return element;
+  }).join('');
+  $('#deviceOsDonut').innerHTML = `
+    <svg viewBox="0 0 150 150"><circle class="donut-track" cx="75" cy="75" r="${radius}"/>${segments}</svg>
+    <div class="donut-center"><strong>${total.toLocaleString(i18n.locale)}</strong><span>${t('devices')}</span></div>`;
+  $('#deviceOsLegend').innerHTML = rows.length ? rows.map(row => {
+    const count = Number(row.count || 0);
+    const percentage = total ? Math.round(count / total * 100) : 0;
+    const color = DEVICE_OS_COLORS[row.os] || DEVICE_OS_COLORS.unknown;
+    const label = deviceOsDisplayLabel(row);
+    const names = deviceOsNames(row);
+    const osClass = deviceOsClass(row.os);
+    const tooltip = dashboardTooltipAttributes({
+      title: label,
+      accent: color,
+      rows: [
+        { label: t('Devices'), value: `${count.toLocaleString(i18n.locale)} ${t('devices')}` },
+        { label: t('Share'), value: `%${percentage}` },
+        { label: t('Names'), value: names.length ? names.length.toLocaleString(i18n.locale) : t('Unknown') }
+      ],
+      foot: deviceOsNameText(row)
+    });
+    return `<div class="device-os-row device-os-row--${osClass}" ${tooltip}>
+      <span class="device-os-dot"></span>
+      <div><strong>${escapeHtml(label)}</strong><span>${count.toLocaleString(i18n.locale)} ${escapeHtml(t('devices'))} · %${percentage} · ${escapeHtml(deviceOsNameText(row))}</span></div>
+    </div>`;
+  }).join('') : `<div class="site-empty">${escapeHtml(t('No active device data yet'))}</div>`;
+}
+
+function topSitesPeriodLabel(minutes) {
+  const value = Number(minutes || 60);
+  if (value === 15) return t('Last 15 minutes');
+  if (value === 30) return t('Last 30 minutes');
+  if (value === 45) return t('Last 45 minutes');
+  return t('Last 1 hour');
+}
+
+function trafficRetentionLabel(minutes) {
+  const value = Number(minutes || 60);
+  if (value === 15) return t('15 minutes');
+  if (value === 30) return t('30 minutes');
+  if (value === 45) return t('45 minutes');
+  return t('1 hour');
 }
 
 const SITE_GAUGE_COLORS = [ '#6366F1', '#8B5CF6', '#EC4899', '#F59E0B', '#10B981', '#06B6D4', '#3B82F6', '#F472B6', '#F97316', '#14B8A6'];
@@ -1693,7 +1879,7 @@ function renderSiteGauge(data, {
 }) {
   const rows = Array.isArray(data.rows) ? data.rows : [];
   const total = rows.reduce((sum, row) => sum + siteGaugeMetricValue(row, metric), 0);
-  const periodLabel = topSitesPeriodLabel(data.hours);
+  const periodLabel = topSitesPeriodLabel(data.minutes);
   const radius = 52;
   const circumference = 2 * Math.PI * radius;
   const rawSegmentLengths = rows.map(row => {
@@ -2012,7 +2198,7 @@ function activityLabel(row) {
     voucher_enabled: t('Voucher enabled'),
     voucher_disabled: t('Voucher disabled'),
     session_disconnected: t('Session disconnected by administrator'),
-    gateway_sync: t('OPNsense data synchronized'),
+    gateway_sync: t('{provider} data synchronized', { provider: gatewayProviderLabel() }),
     settings_updated: t('Settings updated'),
     appearance_asset_uploaded: t('Appearance image uploaded'),
     appearance_asset_deleted: t('Appearance image removed'),
@@ -2023,7 +2209,8 @@ function activityLabel(row) {
     syslog_sync: t('Syslog synchronized'),
     syslog_export: t('Syslog export created'),
     syslog_vacuum: t('Syslog database compacted'),
-    opnsense_template_created: t('OPNsense template ZIP created'),
+    traffic_logs_vacuum: t('Traffic log database compacted'),
+    opnsense_template_created: t('{provider} template ZIP created', { provider: gatewayProviderLabel() }),
     syslog_backup_failed: t('Syslog backup failed'),
     syslog_backup_succeeded: t('Syslog backup completed'),
     syslog_backup_worm_warning: t('Syslog backup WORM warning'),
@@ -2062,11 +2249,11 @@ function activitySource(value) {
   }
   return {
     admin: t('Administration panel'),
-    gateway: 'OPNsense',
+    gateway: gatewayProviderLabel(),
     voucher_batch: t('Voucher group'),
     authorization: t('Hotspot session'),
     traffic_logs: t('Traffic logs'),
-    opnsense_template: t('OPNsense template'),
+    opnsense_template: t('{provider} template', { provider: gatewayProviderLabel() }),
     settings: t('Settings'),
     law5651: 'Syslog',
     syslog: 'Syslog'
@@ -2264,7 +2451,7 @@ function trafficLogFilterParams(extra = {}) {
     startAt: $('#trafficLogStartAt')?.value || '',
     endAt: $('#trafficLogEndAt')?.value || '',
     kind: $('#trafficLogKind')?.value || '',
-    period: $('#trafficLogPeriod')?.value || 'daily',
+    period: $('#trafficLogPeriod')?.value || '60m',
     ...extra
   });
   return params;
@@ -2315,7 +2502,7 @@ function renderTrafficLogSummary(data) {
     [t('Clients'), Number(summary.clients || 0).toLocaleString(i18n.locale)],
     [t('Live download'), liveDownload],
     [t('Live upload'), liveUpload],
-    [t('Retention'), `${settings.retentionDays || 30} ${t('days')}`],
+    [t('Retention'), trafficRetentionLabel(settings.retentionMinutes || 60)],
     [t('Last record'), summary.lastCreatedAt ? relativeTime(summary.lastCreatedAt) : '—']
   ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('');
 }
@@ -2373,7 +2560,7 @@ function setTrafficLogSettingsForm(payload) {
   const values = payload.values || {};
   const runtime = payload.runtime || {};
   $('#trafficLogsEnabled').checked = String(values.TRAFFIC_LOGS_ENABLED ?? runtime.enabled) === 'true' || runtime.enabled === true;
-  $('#trafficLogsRetentionDays').value = values.TRAFFIC_LOGS_RETENTION_DAYS ?? runtime.retentionDays ?? 30;
+  $('#trafficLogsRetentionMinutes').value = values.TRAFFIC_LOGS_RETENTION_MINUTES ?? runtime.retentionMinutes ?? 60;
   $('#trafficLogsResolveDomains').checked = String(values.TRAFFIC_LOGS_RESOLVE_DOMAINS ?? runtime.resolveDomains) === 'true' || runtime.resolveDomains === true;
   $('#trafficLogsLiveRefreshSeconds').value = values.TRAFFIC_LOGS_LIVE_REFRESH_SECONDS ?? runtime.liveRefreshSeconds ?? 5;
 }
@@ -2429,7 +2616,7 @@ async function saveTrafficLogSettings(event) {
       body: JSON.stringify({
         settings: {
           TRAFFIC_LOGS_ENABLED: $('#trafficLogsEnabled').checked,
-          TRAFFIC_LOGS_RETENTION_DAYS: $('#trafficLogsRetentionDays').value,
+          TRAFFIC_LOGS_RETENTION_MINUTES: $('#trafficLogsRetentionMinutes').value,
           TRAFFIC_LOGS_RESOLVE_DOMAINS: $('#trafficLogsResolveDomains').checked,
           TRAFFIC_LOGS_LIVE_REFRESH_SECONDS: $('#trafficLogsLiveRefreshSeconds').value
         }
@@ -2437,6 +2624,20 @@ async function saveTrafficLogSettings(event) {
     });
     state.trafficLogSettings = { ...(state.trafficLogSettings || {}), runtime: result.runtime };
     toast(t('Traffic log settings saved.'));
+    const removed = Number(result.deletedExpired || 0) +
+      Number(result.fileDeletedExpired || 0) +
+      Number(result.cleanup?.deletedRollups || 0);
+    if (removed > 0) {
+      toast(t('Traffic retention removed {count} expired records.', {
+        count: removed.toLocaleString(i18n.locale)
+      }));
+    }
+    const freeBytes = Number(result.maintenance?.after?.freeBytes ?? result.maintenance?.freeBytes ?? 0);
+    if (freeBytes >= 128 * 1024 * 1024) {
+      toast(t('Database has {free} reusable free space. Use Compact database to shrink the file.', {
+        free: formatBytes(freeBytes)
+      }));
+    }
     closeTrafficLogSettingsModal();
     await loadTrafficLogs();
   } catch (error) {
@@ -2450,11 +2651,16 @@ function settingOptionLabel(value, field = null) {
   if (field?.key?.endsWith('_QUOTA_PERIOD')) {
     return quotaPeriodLabel(value);
   }
+  if (field?.key === 'TRAFFIC_LOGS_RETENTION_MINUTES') {
+    return trafficRetentionLabel(value);
+  }
   return {
     en: 'English',
     tr: 'Türkçe',
     mock: 'Mock / test',
     'opnsense-api': 'OPNsense API',
+    // TODO(pfSense): Restore the admin select label with the settings schema option.
+    // 'pfsense-api': 'pfSense API',
     netgsm: 'Netgsm',
     iletimerkezi: 'İleti Merkezi',
     twilio: 'Twilio',
@@ -2481,6 +2687,25 @@ function settingOptionLabel(value, field = null) {
     weekly: t('Once a week'),
     monthly: t('Once a month')
   }[value] || value;
+}
+
+function settingDynamicValue(field, property, fallback = '') {
+  const spec = field?.[property];
+  if (!spec) return fallback;
+  const key = spec.key || 'GATEWAY_MODE';
+  const input = $(`[data-setting="${key}"]`);
+  const value = input
+    ? (input.type === 'checkbox' ? String(input.checked) : String(input.value ?? ''))
+    : String(state.settings?.values?.[key] ?? '');
+  return spec.values?.[value] || fallback;
+}
+
+function settingLabelText(field) {
+  return settingDynamicValue(field, 'labelsByValue', field?.label || '');
+}
+
+function settingWarningText(field) {
+  return settingDynamicValue(field, 'warningsByValue', field?.warning || '');
 }
 
 function settingVisibilityAttributes(field) {
@@ -2511,8 +2736,10 @@ function settingInput(field, value, configured, options = {}) {
   const readOnly = field.readOnly ? ' readonly aria-readonly="true"' : '';
   const full = ['textarea', 'secret'].includes(field.type) ? ' full' : '';
   const visibility = settingVisibilityAttributes(field);
-  const help = field.warning
-    ? `<small>${escapeHtml(t(field.warning))}</small>`
+  const labelText = settingLabelText(field);
+  const warningText = settingWarningText(field);
+  const help = warningText
+    ? `<small data-setting-help-for="${escapeHtml(field.key)}">${escapeHtml(t(warningText))}</small>`
     : (field.restartRequired ? `<small>${escapeHtml(t('Requires a process restart.'))}</small>` : '');
   const networkChoices = ['OPNSENSE_SHAPER_NETWORK', 'SYSLOG_NETWORKS', 'OPNSENSE_ZONE_MAP'].includes(field.key)
     ? `<div class="syslog-network-choices opnsense-network-choices" data-opnsense-network-choices="${escapeHtml(field.key)}"></div>`
@@ -2523,7 +2750,7 @@ function settingInput(field, value, configured, options = {}) {
       return `<div class="setting-field setting-field--minimal-boolean"${provider}${visibility}>
         <label class="minimal-boolean-field" for="${id}">
           <input id="${id}" name="${escapeHtml(field.key)}" data-setting="${field.key}"${derivedFrom} type="checkbox" ${String(value) === 'true' ? 'checked' : ''}>
-          <span>${escapeHtml(t(field.label))}</span>
+          <span data-setting-label-for="${escapeHtml(field.key)}">${escapeHtml(t(labelText))}</span>
         </label>
         ${help}
       </div>`;
@@ -2542,13 +2769,14 @@ function settingInput(field, value, configured, options = {}) {
     const placeholder = field.type === 'secret' && configured
       ? t('Configured — leave blank to keep the current value')
       : (field.placeholder || '');
-    const list = field.key === 'OPNSENSE_SHAPER_INTERFACE' ? ' list="opnsenseInterfaceChoices"' : '';
-    const datalist = field.key === 'OPNSENSE_SHAPER_INTERFACE'
-      ? '<datalist id="opnsenseInterfaceChoices"></datalist><small id="opnsenseInterfaceStatus"></small>'
+    const interfaceFields = new Set(['OPNSENSE_SHAPER_INTERFACE']);
+    const list = interfaceFields.has(field.key) ? ' list="gatewayInterfaceChoices"' : '';
+    const datalist = interfaceFields.has(field.key)
+      ? '<datalist id="gatewayInterfaceChoices"></datalist><small id="gatewayInterfaceStatus"></small>'
       : '';
     control = `<input id="${id}" name="${escapeHtml(field.key)}" data-setting="${field.key}"${derivedFrom}${readOnly} type="${type}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}"${list} ${field.min != null ? `min="${field.min}"` : ''} ${field.max != null ? `max="${field.max}"` : ''}>${datalist}`;
   }
-  return `<div class="setting-field${full}"${provider}${visibility}><label for="${id}">${escapeHtml(t(field.label))}</label>${control}${networkChoices}${help}</div>`;
+  return `<div class="setting-field${full}"${provider}${visibility}><label for="${id}" data-setting-label-for="${escapeHtml(field.key)}">${escapeHtml(t(labelText))}</label>${control}${networkChoices}${help}</div>`;
 }
 
 function isNotificationTemplateField(group, field) {
@@ -2700,6 +2928,582 @@ function renderNotificationAlertTypeGroup(alertGroup, group) {
   `;
 }
 
+function qrGfMultiply(left, right) {
+  let result = 0;
+  let value = left;
+  let factor = right;
+  while (factor > 0) {
+    if ((factor & 1) !== 0) result ^= value;
+    value <<= 1;
+    if ((value & 0x100) !== 0) value ^= 0x11d;
+    factor >>>= 1;
+  }
+  return result;
+}
+
+function qrReedSolomonDivisor(degree) {
+  const result = new Array(degree).fill(0);
+  result[degree - 1] = 1;
+  let root = 1;
+  for (let i = 0; i < degree; i += 1) {
+    for (let j = 0; j < degree; j += 1) {
+      result[j] = qrGfMultiply(result[j], root);
+      if (j + 1 < degree) result[j] ^= result[j + 1];
+    }
+    root = qrGfMultiply(root, 0x02);
+  }
+  return result;
+}
+
+function qrReedSolomonRemainder(data, divisor) {
+  const result = new Array(divisor.length).fill(0);
+  data.forEach(byte => {
+    const factor = byte ^ result.shift();
+    result.push(0);
+    divisor.forEach((coefficient, index) => {
+      result[index] ^= qrGfMultiply(coefficient, factor);
+    });
+  });
+  return result;
+}
+
+function qrFormatBits(mask) {
+  const data = (1 << 3) | mask;
+  let remainder = data << 10;
+  for (let i = 14; i >= 10; i -= 1) {
+    if (((remainder >>> i) & 1) !== 0) remainder ^= 0x537 << (i - 10);
+  }
+  return ((data << 10) | remainder) ^ 0x5412;
+}
+
+const QR_VERSION_L_OPTIONS = [
+  { version: 1, dataCodewords: 19, eccCodewords: 7, alignmentCenters: [] },
+  { version: 2, dataCodewords: 34, eccCodewords: 10, alignmentCenters: [6, 18] },
+  { version: 3, dataCodewords: 55, eccCodewords: 15, alignmentCenters: [6, 22] },
+  { version: 4, dataCodewords: 80, eccCodewords: 20, alignmentCenters: [6, 26] },
+  { version: 5, dataCodewords: 108, eccCodewords: 26, alignmentCenters: [6, 30] }
+];
+
+function qrEncodeBytes(text) {
+  const bytes = Array.from(String(text || ''), character => character.charCodeAt(0) & 0xff);
+  const option = QR_VERSION_L_OPTIONS.find(item => (4 + 8 + (bytes.length * 8)) <= item.dataCodewords * 8);
+  if (!bytes.length || !option) return null;
+  const bits = [];
+  const appendBits = (value, length) => {
+    for (let i = length - 1; i >= 0; i -= 1) bits.push((value >>> i) & 1);
+  };
+  appendBits(0x4, 4);
+  appendBits(bytes.length, 8);
+  bytes.forEach(byte => appendBits(byte, 8));
+  appendBits(0, Math.min(4, (option.dataCodewords * 8) - bits.length));
+  while (bits.length % 8 !== 0) bits.push(0);
+  const dataCodewords = [];
+  for (let i = 0; i < bits.length; i += 8) {
+    dataCodewords.push(bits.slice(i, i + 8).reduce((value, bit) => (value << 1) | bit, 0));
+  }
+  for (let i = 0; dataCodewords.length < option.dataCodewords; i += 1) {
+    dataCodewords.push(i % 2 === 0 ? 0xec : 0x11);
+  }
+
+  const codewords = dataCodewords.concat(qrReedSolomonRemainder(dataCodewords, qrReedSolomonDivisor(option.eccCodewords)));
+  const dataBits = [];
+  codewords.forEach(byte => appendBitsTo(dataBits, byte, 8));
+
+  const size = 21 + ((option.version - 1) * 4);
+  const modules = Array.from({ length: size }, () => new Array(size).fill(false));
+  const reserved = Array.from({ length: size }, () => new Array(size).fill(false));
+  const setFunctionModule = (x, y, dark) => {
+    if (x < 0 || y < 0 || x >= size || y >= size) return;
+    modules[y][x] = dark;
+    reserved[y][x] = true;
+  };
+  const drawFinder = (x, y) => {
+    for (let dy = -1; dy <= 7; dy += 1) {
+      for (let dx = -1; dx <= 7; dx += 1) {
+        const xx = x + dx;
+        const yy = y + dy;
+        const inFinder = dx >= 0 && dx <= 6 && dy >= 0 && dy <= 6;
+        const dark = inFinder && (
+          dx === 0 || dx === 6 || dy === 0 || dy === 6 ||
+          (dx >= 2 && dx <= 4 && dy >= 2 && dy <= 4)
+        );
+        setFunctionModule(xx, yy, dark);
+      }
+    }
+  };
+  drawFinder(0, 0);
+  drawFinder(size - 7, 0);
+  drawFinder(0, size - 7);
+  const drawAlignment = (centerX, centerY) => {
+    for (let dy = -2; dy <= 2; dy += 1) {
+      for (let dx = -2; dx <= 2; dx += 1) {
+        const distance = Math.max(Math.abs(dx), Math.abs(dy));
+        setFunctionModule(centerX + dx, centerY + dy, distance !== 1);
+      }
+    }
+  };
+  option.alignmentCenters.forEach(centerY => {
+    option.alignmentCenters.forEach(centerX => {
+      const overlapsFinder = (
+        (centerX === 6 && centerY === 6) ||
+        (centerX === 6 && centerY === size - 7) ||
+        (centerX === size - 7 && centerY === 6)
+      );
+      if (!overlapsFinder) drawAlignment(centerX, centerY);
+    });
+  });
+  for (let i = 8; i < size - 8; i += 1) {
+    setFunctionModule(6, i, i % 2 === 0);
+    setFunctionModule(i, 6, i % 2 === 0);
+  }
+  drawQrFormatBits(modules, reserved, setFunctionModule, 0);
+
+  let bitIndex = 0;
+  let upward = true;
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    for (let vertical = 0; vertical < size; vertical += 1) {
+      const y = upward ? size - 1 - vertical : vertical;
+      for (let column = 0; column < 2; column += 1) {
+        const x = right - column;
+        if (reserved[y][x]) continue;
+        let dark = bitIndex < dataBits.length && dataBits[bitIndex] === 1;
+        bitIndex += 1;
+        if ((x + y) % 2 === 0) dark = !dark;
+        modules[y][x] = dark;
+      }
+    }
+    upward = !upward;
+  }
+  drawQrFormatBits(modules, reserved, setFunctionModule, 0);
+  return modules;
+}
+
+function appendBitsTo(target, value, length) {
+  for (let i = length - 1; i >= 0; i -= 1) target.push((value >>> i) & 1);
+}
+
+function drawQrFormatBits(modules, reserved, setFunctionModule, mask) {
+  const size = modules.length;
+  const bits = qrFormatBits(mask);
+  const bit = index => ((bits >>> index) & 1) !== 0;
+  for (let i = 0; i <= 5; i += 1) setFunctionModule(8, i, bit(i));
+  setFunctionModule(8, 7, bit(6));
+  setFunctionModule(8, 8, bit(7));
+  setFunctionModule(7, 8, bit(8));
+  for (let i = 9; i < 15; i += 1) setFunctionModule(14 - i, 8, bit(i));
+  for (let i = 0; i < 8; i += 1) setFunctionModule(size - 1 - i, 8, bit(i));
+  for (let i = 8; i < 15; i += 1) setFunctionModule(8, size - 15 + i, bit(i));
+  setFunctionModule(8, size - 8, true);
+}
+
+function androidPairingQrSvg(text, fallbackText = '') {
+  let modules = qrEncodeBytes(text);
+  if (!modules && fallbackText) modules = qrEncodeBytes(fallbackText);
+  if (!modules) return `<div class="android-pairing-qr-fallback">${escapeHtml(t('QR code could not be generated.'))}</div>`;
+  const quietZone = 4;
+  const size = modules.length + (quietZone * 2);
+  const rects = [];
+  modules.forEach((row, y) => {
+    row.forEach((dark, x) => {
+      if (dark) rects.push(`<rect x="${x + quietZone}" y="${y + quietZone}" width="1" height="1"></rect>`);
+    });
+  });
+  return `
+    <svg class="android-pairing-qr" viewBox="0 0 ${size} ${size}" role="img" aria-label="${escapeHtml(t('Pairing QR code'))}" stroke="none">
+      <rect width="${size}" height="${size}" fill="white" stroke="none"></rect>
+      <g fill="currentColor" stroke="none">${rects.join('')}</g>
+    </svg>
+  `;
+}
+
+function androidPairingQrHtml(pairing) {
+  if (pairing?.qrDataUri) {
+    return `<img class="android-pairing-qr" src="${escapeHtml(pairing.qrDataUri)}" alt="${escapeHtml(t('Pairing QR code'))}">`;
+  }
+  return `<div class="android-pairing-qr-fallback">${escapeHtml(t('QR code could not be generated.'))}</div>`;
+}
+
+function androidDeviceStatusLabel(device) {
+  const status = String(device?.status || (device?.enabled ? 'approved' : 'disabled'));
+  return {
+    pending: t('Waiting for approval'),
+    approved: t('Approved'),
+    disabled: t('Disabled')
+  }[status] || status;
+}
+
+function androidDeviceById(deviceId) {
+  return (state.androidDevices?.rows || [])
+    .find(device => String(device.id) === String(deviceId)) || null;
+}
+
+function androidDeviceDisplayName(deviceId) {
+  const name = String(androidDeviceById(deviceId)?.name || '').trim();
+  return name || 'Android';
+}
+
+function androidPairingCodeHtml() {
+  const pairing = state.androidPairing;
+  if (!pairing) {
+    return `<div class="empty-activity">${escapeHtml(t('No active Android pairing code.'))}</div>`;
+  }
+  return `
+    <div class="android-pairing-code-wrap">
+      ${androidPairingQrHtml(pairing)}
+      <div class="android-pairing-code">
+        <span>${escapeHtml(t('Pairing code'))}</span>
+        <strong>${escapeHtml(pairing.code || '')}</strong>
+        <small>${escapeHtml(t('Valid until {time}', { time: formatDate(pairing.expiresAt) }))}</small>
+      </div>
+    </div>
+    <p class="android-pairing-hint">${escapeHtml(t('Scan this QR code from the Android app, or type the code manually.'))}</p>
+  `;
+}
+
+function androidDeviceRowsHtml() {
+  const rows = (state.androidDevices?.rows || []).filter(device => device.status !== 'disabled');
+  if (!rows.length) {
+    return `<div class="empty-activity">${escapeHtml(t('No Android admin devices yet.'))}</div>`;
+  }
+  return rows.map(device => `
+    <div class="approval-row android-device-row">
+      <div class="identity-cell">
+        <div class="identity-icon android">A</div>
+        <div>
+          <strong>${escapeHtml(device.name || 'Android')}</strong>
+          <span>${escapeHtml(device.platformVersion || device.clientIp || '')}</span>
+        </div>
+      </div>
+      <div class="stacked">
+        <strong>${escapeHtml(androidDeviceStatusLabel(device))}</strong>
+        <span>${escapeHtml(t('Last access: {time}', {
+          time: device.lastSeenAt ? formatDate(device.lastSeenAt) : t('Not seen yet')
+        }))}</span>
+        ${device.approvedAt ? `<span>${escapeHtml(t('Approved at: {time}', {
+          time: formatDate(device.approvedAt)
+        }))}</span>` : ''}
+      </div>
+      <div class="actions-cell">
+        ${device.status === 'pending'
+          ? `<button class="action-button approve" type="button" data-android-device-approve="${escapeHtml(device.id)}" title="${escapeHtml(t('Approve'))}" aria-label="${escapeHtml(t('Approve'))}">${adminApprovalActionIcon('approve')}</button>
+            <button class="action-button danger" type="button" data-android-device-reject="${escapeHtml(device.id)}" title="${escapeHtml(t('Reject'))}" aria-label="${escapeHtml(t('Reject'))}">${adminApprovalActionIcon('reject')}</button>`
+          : ''}
+        ${device.status === 'approved'
+          ? `<button class="action-button danger" type="button" data-android-device-remove="${escapeHtml(device.id)}" title="${escapeHtml(t('Remove'))}" aria-label="${escapeHtml(t('Remove'))}">×</button>`
+          : ''}
+      </div>
+    </div>
+  `).join('');
+}
+
+function renderAndroidPairingPanel() {
+  return `
+    <div class="settings-section full android-pairing-panel" id="androidPairingPanel">
+      <div class="panel-head">
+        <div>
+          <h3>${escapeHtml(t('Android device pairing'))}</h3>
+          <p>${escapeHtml(t('Generate a one-time code, enter it in the Android app, then approve the pending device here.'))}</p>
+        </div>
+        <button class="secondary-button" type="button" id="androidPairingCodeButton">${escapeHtml(t('Generate pairing code'))}</button>
+      </div>
+      <div id="androidPairingCodeBox">${androidPairingCodeHtml()}</div>
+      <div class="android-device-list" id="androidDeviceList">${androidDeviceRowsHtml()}</div>
+    </div>
+  `;
+}
+
+function androidBuildStatusCopy(status = state.androidAppBuild) {
+  if (!status) return { tone: '', title: t('Loading APK build status…'), detail: '' };
+  if (status.state === 'running') {
+    return {
+      tone: 'running',
+      title: t('Android APK is being built…'),
+      detail: status.startedAt ? t('Started {time}', { time: formatDate(status.startedAt) }) : ''
+    };
+  }
+  if (status.state === 'failed') {
+    return {
+      tone: 'error',
+      title: t('Android APK build failed.'),
+      detail: t(status.error || 'Gradle build failed.')
+    };
+  }
+  if (status.apk?.ready) {
+    return {
+      tone: 'ready',
+      title: t('Android APK is ready to download.'),
+      detail: t('Built {time} · {size}', {
+        time: formatDate(status.apk.builtAt),
+        size: formatBytes(status.apk.size)
+      })
+    };
+  }
+  if (!status.config?.valid) {
+    return {
+      tone: 'warning',
+      title: t('Upload google-services.json to build the Android app.'),
+      detail: status.config?.error ? t(status.config.error) : ''
+    };
+  }
+  return {
+    tone: '',
+    title: t('Firebase configuration is ready.'),
+    detail: t('Build a new APK for project {projectId}.', { projectId: status.config.projectId })
+  };
+}
+
+function renderAndroidBuildPanel() {
+  const status = state.androidAppBuild;
+  const config = status?.config || {};
+  const copy = androidBuildStatusCopy(status);
+  const busy = Boolean(state.androidAppBuildAction || status?.state === 'running');
+  const uploadLabel = config.valid ? 'Replace google-services.json' : 'Upload google-services.json';
+  return `
+    <section class="settings-section full android-build-panel" id="androidAppBuildPanel">
+      <div class="panel-head">
+        <div>
+          <h3>${escapeHtml(t('Android APK builder'))}</h3>
+          <p>${escapeHtml(t('Upload Firebase configuration, build the app on this server, and download the generated APK.'))}</p>
+        </div>
+      </div>
+      <div class="android-build-meta">
+        <div>
+          <span>${escapeHtml(t('Firebase project'))}</span>
+          <strong>${escapeHtml(config.valid ? config.projectId : t('Not configured'))}</strong>
+        </div>
+        <div>
+          <span>${escapeHtml(t('Android package'))}</span>
+          <strong>com.ghotspot.admin</strong>
+        </div>
+      </div>
+      <div class="android-build-status ${escapeHtml(copy.tone)}" role="status" aria-live="polite">
+        ${status?.state === 'running' ? '<span class="button-spinner" aria-hidden="true"></span>' : '<span class="android-build-status-dot" aria-hidden="true"></span>'}
+        <div><strong>${escapeHtml(copy.title)}</strong>${copy.detail ? `<small>${escapeHtml(copy.detail)}</small>` : ''}</div>
+      </div>
+      ${status?.state === 'failed' && status.log
+        ? `<details class="android-build-log"><summary>${escapeHtml(t('Build output'))}</summary><pre>${escapeHtml(status.log)}</pre></details>`
+        : ''}
+      <div class="android-build-actions">
+        <label class="secondary-button file-button ${busy ? 'disabled' : ''}" for="androidGoogleServicesFile">${escapeHtml(t(uploadLabel))}</label>
+        <input id="androidGoogleServicesFile" class="android-build-file-input" type="file" accept="application/json,.json" ${busy ? 'disabled' : ''}>
+        <button class="primary-button" id="androidBuildApkButton" type="button" ${busy || !config.valid ? 'disabled' : ''}>${escapeHtml(t(status?.state === 'running' ? 'Building APK…' : 'Build APK'))}</button>
+        <button class="secondary-button" id="androidDownloadApkButton" type="button" ${busy || !status?.apk?.ready ? 'disabled' : ''}>${escapeHtml(t('Download APK'))}</button>
+      </div>
+    </section>
+  `;
+}
+
+function refreshAndroidBuildPanel() {
+  const panel = $('#androidAppBuildPanel');
+  if (!panel) return;
+  panel.outerHTML = renderAndroidBuildPanel();
+  bindAndroidBuildPanel();
+}
+
+function stopAndroidBuildAutoRefresh() {
+  if (androidBuildRefreshTimer) clearInterval(androidBuildRefreshTimer);
+  androidBuildRefreshTimer = null;
+}
+
+function startAndroidBuildAutoRefresh() {
+  stopAndroidBuildAutoRefresh();
+  if (state.androidAppBuild?.state !== 'running') return;
+  androidBuildRefreshTimer = setInterval(() => {
+    if (state.currentView !== 'settings' || state.settingsGroup !== 'android-notifications') {
+      stopAndroidBuildAutoRefresh();
+      return;
+    }
+    loadAndroidBuildStatus().catch(() => {});
+  }, 1500);
+}
+
+async function loadAndroidBuildStatus() {
+  state.androidAppBuild = await api('/api/admin/android/app-build');
+  refreshAndroidBuildPanel();
+  if (state.androidAppBuild.state === 'running') startAndroidBuildAutoRefresh();
+  else stopAndroidBuildAutoRefresh();
+}
+
+async function uploadAndroidFirebaseConfig(file) {
+  if (!file) return;
+  if (file.size > 128 * 1024) throw new Error(t('google-services.json is too large'));
+  state.androidAppBuildAction = 'uploading';
+  refreshAndroidBuildPanel();
+  try {
+    state.androidAppBuild = await api('/api/admin/android/firebase-config', {
+      method: 'PUT',
+      body: await file.arrayBuffer(),
+      headers: { 'content-type': 'application/json' }
+    });
+    toast(t('Firebase configuration uploaded.'));
+  } finally {
+    state.androidAppBuildAction = '';
+    refreshAndroidBuildPanel();
+  }
+}
+
+async function buildAndroidApk() {
+  state.androidAppBuildAction = 'starting';
+  refreshAndroidBuildPanel();
+  try {
+    state.androidAppBuild = await api('/api/admin/android/app-build', { method: 'POST' });
+    toast(t('Android APK build started.'));
+    startAndroidBuildAutoRefresh();
+  } finally {
+    state.androidAppBuildAction = '';
+    refreshAndroidBuildPanel();
+  }
+}
+
+async function downloadAndroidApk() {
+  if (window.GHotspotAndroid && typeof window.GHotspotAndroid.downloadAndroidApk === 'function') {
+    window.GHotspotAndroid.downloadAndroidApk();
+    return;
+  }
+  state.androidAppBuildAction = 'downloading';
+  refreshAndroidBuildPanel();
+  try {
+    const response = await fetch('/api/admin/android/app-build/apk', { credentials: 'same-origin' });
+    if (response.status === 401) {
+      showLogin();
+      throw new Error(t('Your administrator session has expired.'));
+    }
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(t(payload.message || `HTTP ${response.status}`));
+    }
+    const blob = await response.blob();
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'g-hotspot.apk';
+    document.body.append(link);
+    link.click();
+    URL.revokeObjectURL(link.href);
+    link.remove();
+  } finally {
+    state.androidAppBuildAction = '';
+    refreshAndroidBuildPanel();
+  }
+}
+
+function bindAndroidBuildPanel() {
+  $('#androidGoogleServicesFile')?.addEventListener('change', event => {
+    const file = event.target.files?.[0];
+    uploadAndroidFirebaseConfig(file).catch(error => {
+      state.androidAppBuildAction = '';
+      refreshAndroidBuildPanel();
+      toast(error.message, 'error');
+    });
+  });
+  $('#androidBuildApkButton')?.addEventListener('click', () =>
+    buildAndroidApk().catch(error => {
+      state.androidAppBuildAction = '';
+      refreshAndroidBuildPanel();
+      toast(error.message, 'error');
+    })
+  );
+  $('#androidDownloadApkButton')?.addEventListener('click', () =>
+    downloadAndroidApk().catch(error => {
+      state.androidAppBuildAction = '';
+      refreshAndroidBuildPanel();
+      toast(error.message, 'error');
+    })
+  );
+}
+
+function refreshAndroidPairingPanel() {
+  const codeBox = $('#androidPairingCodeBox');
+  const list = $('#androidDeviceList');
+  if (codeBox) codeBox.innerHTML = androidPairingCodeHtml();
+  if (list) list.innerHTML = androidDeviceRowsHtml();
+}
+
+function clearAndroidPairingCode() {
+  state.androidPairing = null;
+  refreshAndroidPairingPanel();
+}
+
+async function loadAndroidDevices() {
+  if (state.androidPairing && Number(state.androidPairing.expiresAt || 0) <= Date.now()) {
+    state.androidPairing = null;
+  }
+  state.androidDevices = await api('/api/admin/android/devices?limit=100');
+  refreshAndroidPairingPanel();
+}
+
+function stopAndroidDevicesAutoRefresh() {
+  if (androidDevicesRefreshTimer) clearInterval(androidDevicesRefreshTimer);
+  androidDevicesRefreshTimer = null;
+}
+
+function startAndroidDevicesAutoRefresh() {
+  stopAndroidDevicesAutoRefresh();
+  androidDevicesRefreshTimer = setInterval(() => {
+    if (state.currentView !== 'settings' || state.settingsGroup !== 'android-notifications') {
+      stopAndroidDevicesAutoRefresh();
+      return;
+    }
+    loadAndroidDevices().catch(() => {});
+  }, 3000);
+}
+
+async function createAndroidPairingCode() {
+  const button = $('#androidPairingCodeButton');
+  setButtonBusy(button, true, 'Creating…');
+  try {
+    const result = await api('/api/admin/android/pairing-codes', { method: 'POST' });
+    state.androidPairing = result.pairing || null;
+    refreshAndroidPairingPanel();
+    startAndroidDevicesAutoRefresh();
+    await loadAndroidDevices();
+    toast(t('Android pairing code created.'));
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+async function approveAndroidDevice(deviceId) {
+  await api(`/api/admin/android/devices/${encodeURIComponent(deviceId)}/approve`, { method: 'POST' });
+  clearAndroidPairingCode();
+  toast(t('Android device approved.'));
+  await loadAndroidDevices();
+}
+
+async function rejectAndroidDevice(deviceId) {
+  const deviceName = androidDeviceDisplayName(deviceId);
+  const confirmed = await openActionConfirmModal({
+    eyebrow: 'ANDROID DEVICE',
+    title: 'Reject Android device',
+    message: 'Reject {name}?',
+    messageVariables: { name: deviceName },
+    confirmLabel: 'Reject',
+    danger: true
+  });
+  if (!confirmed) return;
+  await api(`/api/admin/android/devices/${encodeURIComponent(deviceId)}/reject`, { method: 'POST' });
+  clearAndroidPairingCode();
+  toast(t('Android device rejected.'));
+  await loadAndroidDevices();
+}
+
+async function removeAndroidDevice(deviceId) {
+  const deviceName = androidDeviceDisplayName(deviceId);
+  const confirmed = await openActionConfirmModal({
+    eyebrow: 'ANDROID DEVICE',
+    title: 'Remove Android device',
+    message: 'Remove {name}?',
+    messageVariables: { name: deviceName },
+    confirmLabel: 'Remove',
+    danger: true
+  });
+  if (!confirmed) return;
+  await api(`/api/admin/android/devices/${encodeURIComponent(deviceId)}`, { method: 'DELETE' });
+  clearAndroidPairingCode();
+  toast(t('Android device removed.'));
+  await loadAndroidDevices();
+}
+
 function settingDurationInput(valueField, unitField, value, unitValue) {
   const valueId = `setting_${valueField.key}`;
   const unitId = `setting_${unitField.key}`;
@@ -2738,7 +3542,7 @@ function renderSettingFields(group) {
       ? group.fields.find(item => item.durationPair === field.durationPair && item.durationRole === 'unit')
       : null;
     const sectionVisibility = alertTypeGroup
-      ? ' data-visible-when-any="NOTIFICATION_EMAIL_ENABLED,NOTIFICATION_SMS_ENABLED,NOTIFICATION_TELEGRAM_ENABLED"'
+      ? ' data-visible-when-any="NOTIFICATION_EMAIL_ENABLED,NOTIFICATION_SMS_ENABLED,NOTIFICATION_TELEGRAM_ENABLED,NOTIFICATION_ANDROID_ENABLED"'
       : settingVisibilityAttributes(field);
     const section = field.section
       ? `<div class="settings-section"${sectionVisibility}><h3>${escapeHtml(t(field.section))}</h3></div>`
@@ -2821,7 +3625,8 @@ function settingCurrentValue(key) {
 function settingValueMatches(spec) {
   const [key, ...expectedParts] = String(spec || '').split('=');
   if (!key || !expectedParts.length) return true;
-  return settingCurrentValue(key) === expectedParts.join('=');
+  const expected = expectedParts.join('=').split('|').map(item => item.trim()).filter(Boolean);
+  return expected.includes(settingCurrentValue(key));
 }
 
 function updateConditionalSettings() {
@@ -2842,6 +3647,26 @@ function updateConditionalSettings() {
       visible = visible && keys.some(key => settingToggleValue(key));
     }
     element.classList.toggle('hidden', !visible);
+  });
+  updateDynamicSettingText();
+}
+
+function updateDynamicSettingText() {
+  $$('[data-setting-label-for]').forEach(element => {
+    const field = settingFieldByKey(element.dataset.settingLabelFor);
+    if (field) {
+      const source = settingLabelText(field);
+      element.dataset.i18nSource = source;
+      element.textContent = t(source);
+    }
+  });
+  $$('[data-setting-help-for]').forEach(element => {
+    const field = settingFieldByKey(element.dataset.settingHelpFor);
+    if (field) {
+      const source = settingWarningText(field);
+      element.dataset.i18nSource = source;
+      element.textContent = t(source);
+    }
   });
 }
 
@@ -2944,6 +3769,7 @@ function renderPortalPreview() {
     <div class="settings-section"><h3>${escapeHtml(t('Verification screen preview'))}</h3></div>
     <div id="portalPreviewStage" class="portal-preview-stage">
       <div id="portalPreviewCard" class="portal-preview-card">
+        <span class="portal-preview-accent" aria-hidden="true"></span>
         <div class="portal-preview-brand-row">
           <div class="portal-preview-brand">
             <div class="portal-preview-brand-mark">
@@ -2964,6 +3790,7 @@ function renderPortalPreview() {
           <button class="active" type="button">${escapeHtml(t('Voucher'))}</button>
           <button type="button">${escapeHtml(t('Admin approval'))}</button>
           <button type="button">${escapeHtml(t('Email'))}</button>
+          <button type="button">${escapeHtml(t('T.C. Identity'))}</button>
           <button type="button">WhatsApp</button>
           <button type="button">Telegram</button>
           <button type="button">SMS</button>
@@ -3050,12 +3877,16 @@ function renderSyslogStatus(data) {
     [t('Last syslog sample'), syslog.lastMessage || '—'],
     [t('Automatic export'), autoExport.enabled
       ? (autoExport.waitingForGateway
-        ? t('Waiting for OPNsense communication')
+        ? t('Waiting for gateway communication')
         : settingOptionLabel(autoExport.schedule || data.autoExportInterval || 'daily'))
       : t('Disabled')],
     [t('Next automatic export'), autoExport.nextRunAt ? formatDate(autoExport.nextRunAt) : '—'],
     [t('Automatic export error'), autoExport.lastError || '—'],
     [t('Export directory'), data.exportDirectory || '—'],
+    [t('ZIP archive'), data.exportZipEnabled ? t('Enabled') : t('Disabled')],
+    [t('Delete ZIP source files'), data.exportZipEnabled
+      ? (data.exportDeleteSourceAfterZip ? t('Enabled') : t('Disabled'))
+      : '—'],
     [t('Last export'), lastExport ? `${formatDate(lastExport.createdAt)} · ${shortHash(lastExport.exportHash)}` : '—'],
     [t('Last export window'), lastExport?.periodStartAt && lastExport?.periodEndAt
       ? `${lastExport.exportReason || 'manual'} · ${formatDateRange(lastExport.periodStartAt, lastExport.periodEndAt)}`
@@ -3097,13 +3928,17 @@ function renderGatewayNetworkChoices(payload = {}) {
   const targets = $$('[data-opnsense-network-choices]');
   if (!targets.length) return;
   const choices = payload.choices || [];
+  const provider = payload.providerName || gatewayProviderLabel(payload.gatewayMode || state.gatewayMode);
+  const errorText = payload.errorKey
+    ? t(payload.errorKey, { provider, ...(payload.errorVariables || {}) })
+    : (payload.error ? t(payload.error) : '');
   for (const target of targets) {
     const key = target.dataset.opnsenseNetworkChoices;
     if (!choices.length) {
-      target.innerHTML = `<span>${escapeHtml(payload.error ? t(payload.error) : t('No OPNsense networks discovered.'))}</span>`;
+      target.innerHTML = `<span>${escapeHtml(errorText || t('No {provider} networks discovered.', { provider }))}</span>`;
       continue;
     }
-    target.innerHTML = `<span>${escapeHtml(t('OPNsense networks'))}</span>${choices.map(choice =>
+    target.innerHTML = `<span>${escapeHtml(t('{provider} networks', { provider }))}</span>${choices.map(choice =>
       `<button class="syslog-network-choice" type="button" data-setting-network="${escapeHtml(key)}" data-network="${escapeHtml(choice.network)}" title="${escapeHtml(choice.label)}">${escapeHtml(choice.network)}</button>`
     ).join('')}`;
   }
@@ -3117,7 +3952,8 @@ async function loadGatewayNetworks() {
   }
   renderGatewayNetworkChoices({
     choices: [],
-    error: 'Loading OPNsense networks…'
+    error: t('Loading {provider} networks...', { provider: gatewayProviderLabel() }),
+    providerName: gatewayProviderLabel()
   });
   state.gatewayNetworks = await api('/api/admin/gateway/networks');
   renderGatewayNetworkChoices(state.gatewayNetworks);
@@ -3338,30 +4174,35 @@ function bindDerivedSettings() {
 }
 
 function renderGatewayInterfaceChoices(payload = {}) {
-  const datalist = $('#opnsenseInterfaceChoices');
-  const status = $('#opnsenseInterfaceStatus');
+  const datalist = $('#gatewayInterfaceChoices');
+  const status = $('#gatewayInterfaceStatus');
   if (!datalist || !status) return;
   const interfaces = payload.interfaces || [];
+  const provider = payload.providerName || gatewayProviderLabel(payload.gatewayMode || state.gatewayMode);
+  const errorText = payload.errorKey
+    ? t(payload.errorKey, { provider, ...(payload.errorVariables || {}) })
+    : (payload.error ? t(payload.error) : '');
   datalist.innerHTML = interfaces.map(item => {
     const label = item.label && item.label !== item.name ? `${item.label} (${item.name})` : item.name;
     return `<option value="${escapeHtml(item.name)}" label="${escapeHtml(label)}"></option>`;
   }).join('');
-  status.textContent = payload.error
-    ? t(payload.error)
+  status.textContent = errorText
+    ? errorText
     : (interfaces.length
-        ? t('{count} OPNsense interfaces discovered.', { count: interfaces.length })
-        : t('No OPNsense interfaces discovered; manual entry is still available.'));
+        ? t('{count} {provider} interfaces discovered.', { count: interfaces.length, provider })
+        : t('No {provider} interfaces discovered; manual entry is still available.', { provider }));
 }
 
 async function loadGatewayInterfaces() {
-  if (!$('#opnsenseInterfaceChoices')) return;
+  if (!$('#gatewayInterfaceChoices')) return;
   if (state.gatewayInterfaces) {
     renderGatewayInterfaceChoices(state.gatewayInterfaces);
     return;
   }
   renderGatewayInterfaceChoices({
     interfaces: [],
-    error: 'Loading OPNsense interfaces…'
+    error: t('Loading {provider} interfaces...', { provider: gatewayProviderLabel() }),
+    providerName: gatewayProviderLabel()
   });
   state.gatewayInterfaces = await api('/api/admin/gateway/interfaces');
   renderGatewayInterfaceChoices(state.gatewayInterfaces);
@@ -3377,7 +4218,8 @@ function storedOpnsenseTemplateValues() {
 }
 
 function saveOpnsenseTemplateValues(values) {
-  const { targetUrl, ...storedValues } = values;
+  const { targetUrl, gatewayMode, ...storedValues } = values;
+  void gatewayMode;
   try {
     localStorage.setItem(OPNSENSE_TEMPLATE_STORAGE_KEY, JSON.stringify(storedValues));
   } catch {}
@@ -3398,6 +4240,7 @@ function opnsenseTemplateFields() {
 function opnsenseTemplateValuesFromForm() {
   const fields = opnsenseTemplateFields();
   return {
+    gatewayMode: state.opnsenseTemplateDefaults?.gatewayMode || state.gatewayMode || 'opnsense-api',
     lang: fields.lang?.value || '',
     title: fields.title?.value || '',
     targetUrl: fields.targetUrl?.value || '',
@@ -3460,6 +4303,10 @@ function safeOpnsenseTemplatePreviewUrl(value) {
 function updateOpnsenseTemplatePreview() {
   const values = opnsenseTemplateValuesFromForm();
   saveOpnsenseTemplateValues(values);
+  setTranslatedText('#opnsenseTemplateHeading', 'OPNsense captive portal template');
+  setPlainText('#opnsenseTemplateEntryName', 'index.html');
+  setTranslatedText('#opnsenseTemplatePreviewHeading', 'index.html preview');
+  setPlainText('#opnsenseTemplateArchiveName', 'opnsense-captiveportal-template.zip');
   setPlainText('#opnsenseTemplatePreviewTitle', values.title || 'Redirecting');
   setPlainText('#opnsenseTemplatePreviewText', values.redirectText || '');
   const link = $('#opnsenseTemplatePreviewLink');
@@ -3473,10 +4320,10 @@ function updateOpnsenseTemplatePreview() {
 async function loadOpnsenseTemplateBuilder() {
   const form = $('#opnsenseTemplateForm');
   if (!form) return;
-  if (!state.opnsenseTemplateDefaults) {
-    const data = await api('/api/admin/opnsense-template');
-    state.opnsenseTemplateDefaults = data.defaults || {};
-  }
+  const data = await api('/api/admin/opnsense-template');
+  const previousMode = state.opnsenseTemplateDefaults?.gatewayMode || '';
+  state.opnsenseTemplateDefaults = data.defaults || {};
+  if (previousMode && previousMode !== state.opnsenseTemplateDefaults.gatewayMode) form.dataset.loaded = 'false';
   if (form.dataset.loaded !== 'true') {
     const storedValues = storedOpnsenseTemplateValues();
     setOpnsenseTemplateValues({
@@ -3537,7 +4384,7 @@ async function downloadOpnsenseTemplateZip(event) {
     link.click();
     URL.revokeObjectURL(link.href);
     link.remove();
-    toast(t('OPNsense template ZIP created.'));
+    toast(t('{provider} template ZIP created.', { provider: gatewayProviderLabel(opnsenseTemplateValuesFromForm().gatewayMode) }));
   } catch (error) {
     toast(error.message, 'error');
   } finally {
@@ -3548,6 +4395,10 @@ async function downloadOpnsenseTemplateZip(event) {
 function renderSettingsGroup() {
   const group = state.settings.schema.find(item => item.id === state.settingsGroup) || state.settings.schema[0];
   state.settingsGroup = group.id;
+  if (group.id !== 'android-notifications') {
+    stopAndroidDevicesAutoRefresh();
+    stopAndroidBuildAutoRefresh();
+  }
   syncViewLocation('settings', true);
   $$('.settings-tab').forEach(button => button.classList.toggle('active', button.dataset.settingsGroup === group.id));
   $$('.settings-tab').forEach(button => {
@@ -3558,11 +4409,12 @@ function renderSettingsGroup() {
   const isAppearance = group.id === 'appearance';
   const isVoucher = group.id === 'voucher';
   const isAdminApproval = group.id === 'admin-approval';
+  const isAndroidNotifications = group.id === 'android-notifications';
   $('#settingsHeader').innerHTML = `<h2>${escapeHtml(t(group.label))}</h2><p>${escapeHtml(t(group.description))}</p>`;
   $('#settingsFields').classList.toggle('settings-fields--with-preview', isAppearance);
   $('#settingsFields').innerHTML = isAppearance
     ? `<div class="settings-fields-main">${renderSettingFields(group)}${renderAppearanceAssets()}</div>${renderPortalPreview()}`
-    : renderSettingFields(group);
+    : `${renderSettingFields(group)}${isAndroidNotifications ? `${renderAndroidBuildPanel()}${renderAndroidPairingPanel()}` : ''}`;
   $('#emailTestPanel').classList.toggle('hidden', group.id !== 'email');
   $('#syslogPanel').classList.toggle('hidden', group.id !== 'syslog');
   $('#syslogVacuumButton').classList.toggle('hidden', group.id !== 'syslog');
@@ -3647,6 +4499,31 @@ function renderSettingsGroup() {
   }
   if (group.id === 'syslog') {
     loadSyslogStatus().catch(error => toast(error.message, 'error'));
+  }
+  if (isAndroidNotifications) {
+    bindAndroidBuildPanel();
+    loadAndroidBuildStatus().catch(error => toast(error.message, 'error'));
+    loadAndroidDevices().catch(error => toast(error.message, 'error'));
+    startAndroidDevicesAutoRefresh();
+    $('#androidPairingCodeButton')?.addEventListener('click', () =>
+      createAndroidPairingCode().catch(error => toast(error.message, 'error'))
+    );
+    $('#androidDeviceList')?.addEventListener('click', event => {
+      const approveButton = event.target.closest('[data-android-device-approve]');
+      if (approveButton) {
+        approveAndroidDevice(approveButton.dataset.androidDeviceApprove).catch(error => toast(error.message, 'error'));
+        return;
+      }
+      const rejectButton = event.target.closest('[data-android-device-reject]');
+      if (rejectButton) {
+        rejectAndroidDevice(rejectButton.dataset.androidDeviceReject).catch(error => toast(error.message, 'error'));
+        return;
+      }
+      const removeButton = event.target.closest('[data-android-device-remove]');
+      if (removeButton) {
+        removeAndroidDevice(removeButton.dataset.androidDeviceRemove).catch(error => toast(error.message, 'error'));
+      }
+    });
   }
   if (group.id === 'quotas') {
     loadGatewayInterfaces().catch(error => {
@@ -3750,10 +4627,41 @@ async function vacuumSyslogDatabase() {
   }
 }
 
+async function vacuumTrafficLogDatabase() {
+  const confirmed = await openActionConfirmModal({
+    eyebrow: 'DATABASE MAINTENANCE',
+    title: 'Compact traffic log database',
+    message: 'This will compact the hotspot database with SQLite VACUUM. It does not delete records, but it can take time on large traffic databases. The system creates a database backup first; run it during a quiet maintenance window.',
+    confirmLabel: 'Run VACUUM',
+    danger: true
+  });
+  if (!confirmed) return;
+  const button = $('#trafficLogVacuumButton');
+  setButtonBusy(button, true, 'Compacting…');
+  try {
+    const result = await api('/api/admin/traffic-logs/vacuum', { method: 'POST', body: '{}' });
+    toast(t('Database compacted. Reclaimed {reclaimed} in {seconds}s.', {
+      reclaimed: formatBytes(result.reclaimedBytes || 0),
+      seconds: Math.max(0.1, Number(result.durationMs || 0) / 1000).toFixed(1)
+    }));
+    if (result.backupPath) {
+      toast(t('Database backup saved: {file}', {
+        file: String(result.backupPath).split(/[\\/]/u).pop()
+      }));
+    }
+    await loadTrafficLogs();
+  } catch (error) {
+    toast(t('Database compaction failed: {error}', { error: error.message }), 'error');
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
 async function loadSettings() {
   state.gatewayInterfaces = null;
   state.gatewayNetworks = null;
   state.settings = await api('/api/admin/settings');
+  state.gatewayMode = state.settings.values?.GATEWAY_MODE || state.gatewayMode;
   const locationGroup = settingsGroupFromLocation();
   if (locationGroup && state.settings.schema.some(group => group.id === locationGroup)) {
     state.settingsGroup = locationGroup;
@@ -3965,6 +4873,7 @@ function openActionConfirmModal({
   alternateValue = false,
   cancelLabel = 'Cancel',
   cancelValue = false,
+  messageVariables = null,
   danger = false
 } = {}) {
   const modal = $('#actionConfirmModal');
@@ -3976,7 +4885,7 @@ function openActionConfirmModal({
   actionConfirmAlternateValue = alternateValue;
   setPlainText('#actionConfirmEyebrow', t(eyebrow));
   setPlainText('#actionConfirmTitle', t(title));
-  setPlainText('#actionConfirmMessage', t(message));
+  setPlainText('#actionConfirmMessage', t(message, messageVariables));
   setPlainText('#actionConfirmSubmit', t(confirmLabel));
   setPlainText('#actionConfirmCancel', t(cancelLabel));
   if (alternate) {
@@ -4088,11 +4997,13 @@ async function login(event) {
   notice.classList.add('hidden');
   setButtonBusy(button, true, 'Signing in…');
   try {
+    const username = $('#loginUsername').value;
+    rememberLoginUsername(username);
     const notificationPublicIp = await lookupAdminPublicIp();
     const session = await api('/api/admin/login', {
       method: 'POST',
       body: JSON.stringify({
-        username: $('#loginUsername').value,
+        username,
         password: $('#loginPassword').value,
         notificationPublicIp
       })
@@ -4124,6 +5035,7 @@ $('#syslogExportButton').addEventListener('click', exportSyslog);
 $('#syslogVacuumButton').addEventListener('click', vacuumSyslogDatabase);
 $('#trafficLogSettingsButton').addEventListener('click', openTrafficLogSettingsModal);
 $('#trafficLogStreamToggleButton').addEventListener('click', toggleTrafficLogLiveStream);
+$('#trafficLogVacuumButton').addEventListener('click', vacuumTrafficLogDatabase);
 $('#trafficLogSettingsForm').addEventListener('submit', saveTrafficLogSettings);
 function setAdminLanguage(language) {
   i18n.setLanguage(language, 'gh_admin_language');
@@ -4190,33 +5102,57 @@ $('#trafficPeriod').addEventListener('change', () => {
   loadDashboard().catch(error => toast(error.message, 'error'));
 });
 $('#topSitesRange')?.addEventListener('change', () => {
-  state.topSitesHours = Number($('#topSitesRange').value || 6);
+  state.topSitesMinutes = Number($('#topSitesRange').value || 60);
   saveDashboardFilters();
   loadDashboard().catch(error => toast(error.message, 'error'));
 });
 $('#topBandwidthRange')?.addEventListener('change', () => {
-  state.topBandwidthHours = Number($('#topBandwidthRange').value || 6);
+  state.topBandwidthMinutes = Number($('#topBandwidthRange').value || 60);
   saveDashboardFilters();
   loadDashboard().catch(error => toast(error.message, 'error'));
 });
 
+document.addEventListener('pointerdown', event => {
+  const target = dashboardTooltipTarget(event);
+  if (isTouchDashboardTooltipEvent(event)) {
+    if (target) {
+      showDashboardTooltip(target, event);
+    } else {
+      hideDashboardTooltip();
+    }
+    return;
+  }
+  if (!target) hideDashboardTooltip();
+});
+
 document.addEventListener('pointerover', event => {
-  const target = event.target.closest?.('[data-dashboard-tooltip]');
+  if (isTouchDashboardTooltipEvent(event)) return;
+  const target = dashboardTooltipTarget(event);
   if (!target) return;
   showDashboardTooltip(target, event);
 });
 
 document.addEventListener('pointermove', event => {
-  if (!event.target.closest?.('[data-dashboard-tooltip]')) return;
+  if (isTouchDashboardTooltipEvent(event)) return;
+  if (!dashboardTooltipTarget(event)) return;
   positionDashboardTooltip(event);
 });
 
 document.addEventListener('pointerout', event => {
-  const target = event.target.closest?.('[data-dashboard-tooltip]');
+  if (isTouchDashboardTooltipEvent(event)) return;
+  const target = dashboardTooltipTarget(event);
   if (!target) return;
   const nextTarget = event.relatedTarget?.closest?.('[data-dashboard-tooltip]');
   if (nextTarget === target) return;
   hideDashboardTooltip();
+});
+
+document.addEventListener('pointercancel', event => {
+  if (isTouchDashboardTooltipEvent(event)) hideDashboardTooltip();
+});
+
+document.addEventListener('contextmenu', event => {
+  if (dashboardTooltipTarget(event)) event.preventDefault();
 });
 
 window.addEventListener('resize', hideDashboardTooltip);
@@ -4457,15 +5393,37 @@ setInterval(() => {
 
 setTheme(storedTheme());
 
+async function preloadAdminFonts() {
+  if (!document.fonts?.load) return;
+  const families = [
+    'Manrope',
+    'Roboto',
+    'Roboto Condensed',
+    'Satisfy',
+    'Inter',
+    'Work Sans',
+    'DM Sans',
+    'Plus Jakarta Sans',
+    'Outfit'
+  ];
+  const sample = 'G-Hotspot ABCÇĞİÖŞÜ abcçğıöşü 0123456789';
+  await Promise.allSettled(families.map(family => document.fonts.load(`400 1em "${family}"`, sample)));
+}
+
 (async function init() {
   try {
     await i18n.ready;
+    await preloadAdminFonts();
     setTheme(document.documentElement.dataset.theme);
     await loadProjectAttribution();
     const session = await api('/api/admin/session');
     await i18n.setAutomaticLanguage(session.defaultLanguage || 'en', 'gh_admin_language');
     $('#adminLanguage').value = i18n.language;
     if (session.authenticated) showApp(session);
+    else if (requestAndroidAdminSessionRefresh()) {
+      i18n.reveal();
+      return;
+    }
     else {
       showLogin();
       if (!session.enabled) {
@@ -4475,6 +5433,10 @@ setTheme(storedTheme());
     }
     i18n.reveal();
   } catch (error) {
+    if (requestAndroidAdminSessionRefresh()) {
+      i18n.reveal();
+      return;
+    }
     showLogin();
     $('#loginNotice').textContent = t('The administration service is unavailable: {error}', { error: error.message });
     $('#loginNotice').classList.remove('hidden');

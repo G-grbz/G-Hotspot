@@ -22,11 +22,11 @@ test('admin notification public IP helper ignores private addresses', () => {
 });
 
 test('admin update helper reads release versions from GitHub titles', () => {
-  assert.equal(releaseVersion('G-Hotspot v1.0.0'), '1.0.0');
+  assert.equal(releaseVersion('G-Hotspot v1.1.0'), '1.1.0');
   assert.equal(releaseVersion('release/2.4.1 notes'), '2.4.1');
-  assert.equal(compareReleaseVersions('1.0.0', '0.5.3'), 1);
-  assert.equal(compareReleaseVersions('1.0.0-beta.1', '1.0.0'), -1);
-  assert.equal(compareReleaseVersions('1.0.0', '1.0.0'), 0);
+  assert.equal(compareReleaseVersions('1.1.0', '0.5.3'), 1);
+  assert.equal(compareReleaseVersions('1.1.0-beta.1', '1.1.0'), -1);
+  assert.equal(compareReleaseVersions('1.1.0', '1.1.0'), 0);
 });
 
 test('admin allows disabling syslog timestamping after evidence logging starts', () => {
@@ -464,6 +464,96 @@ test('admin sync disconnects a session when DHCP leases show another MAC on the 
     assert.deepEqual(Object.fromEntries(new URLSearchParams(disconnect.body)), {
       sessionId: 'old-session'
     });
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('admin sync stores DHCP lease hostname for device OS dashboard', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-'));
+  const db = new HotspotDatabase(path.join(directory, 'test.db'));
+  const server = http.createServer(async (request, response) => {
+    if (request.url === '/api/captiveportal/session/list/0') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ rows: [] }));
+      return;
+    }
+    if (request.url === '/api/captiveportal/session/list/1') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        rows: [{
+          sessionId: 'active-session',
+          userName: 'email:guest@example.com',
+          ipAddress: '172.16.2.100',
+          macAddress: ''
+        }]
+      }));
+      return;
+    }
+    if (request.url === '/api/diagnostics/interface/get_arp') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ rows: [] }));
+      return;
+    }
+    if (request.url === '/api/kea/leases4/search') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        rows: [{
+          address: '172.16.2.100',
+          mac: '6e:8c:cf:bb:84:9b',
+          hostname: 'xiaomi-13t-pro',
+          state: 'assigned'
+        }]
+      }));
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    const authorization = db.saveAuthorization({
+      method: 'email',
+      identity: 'guest@example.com',
+      clientIp: '172.16.2.100',
+      clientMac: '',
+      gatewayMode: 'opnsense-api',
+      gatewaySessionId: '1:active-session',
+      status: 'active',
+      expiresAt: Date.now() + 3600000,
+      redirectUrl: '',
+      gatewayResponse: {},
+      error: ''
+    });
+    const admin = createAdminController({
+      db,
+      config: {
+        appSecret: 'secret',
+        gateway: {
+          mode: 'opnsense-api',
+          baseUrl: `http://127.0.0.1:${port}`,
+          zoneId: 0,
+          zoneMap: [{ network: '172.16.2.0/24', zoneId: 1 }],
+          apiKey: 'key',
+          apiSecret: 'secret',
+          tlsRejectUnauthorized: true
+        },
+        syslog: { enabled: false, networks: 'any', retentionDays: 730 }
+      }
+    });
+
+    await admin.syncUsage();
+    const updated = db.getAuthorization(authorization.id);
+    const deviceOs = db.dashboard().deviceOs;
+
+    assert.equal(updated.device_name, 'xiaomi-13t-pro');
+    assert.equal(updated.client_mac, '6E:8C:CF:BB:84:9B');
+    assert.equal(deviceOs.total, 1);
+    assert.deepEqual(deviceOs.rows.map(row => [row.os, row.count]), [['android', 1]]);
   } finally {
     await new Promise(resolve => server.close(resolve));
     db.close();

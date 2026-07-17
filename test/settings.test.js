@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { config, reloadConfig } from '../src/config.js';
-import { getSettings, saveSettings } from '../src/settings.js';
+import { getSettings, installOpnsenseGateway, saveSettings } from '../src/settings.js';
 import { quotaProfileForMethod } from '../src/services/quotas.js';
 
 test('settings surface automatic server address instead of bundled env defaults', () => {
@@ -25,6 +25,13 @@ test('settings surface automatic server address instead of bundled env defaults'
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('installer rejects the disabled pfSense gateway mode', () => {
+  assert.throws(
+    () => installOpnsenseGateway({ GATEWAY_MODE: 'pfsense-api' }),
+    /GATEWAY_MODE must be mock or opnsense-api/u
+  );
 });
 
 test('settings mask secrets and persist runtime-safe changes', () => {
@@ -102,6 +109,8 @@ test('settings mask secrets and persist runtime-safe changes', () => {
     assert.equal(before.values.SYSLOG_TIMESTAMP_API_KEY_HEADER, 'Authorization');
     assert.equal(before.values.SYSLOG_TIMESTAMP_API_KEY_PREFIX, 'Bearer');
     assert.equal(before.values.SYSLOG_TIMESTAMP_API_TIMEOUT_SECONDS, '60');
+    assert.equal(before.values.SYSLOG_EXPORT_ZIP_ENABLED, 'false');
+    assert.equal(before.values.SYSLOG_EXPORT_DELETE_SOURCE_AFTER_ZIP, 'false');
     assert.equal(Object.hasOwn(before.values, 'SYSLOG_KAMUSM_TIMESTAMP_ENABLED'), false);
     assert.equal(Object.hasOwn(before.values, 'SYSLOG_SIGNATURE_TIMEOUT_SECONDS'), false);
     assert.equal(Object.hasOwn(before.values, 'SYSLOG_BACKUP_READONLY'), false);
@@ -158,14 +167,18 @@ test('settings mask secrets and persist runtime-safe changes', () => {
     const generalGroup = before.schema.find(group => group.id === 'general');
     const syslogGroup = before.schema.find(group => group.id === 'syslog');
     const opnsenseGroup = before.schema.find(group => group.id === 'opnsense');
+    const gatewayModeField = opnsenseGroup.fields.find(field => field.key === 'GATEWAY_MODE');
     const quotasGroup = before.schema.find(group => group.id === 'quotas');
     const notificationGroup = before.schema.find(group => group.id === 'notifications');
+    const androidNotificationGroup = before.schema.find(group => group.id === 'android-notifications');
     const adminApprovalGroup = before.schema.find(group => group.id === 'admin-approval');
     const nviGroup = before.schema.find(group => group.id === 'nvi');
     assert.equal(Boolean(quotasGroup), true);
     assert.equal(Boolean(notificationGroup), true);
+    assert.equal(Boolean(androidNotificationGroup), true);
     assert.equal(Boolean(adminApprovalGroup), true);
     assert.equal(Boolean(nviGroup), true);
+    assert.deepEqual(gatewayModeField.options, ['mock', 'opnsense-api']);
     assert.equal(generalGroup.fields.some(field => field.key === 'ALLOWED_COUNTRY_CODES'), true);
     assert.equal(opnsenseGroup.fields.some(field => field.key === 'OPNSENSE_COOKIE_IP_MOVE_ENABLED'), true);
     assert.equal(opnsenseGroup.fields.some(field => field.key === 'OPNSENSE_SESSION_COOKIE_REQUIRED'), true);
@@ -176,6 +189,8 @@ test('settings mask secrets and persist runtime-safe changes', () => {
     assert.equal(quotasGroup.fields.some(field => field.key === 'SMS_DOWNLOAD_QUOTA_GB'), true);
     assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_STORAGE_ALERT_PERCENT'), true);
     assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_STORAGE_BLOCK_PERCENT'), true);
+    assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_EXPORT_ZIP_ENABLED'), true);
+    assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_EXPORT_DELETE_SOURCE_AFTER_ZIP'), true);
     assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_TIMESTAMP_MODE'), true);
     assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_TIMESTAMP_API_KEY'), true);
     assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_KAMUSM_TIMESTAMP_ENABLED'), false);
@@ -184,8 +199,14 @@ test('settings mask secrets and persist runtime-safe changes', () => {
     assert.equal(notificationGroup.fields.some(field => field.key === 'NOTIFICATION_SMS_ADMIN_APPROVAL_ENABLED'), false);
     assert.equal(notificationGroup.fields.some(field => field.key === 'NOTIFICATION_TELEGRAM_ENABLED'), true);
     assert.equal(notificationGroup.fields.some(field => field.key === 'NOTIFICATION_TELEGRAM_SYSLOG_STORAGE_ENABLED'), true);
+    assert.equal(notificationGroup.fields.some(field => field.key === 'NOTIFICATION_ANDROID_ENABLED'), false);
+    assert.equal(notificationGroup.fields.some(field => field.key === 'NOTIFICATION_ANDROID_ADMIN_APPROVAL_ENABLED'), false);
+    assert.equal(androidNotificationGroup.fields.some(field => field.key === 'NOTIFICATION_ANDROID_ENABLED'), true);
+    assert.equal(androidNotificationGroup.fields.some(field => field.key === 'ANDROID_FCM_SERVICE_ACCOUNT_FILE'), true);
+    assert.equal(androidNotificationGroup.fields.some(field => field.key === 'NOTIFICATION_ANDROID_ADMIN_APPROVAL_ENABLED'), true);
     assert.equal(adminApprovalGroup.fields.some(field => field.key === 'NOTIFICATION_EMAIL_ADMIN_APPROVAL_ENABLED'), true);
     assert.equal(adminApprovalGroup.fields.some(field => field.key === 'NOTIFICATION_SMS_ADMIN_APPROVAL_ENABLED'), true);
+    assert.equal(adminApprovalGroup.fields.some(field => field.key === 'NOTIFICATION_ANDROID_ADMIN_APPROVAL_ENABLED'), false);
     assert.equal(nviGroup.fields.some(field => field.key === 'NVI_SEND_SMS_CODE'), true);
     assert.equal(nviGroup.fields.some(field => field.key === 'NVI_IP_RETRY_INTERVAL_VALUE'), true);
     assert.equal(nviGroup.fields.some(field => field.key === 'NVI_REVERIFY_DURATION_VALUE'), true);

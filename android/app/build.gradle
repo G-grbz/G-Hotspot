@@ -1,0 +1,59 @@
+plugins {
+    id "com.android.application"
+}
+
+if (file("google-services.json").exists()) {
+    apply plugin: "com.google.gms.google-services"
+}
+
+android {
+    namespace "com.ghotspot.admin"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.ghotspot.admin"
+        minSdk 26
+        targetSdk 34
+        versionCode 4
+        versionName "1.1.0"
+    }
+
+}
+
+dependencies {
+    implementation "com.google.android.gms:play-services-code-scanner:16.1.0"
+    implementation platform("com.google.firebase:firebase-bom:34.15.0")
+    implementation "com.google.firebase:firebase-messaging"
+}
+
+tasks.register("renameDebugApk") {
+    dependsOn("packageDebug")
+    doLast {
+        def outputDir = layout.buildDirectory.dir("outputs/apk/debug").get().asFile
+        def source = new File(outputDir, "app-debug.apk")
+        def target = new File(outputDir, "g-hotspot.apk")
+        if (!source.exists()) {
+            throw new GradleException("Expected debug APK not found: ${source}")
+        }
+        if (target.exists() && !target.delete()) {
+            throw new GradleException("Could not replace existing APK: ${target}")
+        }
+        if (!source.renameTo(target)) {
+            ant.move(file: source, tofile: target, overwrite: true)
+        }
+        def metadata = new File(outputDir, "output-metadata.json")
+        if (metadata.exists()) {
+            def parsed = new groovy.json.JsonSlurper().parse(metadata)
+            parsed.elements.each { element ->
+                element.outputFile = "g-hotspot.apk"
+            }
+            metadata.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(parsed)) + "\n"
+        }
+    }
+}
+
+afterEvaluate {
+    tasks.named("assembleDebug") {
+        finalizedBy("renameDebugApk")
+    }
+}

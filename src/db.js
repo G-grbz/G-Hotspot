@@ -11,6 +11,19 @@ const LIVE_TRAFFIC_WINDOW_MS = 60 * 1000;
 const TRAFFIC_ROLLUP_BACKFILL_DAYS = 32;
 const TRAFFIC_ROLLUP_BACKFILL_BATCH = 5000;
 const INTERFACE_COUNTER_SOURCE = 'opnsense-interface-counter';
+const TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES = [15, 30, 45, 60];
+const SYSLOG_DATABASE_NAME = 'syslog.db';
+const SYSLOG_TABLES = [
+  'law5651_logs',
+  'law5651_exports',
+  'law5651_events',
+  'law5651_backups',
+  'law5651_state'
+];
+
+function sqlString(value) {
+  return `'${String(value).replace(/'/gu, "''")}'`;
+}
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(item => stableJson(item)).join(',')}]`;
@@ -36,6 +49,14 @@ function integerTimestamp(value, fallback = Date.now()) {
   return Math.trunc(Number(fallback) || Date.now());
 }
 
+function trafficLogRetentionMinutes(value, fallback = 60) {
+  const parsed = Math.trunc(Number(value));
+  const minutes = Number.isFinite(parsed) ? parsed : fallback;
+  if (minutes <= TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES[0]) return TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES[0];
+  return TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES.find(option => minutes <= option) ||
+    TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES.at(-1);
+}
+
 function cleanSiteText(value, limit = 255) {
   return String(value || '').trim().slice(0, limit);
 }
@@ -59,6 +80,79 @@ function safeNetworkList(value) {
   } catch {
     return 'any';
   }
+}
+
+function compactDeviceText(value, limit = 80) {
+  return String(value || '').trim().replace(/\s+/gu, ' ').slice(0, limit);
+}
+
+function isGeneratedLeaseDeviceName(value) {
+  return /^gh-(voucher|email|whatsapp|sms|telegram|admin-approval|nvi)-/u.test(String(value || '').toLowerCase());
+}
+
+function deviceOsFromText(value) {
+  const text = String(value || '').toLowerCase();
+  if (!text) return 'unknown';
+  if (isGeneratedLeaseDeviceName(text)) return 'unknown';
+  if (/(iphone|ipad|ipod|ios)/u.test(text)) return 'ios';
+  if (/(android|pixel|samsung|galaxy|xiaomi|redmi|poco|oppo|vivo|realme|huawei|honor|oneplus)/u.test(text)) return 'android';
+  if (/(macbook|imac|mac-mini|macos|osx|darwin)/u.test(text)) return 'macos';
+  if (/(windows|win10|win11|desktop-|laptop-|surface)/u.test(text)) return 'windows';
+  if (/(linux|ubuntu|debian|fedora|arch|mint|raspberry|raspbian|centos|opensuse)/u.test(text)) return 'linux';
+  return 'unknown';
+}
+
+export function deviceOsFromUserAgent(value) {
+  const text = String(value || '').toLowerCase();
+  if (!text) return '';
+  if (/(iphone|ipad|ipod)/u.test(text)) return 'ios';
+  if (/android/u.test(text)) return 'android';
+  if (/(macintosh|mac os x|mac_powerpc)/u.test(text)) return 'macos';
+  if (/(windows nt|windows phone)/u.test(text)) return 'windows';
+  if (/(linux|x11|cros)/u.test(text)) return 'linux';
+  return '';
+}
+
+function normalizedDeviceOs(value) {
+  const os = String(value || '').trim().toLowerCase();
+  return ['windows', 'linux', 'android', 'ios', 'macos'].includes(os) ? os : '';
+}
+
+function deviceOsLabel(os) {
+  return {
+    windows: 'Windows',
+    linux: 'Linux',
+    android: 'Android',
+    ios: 'iOS',
+    macos: 'macOS',
+    unknown: 'Unknown'
+  }[os] || 'Unknown';
+}
+
+function activeDeviceOsDistribution(rows) {
+  const order = ['windows', 'linux', 'android', 'ios', 'macos', 'unknown'];
+  const buckets = new Map(order.map(os => [os, {
+    os,
+    label: deviceOsLabel(os),
+    count: 0,
+    devices: []
+  }]));
+  for (const row of rows || []) {
+    const deviceName = compactDeviceText(row.device_name);
+    const os = normalizedDeviceOs(row.device_os) || deviceOsFromText(deviceName);
+    const bucket = buckets.get(os) || buckets.get('unknown');
+    bucket.count += 1;
+    const displayDeviceName = isGeneratedLeaseDeviceName(deviceName) ? '' : deviceName;
+    const deviceLabel = displayDeviceName || compactDeviceText(row.client_ip, 64) || compactDeviceText(row.client_mac, 64);
+    if (deviceLabel && bucket.devices.length < 5 && !bucket.devices.includes(deviceLabel)) {
+      bucket.devices.push(deviceLabel);
+    }
+  }
+  const total = [...buckets.values()].reduce((sum, row) => sum + row.count, 0);
+  return {
+    total,
+    rows: order.map(os => buckets.get(os)).filter(row => row.count > 0)
+  };
 }
 
 function trafficLogRawJson(row) {
@@ -143,8 +237,11 @@ export class HotspotDatabase {
   constructor(filePath) {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     this.filePath = filePath;
+    this.syslogFilePath = path.join(path.dirname(filePath), SYSLOG_DATABASE_NAME);
     this.db = new DatabaseSync(filePath, { timeout: 5000 });
+    this.syslogDb = new DatabaseSync(this.syslogFilePath, { timeout: 5000 });
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
+    this.syslogDb.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
     this.migrate();
   }
 
@@ -159,6 +256,7 @@ export class HotspotDatabase {
         client_mac TEXT,
         redirect_url TEXT,
         language TEXT NOT NULL DEFAULT 'en',
+        device_os TEXT,
         status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'verified', 'expired', 'failed')),
         attempts INTEGER NOT NULL DEFAULT 0,
         expires_at INTEGER NOT NULL,
@@ -243,6 +341,7 @@ export class HotspotDatabase {
         client_mac TEXT,
         redirect_url TEXT,
         language TEXT NOT NULL DEFAULT 'en',
+        device_os TEXT,
         status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'expired', 'failed')),
         request_expires_at INTEGER NOT NULL,
         created_at INTEGER NOT NULL,
@@ -274,109 +373,64 @@ export class HotspotDatabase {
       CREATE INDEX IF NOT EXISTS admin_audit_created_idx
         ON admin_audit(created_at);
 
+      CREATE TABLE IF NOT EXISTS android_devices (
+        id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        admin_user TEXT NOT NULL,
+        name TEXT,
+        app_version TEXT,
+        platform_version TEXT,
+        user_agent TEXT,
+        client_ip TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        status TEXT NOT NULL DEFAULT 'approved' CHECK (status IN ('pending', 'approved', 'disabled')),
+        pairing_code_hint TEXT,
+        fcm_token TEXT,
+        approved_at INTEGER,
+        approved_by TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        last_seen_at INTEGER
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS android_devices_enabled_seen_idx
+        ON android_devices(enabled, last_seen_at);
+
+      CREATE TABLE IF NOT EXISTS android_notifications (
+        id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        payload_json TEXT,
+        actions_json TEXT,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER,
+        delivered_at INTEGER,
+        FOREIGN KEY(device_id) REFERENCES android_devices(id) ON DELETE CASCADE
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS android_notifications_device_created_idx
+        ON android_notifications(device_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS android_pairing_codes (
+        id TEXT PRIMARY KEY,
+        code_hash TEXT NOT NULL UNIQUE,
+        code_hint TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        claimed_device_id TEXT,
+        claimed_at INTEGER,
+        FOREIGN KEY(claimed_device_id) REFERENCES android_devices(id) ON DELETE SET NULL
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS android_pairing_codes_expires_idx
+        ON android_pairing_codes(expires_at);
+
       CREATE TABLE IF NOT EXISTS runtime_state (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
-        updated_at INTEGER NOT NULL
-      ) STRICT;
-
-      CREATE TABLE IF NOT EXISTS law5651_logs (
-        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-        id TEXT NOT NULL UNIQUE,
-        dedupe_key TEXT NOT NULL UNIQUE,
-        kind TEXT NOT NULL CHECK (kind IN ('session', 'flow')),
-        source TEXT NOT NULL,
-        network TEXT,
-        client_ip TEXT NOT NULL,
-        client_mac TEXT,
-        subscriber_id TEXT,
-        source_ip TEXT NOT NULL,
-        source_port TEXT,
-        destination_ip TEXT,
-        destination_port TEXT,
-        protocol TEXT,
-        service_type TEXT NOT NULL,
-        started_at INTEGER NOT NULL,
-        ended_at INTEGER,
-        download_bytes INTEGER NOT NULL DEFAULT 0,
-        upload_bytes INTEGER NOT NULL DEFAULT 0,
-        raw_json TEXT,
-        previous_hash TEXT NOT NULL,
-        record_hash TEXT NOT NULL UNIQUE,
-        created_at INTEGER NOT NULL
-      ) STRICT;
-
-      CREATE INDEX IF NOT EXISTS law5651_logs_created_idx
-        ON law5651_logs(created_at);
-      CREATE INDEX IF NOT EXISTS law5651_logs_client_idx
-        ON law5651_logs(client_ip, created_at);
-
-      CREATE TABLE IF NOT EXISTS law5651_exports (
-        id TEXT PRIMARY KEY,
-        export_reason TEXT NOT NULL DEFAULT 'manual',
-        period_start_at INTEGER,
-        period_end_at INTEGER,
-        file_path TEXT NOT NULL,
-        manifest_path TEXT NOT NULL,
-        timestamp_request_path TEXT,
-        timestamp_token_path TEXT,
-        timestamp_mode TEXT NOT NULL DEFAULT 'disabled',
-        signature_path TEXT,
-        signature_mode TEXT NOT NULL DEFAULT 'hmac-sha256',
-        record_count INTEGER NOT NULL,
-        first_sequence INTEGER,
-        last_sequence INTEGER,
-        first_created_at INTEGER,
-        last_created_at INTEGER,
-        previous_export_hash TEXT NOT NULL,
-        export_hash TEXT NOT NULL,
-        timestamp_status TEXT NOT NULL,
-        timestamp_error TEXT,
-        signature_status TEXT NOT NULL DEFAULT 'disabled',
-        signature_error TEXT,
-        backup_status TEXT NOT NULL DEFAULT 'disabled',
-        backup_error TEXT,
-        created_at INTEGER NOT NULL
-      ) STRICT;
-
-      CREATE INDEX IF NOT EXISTS law5651_exports_created_idx
-        ON law5651_exports(created_at);
-
-      CREATE TABLE IF NOT EXISTS law5651_events (
-        id TEXT PRIMARY KEY,
-        event_type TEXT NOT NULL,
-        severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error', 'critical')),
-        message TEXT NOT NULL,
-        detail_json TEXT,
-        previous_hash TEXT NOT NULL,
-        event_hash TEXT NOT NULL UNIQUE,
-        created_at INTEGER NOT NULL
-      ) STRICT;
-
-      CREATE INDEX IF NOT EXISTS law5651_events_created_idx
-        ON law5651_events(created_at);
-      CREATE INDEX IF NOT EXISTS law5651_events_type_idx
-        ON law5651_events(event_type, created_at);
-
-      CREATE TABLE IF NOT EXISTS law5651_backups (
-        id TEXT PRIMARY KEY,
-        export_id TEXT NOT NULL,
-        target_directory TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
-        error TEXT,
-        file_count INTEGER NOT NULL DEFAULT 0,
-        total_bytes INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL
-      ) STRICT;
-
-      CREATE INDEX IF NOT EXISTS law5651_backups_created_idx
-        ON law5651_backups(created_at);
-      CREATE INDEX IF NOT EXISTS law5651_backups_export_idx
-        ON law5651_backups(export_id, created_at);
-
-      CREATE TABLE IF NOT EXISTS law5651_state (
-        key TEXT PRIMARY KEY,
-        value TEXT,
         updated_at INTEGER NOT NULL
       ) STRICT;
 
@@ -500,6 +554,7 @@ export class HotspotDatabase {
       ['ended_at', 'INTEGER'],
       ['disconnect_reason', 'TEXT'],
       ['device_name', 'TEXT'],
+      ['device_os', 'TEXT'],
       ['unlimited', 'INTEGER NOT NULL DEFAULT 0'],
       ['kea_deleted_at', 'INTEGER'],
       ['lease_seconds', 'INTEGER'],
@@ -555,33 +610,7 @@ export class HotspotDatabase {
       WHERE lease_seconds IS NULL
         AND expires_at > created_at;
     `);
-    const law5651ExportColumns = new Set(
-      this.db.prepare('PRAGMA table_info(law5651_exports)').all().map(row => row.name)
-    );
-    const law5651ExportAdditions = [
-      ['export_reason', "TEXT NOT NULL DEFAULT 'manual'"],
-      ['period_start_at', 'INTEGER'],
-      ['period_end_at', 'INTEGER'],
-      ['timestamp_request_path', 'TEXT'],
-      ['timestamp_mode', "TEXT NOT NULL DEFAULT 'disabled'"],
-      ['signature_path', 'TEXT'],
-      ['signature_mode', "TEXT NOT NULL DEFAULT 'hmac-sha256'"],
-      ['signature_status', "TEXT NOT NULL DEFAULT 'disabled'"],
-      ['signature_error', 'TEXT'],
-      ['backup_status', "TEXT NOT NULL DEFAULT 'disabled'"],
-      ['backup_error', 'TEXT'],
-      ['first_sequence', 'INTEGER'],
-      ['last_sequence', 'INTEGER']
-    ];
-    for (const [name, definition] of law5651ExportAdditions) {
-      if (!law5651ExportColumns.has(name)) {
-        this.db.exec(`ALTER TABLE law5651_exports ADD COLUMN ${name} ${definition}`);
-      }
-    }
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS law5651_exports_period_idx
-        ON law5651_exports(export_reason, period_start_at, period_end_at);
-    `);
+    this.migrateSyslog();
     this.migrateVerificationMethods();
     const challengeColumns = new Set(
       this.db.prepare('PRAGMA table_info(challenges)').all().map(row => row.name)
@@ -589,6 +618,39 @@ export class HotspotDatabase {
     if (!challengeColumns.has('language')) {
       this.db.exec("ALTER TABLE challenges ADD COLUMN language TEXT NOT NULL DEFAULT 'en'");
     }
+    if (!challengeColumns.has('device_os')) {
+      this.db.exec("ALTER TABLE challenges ADD COLUMN device_os TEXT");
+    }
+    const adminApprovalColumns = new Set(
+      this.db.prepare('PRAGMA table_info(admin_approval_requests)').all().map(row => row.name)
+    );
+    if (!adminApprovalColumns.has('device_os')) {
+      this.db.exec("ALTER TABLE admin_approval_requests ADD COLUMN device_os TEXT");
+    }
+    const androidDeviceColumns = new Set(
+      this.db.prepare('PRAGMA table_info(android_devices)').all().map(row => row.name)
+    );
+    const androidDeviceAdditions = [
+      ['status', "TEXT NOT NULL DEFAULT 'approved' CHECK (status IN ('pending', 'approved', 'disabled'))"],
+      ['pairing_code_hint', 'TEXT'],
+      ['fcm_token', 'TEXT'],
+      ['approved_at', 'INTEGER'],
+      ['approved_by', 'TEXT']
+    ];
+    for (const [name, definition] of androidDeviceAdditions) {
+      if (!androidDeviceColumns.has(name)) {
+        this.db.exec(`ALTER TABLE android_devices ADD COLUMN ${name} ${definition}`);
+      }
+    }
+    this.db.exec(`
+      UPDATE android_devices
+      SET status=CASE WHEN enabled=1 THEN 'approved' ELSE 'disabled' END
+      WHERE status IS NULL OR status='';
+      CREATE INDEX IF NOT EXISTS android_devices_status_seen_idx
+        ON android_devices(status, last_seen_at);
+      CREATE INDEX IF NOT EXISTS android_pairing_codes_expires_idx
+        ON android_pairing_codes(expires_at);
+    `);
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS authorizations_ip_created_idx
         ON authorizations(client_ip, created_at);
@@ -618,8 +680,334 @@ export class HotspotDatabase {
             AND authorization.client_mac != ''
         );
     `);
+    this.db.exec(`
+      UPDATE authorizations AS target
+      SET device_os = (
+        SELECT source.device_os
+        FROM authorizations AS source
+        WHERE source.client_mac = target.client_mac COLLATE NOCASE
+          AND source.device_os IN ('windows', 'linux', 'android', 'ios', 'macos')
+        ORDER BY source.created_at DESC
+        LIMIT 1
+      )
+      WHERE (target.device_os IS NULL OR target.device_os = '')
+        AND target.client_mac IS NOT NULL
+        AND target.client_mac != ''
+        AND EXISTS (
+          SELECT 1
+          FROM authorizations AS source
+          WHERE source.client_mac = target.client_mac COLLATE NOCASE
+            AND source.device_os IN ('windows', 'linux', 'android', 'ios', 'macos')
+        );
+    `);
     this.ensureTrafficLogRollups();
     this.repairAuthorizationQuotaResetBaselines();
+  }
+
+  tableExists(database, tableName, schema = 'main') {
+    const source = schema === 'main' ? 'sqlite_master' : `${schema}.sqlite_master`;
+    return Boolean(database.prepare(`
+      SELECT 1 FROM ${source} WHERE type='table' AND name=? LIMIT 1
+    `).get(tableName));
+  }
+
+  migrateSyslog() {
+    this.syslogDb.exec(`
+      CREATE TABLE IF NOT EXISTS law5651_logs (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL UNIQUE,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL CHECK (kind IN ('session', 'flow')),
+        source TEXT NOT NULL,
+        network TEXT,
+        client_ip TEXT NOT NULL,
+        client_mac TEXT,
+        subscriber_id TEXT,
+        source_ip TEXT NOT NULL,
+        source_port TEXT,
+        destination_ip TEXT,
+        destination_port TEXT,
+        protocol TEXT,
+        service_type TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        download_bytes INTEGER NOT NULL DEFAULT 0,
+        upload_bytes INTEGER NOT NULL DEFAULT 0,
+        raw_json TEXT,
+        previous_hash TEXT NOT NULL,
+        record_hash TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS law5651_logs_created_idx
+        ON law5651_logs(created_at);
+      CREATE INDEX IF NOT EXISTS law5651_logs_client_idx
+        ON law5651_logs(client_ip, created_at);
+
+      CREATE TABLE IF NOT EXISTS law5651_exports (
+        id TEXT PRIMARY KEY,
+        export_reason TEXT NOT NULL DEFAULT 'manual',
+        period_start_at INTEGER,
+        period_end_at INTEGER,
+        file_path TEXT NOT NULL,
+        manifest_path TEXT NOT NULL,
+        timestamp_request_path TEXT,
+        timestamp_token_path TEXT,
+        timestamp_mode TEXT NOT NULL DEFAULT 'disabled',
+        signature_path TEXT,
+        signature_mode TEXT NOT NULL DEFAULT 'hmac-sha256',
+        record_count INTEGER NOT NULL,
+        first_sequence INTEGER,
+        last_sequence INTEGER,
+        first_created_at INTEGER,
+        last_created_at INTEGER,
+        previous_export_hash TEXT NOT NULL,
+        export_hash TEXT NOT NULL,
+        timestamp_status TEXT NOT NULL,
+        timestamp_error TEXT,
+        signature_status TEXT NOT NULL DEFAULT 'disabled',
+        signature_error TEXT,
+        backup_status TEXT NOT NULL DEFAULT 'disabled',
+        backup_error TEXT,
+        created_at INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS law5651_exports_created_idx
+        ON law5651_exports(created_at);
+      CREATE INDEX IF NOT EXISTS law5651_exports_period_idx
+        ON law5651_exports(export_reason, period_start_at, period_end_at);
+
+      CREATE TABLE IF NOT EXISTS law5651_events (
+        id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error', 'critical')),
+        message TEXT NOT NULL,
+        detail_json TEXT,
+        previous_hash TEXT NOT NULL,
+        event_hash TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS law5651_events_created_idx
+        ON law5651_events(created_at);
+      CREATE INDEX IF NOT EXISTS law5651_events_type_idx
+        ON law5651_events(event_type, created_at);
+
+      CREATE TABLE IF NOT EXISTS law5651_backups (
+        id TEXT PRIMARY KEY,
+        export_id TEXT NOT NULL,
+        target_directory TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
+        error TEXT,
+        file_count INTEGER NOT NULL DEFAULT 0,
+        total_bytes INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS law5651_backups_created_idx
+        ON law5651_backups(created_at);
+      CREATE INDEX IF NOT EXISTS law5651_backups_export_idx
+        ON law5651_backups(export_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS law5651_state (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at INTEGER NOT NULL
+      ) STRICT;
+    `);
+
+    const exportColumns = new Set(
+      this.syslogDb.prepare('PRAGMA table_info(law5651_exports)').all().map(row => row.name)
+    );
+    const exportAdditions = [
+      ['export_reason', "TEXT NOT NULL DEFAULT 'manual'"],
+      ['period_start_at', 'INTEGER'],
+      ['period_end_at', 'INTEGER'],
+      ['timestamp_request_path', 'TEXT'],
+      ['timestamp_token_path', 'TEXT'],
+      ['timestamp_mode', "TEXT NOT NULL DEFAULT 'disabled'"],
+      ['signature_path', 'TEXT'],
+      ['signature_mode', "TEXT NOT NULL DEFAULT 'hmac-sha256'"],
+      ['signature_status', "TEXT NOT NULL DEFAULT 'disabled'"],
+      ['signature_error', 'TEXT'],
+      ['backup_status', "TEXT NOT NULL DEFAULT 'disabled'"],
+      ['backup_error', 'TEXT'],
+      ['first_sequence', 'INTEGER'],
+      ['last_sequence', 'INTEGER'],
+      ['first_created_at', 'INTEGER'],
+      ['last_created_at', 'INTEGER']
+    ];
+    for (const [name, definition] of exportAdditions) {
+      if (!exportColumns.has(name)) {
+        this.syslogDb.exec(`ALTER TABLE law5651_exports ADD COLUMN ${name} ${definition}`);
+      }
+    }
+    this.syslogDb.exec(`
+      CREATE INDEX IF NOT EXISTS law5651_exports_period_idx
+        ON law5651_exports(export_reason, period_start_at, period_end_at);
+    `);
+    this.migrateLegacySyslogTables();
+  }
+
+  migrateLegacySyslogTables() {
+    const legacyTables = SYSLOG_TABLES.filter(table => this.tableExists(this.db, table));
+    if (!legacyTables.length) return;
+
+    const legacyColumns = table => new Set(
+      this.db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name)
+    );
+    const value = (columns, name, fallback = 'NULL') => columns.has(name) ? name : fallback;
+    const required = (columns, name, fallback) => columns.has(name) ? `COALESCE(${name}, ${fallback})` : fallback;
+    const nowSql = "CAST(strftime('%s','now') AS INTEGER) * 1000";
+
+    this.syslogDb.exec(`ATTACH DATABASE ${sqlString(this.filePath)} AS legacy;`);
+    try {
+      this.syslogDb.exec('BEGIN IMMEDIATE;');
+      try {
+        if (legacyTables.includes('law5651_logs')) {
+          const columns = legacyColumns('law5651_logs');
+          const id = required(columns, 'id', 'lower(hex(randomblob(16)))');
+          const createdAt = required(columns, 'created_at', nowSql);
+          this.syslogDb.exec(`
+            INSERT OR IGNORE INTO law5651_logs
+              (sequence, id, dedupe_key, kind, source, network, client_ip, client_mac, subscriber_id,
+               source_ip, source_port, destination_ip, destination_port, protocol, service_type,
+               started_at, ended_at, download_bytes, upload_bytes, raw_json, previous_hash,
+               record_hash, created_at)
+            SELECT
+              ${value(columns, 'sequence')},
+              ${id},
+              ${required(columns, 'dedupe_key', `'legacy:' || ${id}`)},
+              ${required(columns, 'kind', "'session'")},
+              ${required(columns, 'source', "'legacy'")},
+              ${value(columns, 'network')},
+              ${required(columns, 'client_ip', required(columns, 'source_ip', "'0.0.0.0'"))},
+              ${value(columns, 'client_mac')},
+              ${value(columns, 'subscriber_id')},
+              ${required(columns, 'source_ip', required(columns, 'client_ip', "'0.0.0.0'"))},
+              ${value(columns, 'source_port')},
+              ${value(columns, 'destination_ip')},
+              ${value(columns, 'destination_port')},
+              ${value(columns, 'protocol')},
+              ${required(columns, 'service_type', "'internet-access'")},
+              ${required(columns, 'started_at', createdAt)},
+              ${value(columns, 'ended_at')},
+              ${required(columns, 'download_bytes', '0')},
+              ${required(columns, 'upload_bytes', '0')},
+              ${value(columns, 'raw_json')},
+              ${required(columns, 'previous_hash', sqlString('0'.repeat(64)))},
+              ${required(columns, 'record_hash', 'lower(hex(randomblob(32)))')},
+              ${createdAt}
+            FROM legacy.law5651_logs;
+          `);
+        }
+
+        if (legacyTables.includes('law5651_exports')) {
+          const columns = legacyColumns('law5651_exports');
+          this.syslogDb.exec(`
+            INSERT OR IGNORE INTO law5651_exports
+              (id, export_reason, period_start_at, period_end_at, file_path, manifest_path,
+               timestamp_request_path, timestamp_token_path, timestamp_mode, signature_path,
+               signature_mode, record_count, first_sequence, last_sequence, first_created_at,
+               last_created_at, previous_export_hash, export_hash, timestamp_status,
+               timestamp_error, signature_status, signature_error, backup_status, backup_error,
+               created_at)
+            SELECT
+              ${required(columns, 'id', 'lower(hex(randomblob(16)))')},
+              ${required(columns, 'export_reason', "'manual'")},
+              ${value(columns, 'period_start_at')},
+              ${value(columns, 'period_end_at')},
+              ${required(columns, 'file_path', "''")},
+              ${required(columns, 'manifest_path', "''")},
+              ${value(columns, 'timestamp_request_path')},
+              ${value(columns, 'timestamp_token_path')},
+              ${required(columns, 'timestamp_mode', "'disabled'")},
+              ${value(columns, 'signature_path')},
+              ${required(columns, 'signature_mode', "'hmac-sha256'")},
+              ${required(columns, 'record_count', '0')},
+              ${value(columns, 'first_sequence')},
+              ${value(columns, 'last_sequence')},
+              ${value(columns, 'first_created_at')},
+              ${value(columns, 'last_created_at')},
+              ${required(columns, 'previous_export_hash', "''")},
+              ${required(columns, 'export_hash', "''")},
+              ${required(columns, 'timestamp_status', "'disabled'")},
+              ${value(columns, 'timestamp_error')},
+              ${required(columns, 'signature_status', "'disabled'")},
+              ${value(columns, 'signature_error')},
+              ${required(columns, 'backup_status', "'disabled'")},
+              ${value(columns, 'backup_error')},
+              ${required(columns, 'created_at', nowSql)}
+            FROM legacy.law5651_exports;
+          `);
+        }
+
+        if (legacyTables.includes('law5651_events')) {
+          const columns = legacyColumns('law5651_events');
+          this.syslogDb.exec(`
+            INSERT OR IGNORE INTO law5651_events
+              (id, event_type, severity, message, detail_json, previous_hash, event_hash, created_at)
+            SELECT
+              ${required(columns, 'id', 'lower(hex(randomblob(16)))')},
+              ${required(columns, 'event_type', "'legacy_migration'")},
+              ${required(columns, 'severity', "'info'")},
+              ${required(columns, 'message', "'Legacy syslog event'")},
+              ${value(columns, 'detail_json')},
+              ${required(columns, 'previous_hash', sqlString('0'.repeat(64)))},
+              ${required(columns, 'event_hash', 'lower(hex(randomblob(32)))')},
+              ${required(columns, 'created_at', nowSql)}
+            FROM legacy.law5651_events;
+          `);
+        }
+
+        if (legacyTables.includes('law5651_backups')) {
+          const columns = legacyColumns('law5651_backups');
+          this.syslogDb.exec(`
+            INSERT OR IGNORE INTO law5651_backups
+              (id, export_id, target_directory, status, error, file_count, total_bytes, created_at)
+            SELECT
+              ${required(columns, 'id', 'lower(hex(randomblob(16)))')},
+              ${required(columns, 'export_id', "''")},
+              ${required(columns, 'target_directory', "''")},
+              ${required(columns, 'status', "'failed'")},
+              ${value(columns, 'error')},
+              ${required(columns, 'file_count', '0')},
+              ${required(columns, 'total_bytes', '0')},
+              ${required(columns, 'created_at', nowSql)}
+            FROM legacy.law5651_backups;
+          `);
+        }
+
+        if (legacyTables.includes('law5651_state')) {
+          const columns = legacyColumns('law5651_state');
+          this.syslogDb.exec(`
+            INSERT OR IGNORE INTO law5651_state(key, value, updated_at)
+            SELECT
+              ${required(columns, 'key', "''")},
+              ${value(columns, 'value', "''")},
+              ${required(columns, 'updated_at', nowSql)}
+            FROM legacy.law5651_state;
+          `);
+        }
+
+        this.syslogDb.exec('COMMIT;');
+      } catch (error) {
+        try { this.syslogDb.exec('ROLLBACK;'); } catch {}
+        throw error;
+      }
+    } finally {
+      try { this.syslogDb.exec('DETACH DATABASE legacy;'); } catch {}
+    }
+
+    this.db.exec(`
+      BEGIN IMMEDIATE;
+      DROP TABLE IF EXISTS law5651_logs;
+      DROP TABLE IF EXISTS law5651_exports;
+      DROP TABLE IF EXISTS law5651_events;
+      DROP TABLE IF EXISTS law5651_backups;
+      DROP TABLE IF EXISTS law5651_state;
+      COMMIT;
+    `);
   }
 
   migrateVerificationMethods() {
@@ -633,6 +1021,8 @@ export class HotspotDatabase {
       );
       const languageInsertColumn = challengeColumns.has('language') ? ', language' : '';
       const languageSelectColumn = challengeColumns.has('language') ? ', language' : '';
+      const deviceOsInsertColumn = challengeColumns.has('device_os') ? ', device_os' : '';
+      const deviceOsSelectColumn = challengeColumns.has('device_os') ? ', device_os' : '';
       this.db.exec(`
         BEGIN IMMEDIATE;
         DROP INDEX IF EXISTS challenges_target_created_idx;
@@ -648,6 +1038,7 @@ export class HotspotDatabase {
           client_mac TEXT,
           redirect_url TEXT,
           language TEXT NOT NULL DEFAULT 'en',
+          device_os TEXT,
           status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'verified', 'expired', 'failed')),
           attempts INTEGER NOT NULL DEFAULT 0,
           expires_at INTEGER NOT NULL,
@@ -657,9 +1048,9 @@ export class HotspotDatabase {
         ) STRICT;
         INSERT INTO challenges
           (id, kind, target, secret_hash, client_ip, client_mac, redirect_url,
-           status, attempts, expires_at, created_at, verified_at, last_error${languageInsertColumn})
+           status, attempts, expires_at, created_at, verified_at, last_error${languageInsertColumn}${deviceOsInsertColumn})
         SELECT id, kind, target, secret_hash, client_ip, client_mac, redirect_url,
-          status, attempts, expires_at, created_at, verified_at, last_error${languageSelectColumn}
+          status, attempts, expires_at, created_at, verified_at, last_error${languageSelectColumn}${deviceOsSelectColumn}
         FROM challenges_legacy;
         DROP TABLE challenges_legacy;
         CREATE INDEX challenges_target_created_idx ON challenges(kind, target, created_at);
@@ -675,6 +1066,10 @@ export class HotspotDatabase {
     if (!authorizationSql.includes("'telegram'") ||
         !authorizationSql.includes("'admin-approval'") ||
         !authorizationSql.includes("'nvi'")) {
+      const authorizationColumns = new Set(
+        this.db.prepare('PRAGMA table_info(authorizations)').all().map(row => row.name)
+      );
+      const deviceOsSelectColumn = authorizationColumns.has('device_os') ? 'device_os' : 'NULL';
       this.db.exec(`
         BEGIN IMMEDIATE;
         DROP INDEX IF EXISTS authorizations_ip_created_idx;
@@ -698,9 +1093,10 @@ export class HotspotDatabase {
           upload_bytes INTEGER NOT NULL DEFAULT 0,
           last_seen_at INTEGER,
           ended_at INTEGER,
-          disconnect_reason TEXT,
-          device_name TEXT,
-	          unlimited INTEGER NOT NULL DEFAULT 0,
+        disconnect_reason TEXT,
+        device_name TEXT,
+        device_os TEXT,
+        unlimited INTEGER NOT NULL DEFAULT 0,
 	          kea_deleted_at INTEGER,
 	          lease_seconds INTEGER,
 	          quota_blocked_until INTEGER,
@@ -714,14 +1110,14 @@ export class HotspotDatabase {
 	        ) STRICT;
 	        INSERT INTO authorizations
 	          (id, method, identity, client_ip, client_mac, gateway_mode, gateway_session_id,
-	           status, created_at, expires_at, redirect_url, gateway_response_json, error,
-	           download_bytes, upload_bytes, last_seen_at, ended_at, disconnect_reason, device_name,
-	           unlimited, kea_deleted_at, lease_seconds, quota_blocked_until, quota_period_key, quota_exceeded_at,
-	           previous_gateway_download_bytes, previous_gateway_upload_bytes, previous_gateway_seen_at,
-	           gateway_sampled_at, previous_gateway_sampled_at)
+           status, created_at, expires_at, redirect_url, gateway_response_json, error,
+           download_bytes, upload_bytes, last_seen_at, ended_at, disconnect_reason, device_name, device_os,
+           unlimited, kea_deleted_at, lease_seconds, quota_blocked_until, quota_period_key, quota_exceeded_at,
+           previous_gateway_download_bytes, previous_gateway_upload_bytes, previous_gateway_seen_at,
+           gateway_sampled_at, previous_gateway_sampled_at)
 	        SELECT id, method, identity, client_ip, client_mac, gateway_mode, gateway_session_id,
 	          status, created_at, expires_at, redirect_url, gateway_response_json, error,
-	          download_bytes, upload_bytes, last_seen_at, ended_at, disconnect_reason, device_name,
+	          download_bytes, upload_bytes, last_seen_at, ended_at, disconnect_reason, device_name, ${deviceOsSelectColumn},
 	          COALESCE(unlimited, 0), kea_deleted_at, lease_seconds,
 	          quota_blocked_until, quota_period_key, quota_exceeded_at,
 	          previous_gateway_download_bytes, previous_gateway_upload_bytes, previous_gateway_seen_at,
@@ -757,20 +1153,21 @@ export class HotspotDatabase {
   }
 
   close() {
+    this.syslogDb.close();
     this.db.close();
   }
 
-  databaseMaintenanceStats() {
-    const pageSize = Number(this.db.prepare('PRAGMA page_size').get().page_size || 0);
-    const pageCount = Number(this.db.prepare('PRAGMA page_count').get().page_count || 0);
-    const freelistCount = Number(this.db.prepare('PRAGMA freelist_count').get().freelist_count || 0);
-    const fileBytes = fs.existsSync(this.filePath) ? fs.statSync(this.filePath).size : 0;
-    const walPath = `${this.filePath}-wal`;
-    const shmPath = `${this.filePath}-shm`;
+  databaseMaintenanceStatsFor(database, filePath) {
+    const pageSize = Number(database.prepare('PRAGMA page_size').get().page_size || 0);
+    const pageCount = Number(database.prepare('PRAGMA page_count').get().page_count || 0);
+    const freelistCount = Number(database.prepare('PRAGMA freelist_count').get().freelist_count || 0);
+    const fileBytes = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
+    const walPath = `${filePath}-wal`;
+    const shmPath = `${filePath}-shm`;
     const walBytes = fs.existsSync(walPath) ? fs.statSync(walPath).size : 0;
     const shmBytes = fs.existsSync(shmPath) ? fs.statSync(shmPath).size : 0;
     return {
-      path: this.filePath,
+      path: filePath,
       pageSize,
       pageCount,
       freelistCount,
@@ -784,15 +1181,51 @@ export class HotspotDatabase {
     };
   }
 
-  vacuumDatabase() {
+  databaseMaintenanceStats() {
+    return this.databaseMaintenanceStatsFor(this.db, this.filePath);
+  }
+
+  syslogDatabaseMaintenanceStats() {
+    return this.databaseMaintenanceStatsFor(this.syslogDb, this.syslogFilePath);
+  }
+
+  checkpointDatabaseFor(database, filePath, mode = 'PASSIVE') {
     const startedAt = Date.now();
-    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
-    const before = this.databaseMaintenanceStats();
-    const backupPath = `${this.filePath}.backup-${new Date(startedAt).toISOString().replace(/[:.]/gu, '-')}`;
-    fs.copyFileSync(this.filePath, backupPath, fs.constants.COPYFILE_EXCL);
+    const before = this.databaseMaintenanceStatsFor(database, filePath);
+    const safeMode = String(mode || '').toUpperCase() === 'TRUNCATE' ? 'TRUNCATE' : 'PASSIVE';
+    database.exec(`PRAGMA wal_checkpoint(${safeMode}); PRAGMA optimize;`);
+    const after = this.databaseMaintenanceStatsFor(database, filePath);
+    const completedAt = Date.now();
+    return {
+      ok: true,
+      mode: safeMode,
+      startedAt,
+      completedAt,
+      durationMs: completedAt - startedAt,
+      before,
+      after,
+      reclaimedBytes: Math.max(0, before.totalFileBytes - after.totalFileBytes),
+      freeBytes: after.freeBytes
+    };
+  }
+
+  checkpointDatabase(mode = 'PASSIVE') {
+    return this.checkpointDatabaseFor(this.db, this.filePath, mode);
+  }
+
+  checkpointSyslogDatabase(mode = 'PASSIVE') {
+    return this.checkpointDatabaseFor(this.syslogDb, this.syslogFilePath, mode);
+  }
+
+  vacuumDatabaseFor(database, filePath) {
+    const startedAt = Date.now();
+    database.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+    const before = this.databaseMaintenanceStatsFor(database, filePath);
+    const backupPath = `${filePath}.backup-${new Date(startedAt).toISOString().replace(/[:.]/gu, '-')}`;
+    fs.copyFileSync(filePath, backupPath, fs.constants.COPYFILE_EXCL);
     const backupBytes = fs.statSync(backupPath).size;
-    this.db.exec('VACUUM; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;');
-    const after = this.databaseMaintenanceStats();
+    database.exec('VACUUM; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;');
+    const after = this.databaseMaintenanceStatsFor(database, filePath);
     const completedAt = Date.now();
     return {
       ok: true,
@@ -808,10 +1241,19 @@ export class HotspotDatabase {
     };
   }
 
+  vacuumDatabase() {
+    return this.vacuumDatabaseFor(this.db, this.filePath);
+  }
+
+  vacuumSyslogDatabase() {
+    return this.vacuumDatabaseFor(this.syslogDb, this.syslogFilePath);
+  }
+
   cleanup(now = Date.now()) {
     this.db.prepare(`UPDATE challenges SET status='expired' WHERE status='pending' AND expires_at < ?`).run(now);
     this.expireAdminApprovalRequests(now);
     this.db.prepare('DELETE FROM security_events WHERE created_at < ?').run(now - 24 * 60 * 60 * 1000);
+    this.db.prepare('DELETE FROM android_notifications WHERE created_at < ?').run(now - 7 * 24 * 60 * 60 * 1000);
   }
 
   recordEvent(kind, clientIp, subject = '') {
@@ -853,7 +1295,7 @@ export class HotspotDatabase {
 
   createAdminApprovalRequest({
     fullName, contact = '', contactType = 'none', identity, clientIp,
-    clientMac = '', redirectUrl = '', expiresAt, language = 'en'
+    clientMac = '', redirectUrl = '', expiresAt, language = 'en', deviceOs = ''
   }) {
     const id = randomUUID();
     const createdAt = Date.now();
@@ -861,8 +1303,8 @@ export class HotspotDatabase {
     this.db.prepare(`
       INSERT INTO admin_approval_requests
         (id, full_name, contact, contact_type, identity, client_ip, client_mac,
-         redirect_url, language, request_expires_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         redirect_url, language, device_os, request_expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       fullName,
@@ -873,6 +1315,7 @@ export class HotspotDatabase {
       clientMac || null,
       redirectUrl || null,
       normalizedLanguage,
+      normalizedDeviceOs(deviceOs) || null,
       expiresAt,
       createdAt
     );
@@ -961,15 +1404,15 @@ export class HotspotDatabase {
     return Number(result.changes) === 1 ? this.getAdminApprovalRequest(id) : null;
   }
 
-  createChallenge({ kind, target, secretHash, clientIp, clientMac, redirectUrl, expiresAt, language = 'en' }) {
+  createChallenge({ kind, target, secretHash, clientIp, clientMac, redirectUrl, expiresAt, language = 'en', deviceOs = '' }) {
     const id = randomUUID();
     const createdAt = Date.now();
     const normalizedLanguage = normalizeLanguage(language, 'en');
     this.db.prepare(`INSERT INTO challenges
-      (id, kind, target, secret_hash, client_ip, client_mac, redirect_url, language, expires_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      (id, kind, target, secret_hash, client_ip, client_mac, redirect_url, language, device_os, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(id, kind, target, secretHash, clientIp, clientMac || null, redirectUrl || null,
-        normalizedLanguage, expiresAt, createdAt);
+        normalizedLanguage, normalizedDeviceOs(deviceOs) || null, expiresAt, createdAt);
     return this.getChallenge(id);
   }
 
@@ -1135,18 +1578,18 @@ export class HotspotDatabase {
   }
 
   saveAuthorization({ method, identity, clientIp, clientMac, gatewayMode, gatewaySessionId,
-    status, expiresAt, unlimited = false, leaseSeconds = null, redirectUrl, gatewayResponse, error }) {
+    status, expiresAt, unlimited = false, leaseSeconds = null, redirectUrl, gatewayResponse, error, deviceOs = '' }) {
     const id = randomUUID();
     const createdAt = Date.now();
     const storedLeaseSeconds = normalizedLeaseSeconds(leaseSeconds) ||
       normalizedLeaseSeconds((Number(expiresAt) - createdAt) / 1000);
     this.db.prepare(`INSERT INTO authorizations
       (id, method, identity, client_ip, client_mac, gateway_mode, gateway_session_id,
-       status, created_at, expires_at, unlimited, lease_seconds, redirect_url, gateway_response_json, error)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+       status, created_at, expires_at, unlimited, lease_seconds, redirect_url, gateway_response_json, error, device_os)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(id, method, identity, clientIp, clientMac || null, gatewayMode,
         gatewaySessionId || null, status, createdAt, expiresAt, unlimited ? 1 : 0, storedLeaseSeconds, redirectUrl || null,
-        gatewayResponse == null ? null : JSON.stringify(gatewayResponse), error || null);
+        gatewayResponse == null ? null : JSON.stringify(gatewayResponse), error || null, normalizedDeviceOs(deviceOs) || null);
     return this.getAuthorization(id);
   }
 
@@ -1157,6 +1600,31 @@ export class HotspotDatabase {
       LEFT JOIN vouchers v ON a.method='voucher' AND a.identity=v.id
       WHERE a.id=?
     `).get(id) || null;
+  }
+
+  rememberAuthorizationDeviceOs(id, deviceOs) {
+    const detected = normalizedDeviceOs(deviceOs);
+    if (!detected) return '';
+    const authorization = this.db.prepare(`
+      SELECT client_mac, device_os FROM authorizations WHERE id=?
+    `).get(id);
+    if (!authorization) return '';
+    const remembered = normalizedDeviceOs(authorization.device_os) || detected;
+    const clientMac = normalizeMac(authorization.client_mac);
+    if (clientMac) {
+      this.db.prepare(`
+        UPDATE authorizations
+        SET device_os=?
+        WHERE id=? OR (
+          UPPER(client_mac)=?
+          AND (device_os IS NULL OR device_os='')
+        )
+      `).run(remembered, id, clientMac);
+    } else {
+      this.db.prepare('UPDATE authorizations SET device_os=? WHERE id=?')
+        .run(remembered, id);
+    }
+    return remembered;
   }
 
   listOpenAuthorizationsForMethods(methods, { limit = 1000 } = {}) {
@@ -1288,6 +1756,325 @@ export class HotspotDatabase {
         detail == null ? null : JSON.stringify(detail), clientIp, Date.now());
   }
 
+  createAndroidDevice({
+    tokenHash, adminUser, name = '', appVersion = '', platformVersion = '',
+    userAgent = '', clientIp = '', status = 'approved', pairingCodeHint = '',
+    fcmToken = '', approvedBy = '', now = Date.now()
+  }) {
+    const id = randomUUID();
+    const normalizedStatus = ['pending', 'approved', 'disabled'].includes(status) ? status : 'approved';
+    this.db.prepare(`
+      INSERT INTO android_devices
+        (id, token_hash, admin_user, name, app_version, platform_version,
+         user_agent, client_ip, enabled, status, pairing_code_hint, approved_at,
+         approved_by, created_at, updated_at, last_seen_at, fcm_token)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      tokenHash,
+      adminUser,
+      name || null,
+      appVersion || null,
+      platformVersion || null,
+      userAgent || null,
+      clientIp || null,
+      normalizedStatus === 'approved' ? 1 : 0,
+      normalizedStatus,
+      pairingCodeHint || null,
+      normalizedStatus === 'approved' ? now : null,
+      approvedBy || (normalizedStatus === 'approved' ? adminUser : '') || null,
+      now,
+      now,
+      now,
+      fcmToken || null
+    );
+    return this.getAndroidDevice(id);
+  }
+
+  getAndroidDevice(id) {
+    return this.db.prepare(`
+      SELECT id, admin_user, name, app_version, platform_version, user_agent,
+        client_ip, enabled, status, pairing_code_hint, fcm_token, approved_at, approved_by,
+        created_at, updated_at, last_seen_at
+      FROM android_devices
+      WHERE id=?
+    `).get(id) || null;
+  }
+
+  getAndroidDeviceByTokenHash(tokenHash) {
+    return this.db.prepare(`
+      SELECT id, admin_user, name, app_version, platform_version, user_agent,
+        client_ip, enabled, status, pairing_code_hint, fcm_token, approved_at, approved_by,
+        created_at, updated_at, last_seen_at
+      FROM android_devices
+      WHERE token_hash=?
+    `).get(tokenHash) || null;
+  }
+
+  updateAndroidDevice(id, {
+    adminUser = '', name = '', appVersion = '', platformVersion = '',
+    userAgent = '', clientIp = '', enabled = 1, now = Date.now()
+  } = {}) {
+    this.db.prepare(`
+      UPDATE android_devices
+      SET admin_user=COALESCE(NULLIF(?, ''), admin_user),
+        name=COALESCE(NULLIF(?, ''), name),
+        app_version=COALESCE(NULLIF(?, ''), app_version),
+        platform_version=COALESCE(NULLIF(?, ''), platform_version),
+        user_agent=COALESCE(NULLIF(?, ''), user_agent),
+        client_ip=COALESCE(NULLIF(?, ''), client_ip),
+        enabled=?,
+        status=CASE WHEN ? THEN 'approved' ELSE status END,
+        updated_at=?,
+        last_seen_at=?
+      WHERE id=?
+    `).run(
+      adminUser,
+      name,
+      appVersion,
+      platformVersion,
+      userAgent,
+      clientIp,
+      enabled ? 1 : 0,
+      enabled ? 1 : 0,
+      now,
+      now,
+      id
+    );
+    return this.getAndroidDevice(id);
+  }
+
+  touchAndroidDevice(id, now = Date.now()) {
+    this.db.prepare(`
+      UPDATE android_devices
+      SET last_seen_at=?, updated_at=?
+      WHERE id=? AND enabled=1 AND status='approved'
+    `).run(now, now, id);
+    return this.getAndroidDevice(id);
+  }
+
+  setAndroidDevicePushToken(id, fcmToken, now = Date.now()) {
+    this.db.prepare(`
+      UPDATE android_devices
+      SET fcm_token=?, updated_at=?, last_seen_at=?
+      WHERE id=? AND status!='disabled'
+    `).run(String(fcmToken || '').trim() || null, now, now, id);
+    return this.getAndroidDevice(id);
+  }
+
+  clearAndroidDevicePushToken(id, expectedToken = '', now = Date.now()) {
+    const tokenClause = expectedToken ? ' AND fcm_token=?' : '';
+    const params = [now, id];
+    if (expectedToken) params.push(expectedToken);
+    this.db.prepare(`
+      UPDATE android_devices
+      SET fcm_token=NULL, updated_at=?
+      WHERE id=?${tokenClause}
+    `).run(...params);
+    return this.getAndroidDevice(id);
+  }
+
+  disableAndroidDevice(id, now = Date.now()) {
+    this.db.prepare(`
+      UPDATE android_devices
+      SET enabled=0, status='disabled', updated_at=?
+      WHERE id=?
+    `).run(now, id);
+    return this.getAndroidDevice(id);
+  }
+
+  approveAndroidDevice(id, { adminUser = '', now = Date.now() } = {}) {
+    this.db.prepare(`
+      UPDATE android_devices
+      SET enabled=1,
+        status='approved',
+        admin_user=COALESCE(NULLIF(?, ''), admin_user),
+        approved_by=COALESCE(NULLIF(?, ''), approved_by),
+        approved_at=?,
+        updated_at=?,
+        last_seen_at=?
+      WHERE id=? AND status='pending'
+    `).run(adminUser, adminUser, now, now, now, id);
+    return this.getAndroidDevice(id);
+  }
+
+  listAndroidDevices({ enabled = null, status = '', limit = 100, offset = 0 } = {}) {
+    const params = [];
+    const where = [];
+    if (enabled != null) {
+      where.push('enabled=?');
+      params.push(enabled ? 1 : 0);
+    }
+    if (status) {
+      where.push('status=?');
+      params.push(String(status));
+    }
+    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const total = this.db.prepare(`SELECT COUNT(*) count FROM android_devices ${clause}`).get(...params);
+    const rows = this.db.prepare(`
+      SELECT id, admin_user, name, app_version, platform_version, user_agent,
+        client_ip, enabled, status, pairing_code_hint, fcm_token, approved_at, approved_by,
+        created_at, updated_at, last_seen_at
+      FROM android_devices
+      ${clause}
+      ORDER BY COALESCE(last_seen_at, created_at) DESC
+      LIMIT ? OFFSET ?
+    `).all(...params, Math.max(1, Math.trunc(Number(limit) || 100)), Math.max(0, Math.trunc(Number(offset) || 0)));
+    return { rows, total: Number(total.count || 0) };
+  }
+
+  createAndroidNotification({
+    deviceId, type = 'system', title, body, payload = null, actions = [],
+    expiresAt = null, createdAt = Date.now()
+  }) {
+    const id = randomUUID();
+    this.db.prepare(`
+      INSERT INTO android_notifications
+        (id, device_id, type, title, body, payload_json, actions_json, created_at, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      deviceId,
+      String(type || 'system'),
+      String(title || '').slice(0, 160),
+      String(body || '').slice(0, 2000),
+      payload == null ? null : JSON.stringify(payload),
+      JSON.stringify(actions || []),
+      createdAt,
+      expiresAt == null ? null : Number(expiresAt)
+    );
+    return this.getAndroidNotification(id, deviceId);
+  }
+
+  getAndroidNotification(id, deviceId = '') {
+    const params = [id];
+    const deviceClause = deviceId ? ' AND device_id=?' : '';
+    if (deviceId) params.push(deviceId);
+    const row = this.db.prepare(`
+      SELECT id, device_id, type, title, body, payload_json, actions_json,
+        created_at, expires_at, delivered_at
+      FROM android_notifications
+      WHERE id=?${deviceClause}
+    `).get(...params);
+    return row ? this.androidNotificationPublic(row) : null;
+  }
+
+  listAndroidNotifications(deviceId, {
+    since = 0, limit = 50, now = Date.now()
+  } = {}) {
+    const rows = this.db.prepare(`
+      SELECT id, device_id, type, title, body, payload_json, actions_json,
+        created_at, expires_at, delivered_at
+      FROM android_notifications
+      WHERE device_id=?
+        AND created_at > ?
+        AND delivered_at IS NULL
+        AND (expires_at IS NULL OR expires_at >= ?)
+      ORDER BY created_at ASC
+      LIMIT ?
+    `).all(
+      deviceId,
+      Math.max(0, Number(since) || 0),
+      now,
+      Math.max(1, Math.min(100, Math.trunc(Number(limit) || 50)))
+    );
+    const notifications = [];
+    for (const row of rows) {
+      const notification = this.androidNotificationPublic(row);
+      if (notification.type === 'admin-approval' && notification.payload.requestId) {
+        const approvalRequest = this.getAdminApprovalRequest(notification.payload.requestId);
+        if (approvalRequest && approvalRequest.status !== 'pending') {
+          this.markAndroidNotificationDelivered(row.id, deviceId, now);
+          continue;
+        }
+      }
+      notifications.push(notification);
+    }
+    return notifications;
+  }
+
+  markAndroidNotificationDelivered(id, deviceId, deliveredAt = Date.now()) {
+    this.db.prepare(`
+      UPDATE android_notifications
+      SET delivered_at=COALESCE(delivered_at, ?)
+      WHERE id=? AND device_id=?
+    `).run(deliveredAt, id, deviceId);
+    return this.getAndroidNotification(id, deviceId);
+  }
+
+  dismissAndroidNotificationsForAdminApprovalRequest(requestId, deliveredAt = Date.now()) {
+    return Number(this.db.prepare(`
+      UPDATE android_notifications
+      SET delivered_at=COALESCE(delivered_at, ?)
+      WHERE type='admin-approval'
+        AND delivered_at IS NULL
+        AND payload_json LIKE ?
+    `).run(deliveredAt, `%"requestId":"${String(requestId).replace(/[%_]/gu, '')}"%`).changes);
+  }
+
+  createAndroidPairingCode({
+    codeHash, codeHint, createdBy, expiresAt, createdAt = Date.now()
+  }) {
+    const id = randomUUID();
+    this.db.prepare(`
+      INSERT INTO android_pairing_codes
+        (id, code_hash, code_hint, created_by, created_at, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, codeHash, codeHint, createdBy, createdAt, expiresAt);
+    return this.getAndroidPairingCode(id);
+  }
+
+  getAndroidPairingCode(id) {
+    return this.db.prepare(`
+      SELECT id, code_hint, created_by, created_at, expires_at,
+        claimed_device_id, claimed_at
+      FROM android_pairing_codes
+      WHERE id=?
+    `).get(id) || null;
+  }
+
+  getActiveAndroidPairingCodeByHash(codeHash, now = Date.now()) {
+    return this.db.prepare(`
+      SELECT id, code_hash, code_hint, created_by, created_at, expires_at,
+        claimed_device_id, claimed_at
+      FROM android_pairing_codes
+      WHERE code_hash=? AND expires_at >= ?
+      ORDER BY created_at DESC LIMIT 1
+    `).get(codeHash, now) || null;
+  }
+
+  claimAndroidPairingCode(codeId, deviceId, claimedAt = Date.now()) {
+    const result = this.db.prepare(`
+      UPDATE android_pairing_codes
+      SET claimed_device_id=?, claimed_at=?
+      WHERE id=? AND claimed_device_id IS NULL AND expires_at >= ?
+    `).run(deviceId, claimedAt, codeId, claimedAt);
+    return Number(result.changes) === 1 ? this.getAndroidPairingCode(codeId) : null;
+  }
+
+  androidNotificationPublic(row) {
+    const parse = value => {
+      if (!value) return null;
+      try {
+        return JSON.parse(value);
+      } catch {
+        return null;
+      }
+    };
+    return {
+      id: row.id,
+      deviceId: row.device_id,
+      type: row.type,
+      title: row.title,
+      body: row.body,
+      payload: parse(row.payload_json) || {},
+      actions: parse(row.actions_json) || [],
+      createdAt: Number(row.created_at || 0),
+      expiresAt: row.expires_at == null ? null : Number(row.expires_at),
+      deliveredAt: row.delivered_at == null ? null : Number(row.delivered_at)
+    };
+  }
+
   setRuntimeState(key, value, now = Date.now()) {
     this.db.prepare(`
       INSERT INTO runtime_state (key, value, updated_at)
@@ -1349,6 +2136,13 @@ export class HotspotDatabase {
       ORDER BY a.created_at DESC LIMIT 8
     `).all();
 
+    const activeDevices = this.db.prepare(`
+      SELECT client_ip, client_mac, device_name, device_os
+      FROM authorizations
+      WHERE status='active' AND ended_at IS NULL AND expires_at > ?
+      ORDER BY COALESCE(last_seen_at, created_at) DESC
+    `).all(now);
+
     this.expireAdminApprovalRequests(now);
     const adminApprovalSummary = this.db.prepare(`
       SELECT
@@ -1374,6 +2168,7 @@ export class HotspotDatabase {
         redeemedVouchers: Number(vouchers.redeemed || 0)
       },
       methods: methods.map(row => ({ method: row.method, count: Number(row.count) })),
+      deviceOs: activeDeviceOsDistribution(activeDevices),
       daily: daily.map(row => ({
         day: row.day,
         sessions: Number(row.sessions),
@@ -1677,7 +2472,7 @@ export class HotspotDatabase {
         createdAt: Number(row.created_at)
       });
     }
-    const syslogRows = this.db.prepare(`
+    const syslogRows = this.syslogDb.prepare(`
       SELECT id, event_type, severity, message, detail_json, created_at
       FROM law5651_events ORDER BY created_at DESC LIMIT ?
     `).all(limit);
@@ -1973,49 +2768,26 @@ export class HotspotDatabase {
     return { inserted, skipped };
   }
 
-  trafficLogPeriod(period = 'daily', now = Date.now()) {
-    const selected = ['hourly', '6h', '12h', 'daily', 'weekly', 'monthly'].includes(period) ? period : 'daily';
+  trafficLogPeriod(period = '60m', now = Date.now()) {
+    const selected = ['15m', '30m', '45m', '60m'].includes(period) ? period : '60m';
     const current = Math.trunc(Number(now) || Date.now());
     const rolling = {
-      hourly: { bucket: '5min', bucketMs: 5 * 60 * 1000, count: 12 },
-      '6h': { bucket: '30min', bucketMs: 30 * 60 * 1000, count: 12 },
-      '12h': { bucket: 'hour', bucketMs: 60 * 60 * 1000, count: 12 }
+      '15m': { bucket: 'minute', bucketMs: 60 * 1000, count: 15 },
+      '30m': { bucket: 'minute', bucketMs: 60 * 1000, count: 30 },
+      '45m': { bucket: 'minute', bucketMs: 60 * 1000, count: 45 },
+      '60m': { bucket: 'minute', bucketMs: 60 * 1000, count: 60 }
     }[selected];
-    if (rolling) {
-      const endAt = Math.ceil((current + 1) / rolling.bucketMs) * rolling.bucketMs;
-      return {
-        period: selected,
-        ...rolling,
-        startAt: endAt - rolling.count * rolling.bucketMs,
-        endAt
-      };
-    }
-    const dayStart = new Date(Math.trunc(Number(now) || Date.now()));
-    dayStart.setHours(0, 0, 0, 0);
-    const dayStartAt = dayStart.getTime();
-    if (selected === 'daily') {
-      return {
-        period: selected,
-        bucket: 'hour',
-        bucketMs: 60 * 60 * 1000,
-        count: 24,
-        startAt: dayStartAt,
-        endAt: dayStartAt + 24 * 60 * 60 * 1000
-      };
-    }
-    const count = selected === 'weekly' ? 7 : 30;
+    const endAt = Math.ceil((current + 1) / rolling.bucketMs) * rolling.bucketMs;
     return {
       period: selected,
-      bucket: 'day',
-      bucketMs: 24 * 60 * 60 * 1000,
-      count,
-      startAt: dayStartAt - (count - 1) * 24 * 60 * 60 * 1000,
-      endAt: dayStartAt + 24 * 60 * 60 * 1000
+      ...rolling,
+      startAt: endAt - rolling.count * rolling.bucketMs,
+      endAt
     };
   }
 
   trafficLogPointLabel(date, bucket) {
-    if (['5min', '30min', 'hour'].includes(bucket)) {
+    if (['minute', '5min', '30min', 'hour'].includes(bucket)) {
       return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
     }
     return [
@@ -2187,8 +2959,8 @@ export class HotspotDatabase {
     };
   }
 
-  topTrafficLogSites({ hours = 6, limit = 10, sort = 'visits', now = Date.now() } = {}) {
-    const safeHours = [1, 6, 12, 24].includes(Number(hours)) ? Number(hours) : 6;
+  topTrafficLogSites({ minutes = null, hours = null, limit = 10, sort = 'visits', now = Date.now() } = {}) {
+    const safeMinutes = trafficLogRetentionMinutes(minutes ?? (hours == null ? 60 : Number(hours) * 60));
     const safeLimit = Math.max(1, Math.min(25, Math.trunc(Number(limit) || 10)));
     const safeSort = sort === 'bytes' ? 'bytes' : 'visits';
     const orderBy = safeSort === 'bytes'
@@ -2199,7 +2971,7 @@ export class HotspotDatabase {
         total_bytes DESC,
         site ASC`;
     const endAt = Math.trunc(Number(now) || Date.now()) + 1;
-    const startAt = endAt - safeHours * 60 * 60 * 1000;
+    const startAt = endAt - safeMinutes * 60 * 1000;
     const bucketStartAt = minuteBucket(startAt);
     const rows = this.db.prepare(`
       SELECT site,
@@ -2236,7 +3008,8 @@ export class HotspotDatabase {
     `).get(bucketStartAt, endAt);
     return {
       source: 'traffic_rollups',
-      hours: safeHours,
+      minutes: safeMinutes,
+      hours: safeMinutes / 60,
       limit: safeLimit,
       sort: safeSort,
       startAt,
@@ -2268,11 +3041,11 @@ export class HotspotDatabase {
     return false;
   }
 
-  topTrafficLogClients({ hours = 6, limit = 10, networks = 'any', excludedInterfaces = [], now = Date.now() } = {}) {
-    const safeHours = [1, 6, 12, 24].includes(Number(hours)) ? Number(hours) : 6;
+  topTrafficLogClients({ minutes = null, hours = null, limit = 10, networks = 'any', excludedInterfaces = [], now = Date.now() } = {}) {
+    const safeMinutes = trafficLogRetentionMinutes(minutes ?? (hours == null ? 60 : Number(hours) * 60));
     const safeLimit = Math.max(1, Math.min(25, Math.trunc(Number(limit) || 10)));
     const endAt = Math.trunc(Number(now) || Date.now()) + 1;
-    const startAt = endAt - safeHours * 60 * 60 * 1000;
+    const startAt = endAt - safeMinutes * 60 * 1000;
     const bucketStartAt = minuteBucket(startAt);
     const blockedInterfaces = [...new Set(excludedInterfaces.map(value => String(value || '').trim().toLowerCase()).filter(Boolean))];
     const interfaceFilter = blockedInterfaces.length
@@ -2337,7 +3110,8 @@ export class HotspotDatabase {
       .slice(0, safeLimit);
     return {
       source: 'traffic_rollups',
-      hours: safeHours,
+      minutes: safeMinutes,
+      hours: safeMinutes / 60,
       limit: safeLimit,
       startAt,
       endAt,
@@ -2507,7 +3281,7 @@ export class HotspotDatabase {
       : Math.trunc(Number(now) || Date.now()) + 1;
     const window = hasCustomWindow
       ? { startAt: safeCustomStart, endAt: safeCustomEnd }
-      : (['hourly', '6h', '12h', 'daily', 'weekly', 'monthly'].includes(period)
+      : (['15m', '30m', '45m', '60m'].includes(period)
           ? this.trafficLogPeriod(period, now)
           : null);
     const safeOffset = Math.max(0, Math.trunc(Number(offset) || 0));
@@ -2615,21 +3389,41 @@ export class HotspotDatabase {
     };
   }
 
-  cleanupTrafficLogs(retentionDays, now = Date.now()) {
-    const days = Math.max(1, Math.trunc(Number(retentionDays) || 30));
-    const cutoff = Math.trunc(Number(now) || Date.now()) - days * 24 * 60 * 60 * 1000;
+  cleanupTrafficLogs(retentionMinutes, now = Date.now()) {
+    return this.cleanupTrafficLogsDetailed(retentionMinutes, now).deleted;
+  }
+
+  cleanupTrafficLogsDetailed(retentionMinutes, now = Date.now()) {
+    const minutes = trafficLogRetentionMinutes(retentionMinutes);
+    const cutoff = Math.trunc(Number(now) || Date.now()) - minutes * 60 * 1000;
     const bucketCutoff = minuteBucket(cutoff);
-    const deleted = Number(this.db.prepare('DELETE FROM traffic_logs WHERE created_at < ?')
-      .run(cutoff).changes);
-    this.db.prepare('DELETE FROM traffic_log_minute_rollups WHERE bucket_start_at < ?')
-      .run(bucketCutoff);
-    this.db.prepare('DELETE FROM traffic_log_client_minute_rollups WHERE bucket_start_at < ?')
-      .run(bucketCutoff);
-    this.db.prepare('DELETE FROM traffic_log_client_detail_minute_rollups WHERE bucket_start_at < ?')
-      .run(bucketCutoff);
-    this.db.prepare('DELETE FROM traffic_log_site_minute_rollups WHERE bucket_start_at < ?')
-      .run(bucketCutoff);
-    return deleted;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const deleted = Number(this.db.prepare('DELETE FROM traffic_logs WHERE created_at < ?')
+        .run(cutoff).changes);
+      const rollups = {
+        minute: Number(this.db.prepare('DELETE FROM traffic_log_minute_rollups WHERE bucket_start_at < ?')
+          .run(bucketCutoff).changes),
+        client: Number(this.db.prepare('DELETE FROM traffic_log_client_minute_rollups WHERE bucket_start_at < ?')
+          .run(bucketCutoff).changes),
+        clientDetail: Number(this.db.prepare('DELETE FROM traffic_log_client_detail_minute_rollups WHERE bucket_start_at < ?')
+          .run(bucketCutoff).changes),
+        site: Number(this.db.prepare('DELETE FROM traffic_log_site_minute_rollups WHERE bucket_start_at < ?')
+          .run(bucketCutoff).changes)
+      };
+      this.db.exec('COMMIT');
+      return {
+        retentionMinutes: minutes,
+        cutoff,
+        bucketCutoff,
+        deleted,
+        rollups,
+        deletedRollups: Object.values(rollups).reduce((sum, value) => sum + value, 0)
+      };
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch {}
+      throw error;
+    }
   }
 
   updateAuthorizationUsage(id, {
@@ -2798,7 +3592,7 @@ export class HotspotDatabase {
     );
     const effectiveResetAt = Math.max(0, Number(resetAt || 0));
     const flowStartedAt = effectiveResetAt ? Math.max(startedAt, effectiveResetAt) : startedAt;
-    const flowRow = this.db.prepare(`
+    const flowRow = this.syslogDb.prepare(`
       SELECT
         COALESCE(SUM(download_bytes), 0) download_bytes,
         COALESCE(SUM(upload_bytes), 0) upload_bytes,
@@ -2811,7 +3605,7 @@ export class HotspotDatabase {
         AND (subscriber_id=? OR subscriber_id IS NULL OR subscriber_id='')
     `).get(authorization.client_ip, flowStartedAt, endedBefore, subscriberId);
     const sessionRow = effectiveResetAt
-      ? this.db.prepare(`
+      ? this.syslogDb.prepare(`
         SELECT
           COALESCE(MAX(download_bytes), 0) download_bytes,
           COALESCE(MAX(upload_bytes), 0) upload_bytes,
@@ -2823,7 +3617,7 @@ export class HotspotDatabase {
           AND created_at < ?
           AND (subscriber_id=? OR subscriber_id IS NULL OR subscriber_id='')
       `).get(authorization.client_ip, effectiveResetAt, endedBefore, subscriberId)
-      : this.db.prepare(`
+      : this.syslogDb.prepare(`
         SELECT
           COALESCE(MAX(download_bytes), 0) download_bytes,
           COALESCE(MAX(upload_bytes), 0) upload_bytes,
@@ -3130,14 +3924,14 @@ export class HotspotDatabase {
     let inserted = 0;
     let skipped = 0;
     let lastHash = this.latestLaw5651Hash();
-    this.db.exec('BEGIN IMMEDIATE');
+    this.syslogDb.exec('BEGIN IMMEDIATE');
     try {
       for (const input of records) {
         if (!input?.dedupeKey || !input.clientIp || !input.sourceIp || !input.startedAt) {
           skipped += 1;
           continue;
         }
-        const exists = this.db.prepare('SELECT 1 FROM law5651_logs WHERE dedupe_key=?')
+        const exists = this.syslogDb.prepare('SELECT 1 FROM law5651_logs WHERE dedupe_key=?')
           .get(input.dedupeKey);
         if (exists) {
           skipped += 1;
@@ -3174,7 +3968,7 @@ export class HotspotDatabase {
           createdAt
         };
         const recordHash = sha256Hex(law5651HashPayload(record, previousHash));
-        this.db.prepare(`
+        this.syslogDb.prepare(`
           INSERT INTO law5651_logs
             (id, dedupe_key, kind, source, network, client_ip, client_mac, subscriber_id,
              source_ip, source_port, destination_ip, destination_port, protocol, service_type,
@@ -3208,22 +4002,22 @@ export class HotspotDatabase {
         lastHash = recordHash;
         inserted += 1;
       }
-      this.db.exec('COMMIT');
+      this.syslogDb.exec('COMMIT');
     } catch (error) {
-      try { this.db.exec('ROLLBACK'); } catch {}
+      try { this.syslogDb.exec('ROLLBACK'); } catch {}
       throw error;
     }
     return { inserted, skipped, lastHash };
   }
 
   latestLaw5651Hash() {
-    return this.db.prepare(`
+    return this.syslogDb.prepare(`
       SELECT record_hash FROM law5651_logs ORDER BY sequence DESC LIMIT 1
     `).get()?.record_hash || '';
   }
 
   latestLaw5651EventHash() {
-    return this.db.prepare(`
+    return this.syslogDb.prepare(`
       SELECT event_hash FROM law5651_events ORDER BY rowid DESC LIMIT 1
     `).get()?.event_hash || '';
   }
@@ -3249,7 +4043,7 @@ export class HotspotDatabase {
     const previousHash = this.latestLaw5651EventHash() || '0'.repeat(64);
     const eventHash = sha256Hex(law5651EventHashPayload(event, previousHash));
     const id = randomUUID();
-    this.db.prepare(`
+    this.syslogDb.prepare(`
       INSERT INTO law5651_events
         (id, event_type, severity, message, detail_json, previous_hash, event_hash, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -3263,7 +4057,7 @@ export class HotspotDatabase {
       eventHash,
       event.createdAt
     );
-    return this.db.prepare('SELECT * FROM law5651_events WHERE id=?').get(id);
+    return this.syslogDb.prepare('SELECT * FROM law5651_events WHERE id=?').get(id);
   }
 
   listLaw5651Events({
@@ -3290,9 +4084,9 @@ export class HotspotDatabase {
     }
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const direction = order === 'asc' ? 'ASC' : 'DESC';
-    const total = this.db.prepare(`SELECT COUNT(*) count FROM law5651_events ${clause}`)
+    const total = this.syslogDb.prepare(`SELECT COUNT(*) count FROM law5651_events ${clause}`)
       .get(...params);
-    const rows = this.db.prepare(`
+    const rows = this.syslogDb.prepare(`
       SELECT * FROM law5651_events ${clause}
       ORDER BY created_at ${direction}, id ${direction} LIMIT ? OFFSET ?
     `).all(...params, Math.max(1, Math.trunc(Number(limit) || 1000)), Math.max(0, Math.trunc(Number(offset) || 0)));
@@ -3309,7 +4103,7 @@ export class HotspotDatabase {
     createdAt = Date.now()
   }) {
     const id = randomUUID();
-    this.db.prepare(`
+    this.syslogDb.prepare(`
       INSERT INTO law5651_backups
         (id, export_id, target_directory, status, error, file_count, total_bytes, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -3323,18 +4117,18 @@ export class HotspotDatabase {
       Math.max(0, Math.trunc(Number(totalBytes) || 0)),
       Math.trunc(Number(createdAt) || Date.now())
     );
-    return this.db.prepare('SELECT * FROM law5651_backups WHERE id=?').get(id);
+    return this.syslogDb.prepare('SELECT * FROM law5651_backups WHERE id=?').get(id);
   }
 
   listLaw5651Backups({ limit = 20, exportId = '' } = {}) {
     if (exportId) {
-      return this.db.prepare(`
+      return this.syslogDb.prepare(`
         SELECT * FROM law5651_backups
         WHERE export_id=?
         ORDER BY created_at DESC LIMIT ?
       `).all(exportId, Math.max(1, Math.trunc(Number(limit) || 20)));
     }
-    return this.db.prepare(`
+    return this.syslogDb.prepare(`
       SELECT * FROM law5651_backups
       ORDER BY created_at DESC LIMIT ?
     `).all(Math.max(1, Math.trunc(Number(limit) || 20)));
@@ -3347,7 +4141,7 @@ export class HotspotDatabase {
     backupStatus = null,
     backupError = null
   } = {}) {
-    return Number(this.db.prepare(`
+    return Number(this.syslogDb.prepare(`
       UPDATE law5651_exports SET
         signature_path=COALESCE(?, signature_path),
         signature_status=COALESCE(?, signature_status),
@@ -3366,12 +4160,12 @@ export class HotspotDatabase {
   }
 
   getLaw5651State(key) {
-    return this.db.prepare('SELECT key, value, updated_at FROM law5651_state WHERE key=?')
+    return this.syslogDb.prepare('SELECT key, value, updated_at FROM law5651_state WHERE key=?')
       .get(key) || null;
   }
 
   setLaw5651State(key, value, updatedAt = Date.now()) {
-    this.db.prepare(`
+    this.syslogDb.prepare(`
       INSERT INTO law5651_state(key, value, updated_at)
       VALUES (?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
@@ -3380,32 +4174,32 @@ export class HotspotDatabase {
   }
 
   law5651Summary() {
-    const summary = this.db.prepare(`
+    const summary = this.syslogDb.prepare(`
       SELECT COUNT(*) count, MIN(created_at) first_created_at, MAX(created_at) last_created_at,
         COALESCE(SUM(download_bytes), 0) download_bytes,
         COALESCE(SUM(upload_bytes), 0) upload_bytes
       FROM law5651_logs
     `).get();
-    const last = this.db.prepare(`
+    const last = this.syslogDb.prepare(`
       SELECT sequence, record_hash, created_at FROM law5651_logs ORDER BY sequence DESC LIMIT 1
     `).get() || null;
-    const lastExport = this.db.prepare(`
+    const lastExport = this.syslogDb.prepare(`
       SELECT * FROM law5651_exports ORDER BY created_at DESC LIMIT 1
     `).get() || null;
-    const events = this.db.prepare(`
+    const events = this.syslogDb.prepare(`
       SELECT COUNT(*) count,
         SUM(CASE WHEN severity IN ('warning', 'error', 'critical') THEN 1 ELSE 0 END) alert_count
       FROM law5651_events
     `).get();
-    const lastEvent = this.db.prepare(`
+    const lastEvent = this.syslogDb.prepare(`
       SELECT * FROM law5651_events ORDER BY rowid DESC LIMIT 1
     `).get() || null;
-    const lastAlert = this.db.prepare(`
+    const lastAlert = this.syslogDb.prepare(`
       SELECT * FROM law5651_events
       WHERE severity IN ('warning', 'error', 'critical')
       ORDER BY rowid DESC LIMIT 1
     `).get() || null;
-    const lastBackup = this.db.prepare(`
+    const lastBackup = this.syslogDb.prepare(`
       SELECT * FROM law5651_backups ORDER BY created_at DESC LIMIT 1
     `).get() || null;
     return {
@@ -3498,9 +4292,9 @@ export class HotspotDatabase {
     }
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const direction = order === 'asc' ? 'ASC' : 'DESC';
-    const total = this.db.prepare(`SELECT COUNT(*) count FROM law5651_logs ${clause}`)
+    const total = this.syslogDb.prepare(`SELECT COUNT(*) count FROM law5651_logs ${clause}`)
       .get(...params);
-    const rows = this.db.prepare(`
+    const rows = this.syslogDb.prepare(`
       SELECT * FROM law5651_logs ${clause}
       ORDER BY sequence ${direction} LIMIT ? OFFSET ?
     `).all(...params, limit, offset);
@@ -3540,7 +4334,7 @@ export class HotspotDatabase {
         Number.isFinite(lastSequence) &&
         firstSequence > 0 &&
         lastSequence >= firstSequence) {
-      const current = this.db.prepare(`
+      const current = this.syslogDb.prepare(`
         SELECT COUNT(*) count
         FROM law5651_logs
         WHERE sequence BETWEEN ? AND ?
@@ -3550,7 +4344,7 @@ export class HotspotDatabase {
       if (Number(current?.count || 0) > recordCount) return null;
       return { firstSequence, lastSequence, firstCreatedAt, lastCreatedAt };
     }
-    const current = this.db.prepare(`
+    const current = this.syslogDb.prepare(`
       SELECT COUNT(*) count, MIN(sequence) first_sequence, MAX(sequence) last_sequence
       FROM law5651_logs
       WHERE created_at >= ?
@@ -3591,7 +4385,7 @@ export class HotspotDatabase {
     const allowedReasons = [...new Set(reasons.map(reason => String(reason || '').trim()).filter(Boolean))];
     if (!allowedReasons.length) return 0;
     const placeholders = allowedReasons.map(() => '?').join(', ');
-    const exports = this.db.prepare(`
+    const exports = this.syslogDb.prepare(`
       SELECT *
       FROM law5651_exports
       WHERE export_reason IN (${placeholders})
@@ -3602,19 +4396,19 @@ export class HotspotDatabase {
       ORDER BY first_created_at ASC, last_created_at ASC, created_at ASC
     `).all(...allowedReasons, cutoff);
     let deleted = 0;
-    this.db.exec('BEGIN IMMEDIATE');
+    this.syslogDb.exec('BEGIN IMMEDIATE');
     try {
       for (const row of exports) {
         const range = this.law5651ExportCleanupRange(row, { requireTimestamp, requireBackup });
         if (!range) continue;
         if (range.derivedSequence) {
-          this.db.prepare(`
+          this.syslogDb.prepare(`
             UPDATE law5651_exports
             SET first_sequence=?, last_sequence=?
             WHERE id=?
           `).run(range.firstSequence, range.lastSequence, row.id);
         }
-        const result = this.db.prepare(`
+        const result = this.syslogDb.prepare(`
           DELETE FROM law5651_logs
           WHERE sequence BETWEEN ? AND ?
             AND created_at >= ?
@@ -3629,9 +4423,9 @@ export class HotspotDatabase {
         );
         deleted += Number(result.changes || 0);
       }
-      this.db.exec('COMMIT');
+      this.syslogDb.exec('COMMIT');
     } catch (error) {
-      try { this.db.exec('ROLLBACK'); } catch {}
+      try { this.syslogDb.exec('ROLLBACK'); } catch {}
       throw error;
     }
     return deleted;
@@ -3663,7 +4457,7 @@ export class HotspotDatabase {
     backupError = ''
   }) {
     const id = randomUUID();
-    this.db.prepare(`
+    this.syslogDb.prepare(`
       INSERT INTO law5651_exports
         (id, export_reason, period_start_at, period_end_at,
          file_path, manifest_path, timestamp_request_path, timestamp_token_path,
@@ -3700,19 +4494,19 @@ export class HotspotDatabase {
       backupError || null,
       Date.now()
     );
-    return this.db.prepare('SELECT * FROM law5651_exports WHERE id=?').get(id);
+    return this.syslogDb.prepare('SELECT * FROM law5651_exports WHERE id=?').get(id);
   }
 
   latestLaw5651Export({ reason = '' } = {}) {
     if (reason) {
-      return this.db.prepare(`
+      return this.syslogDb.prepare(`
         SELECT * FROM law5651_exports
         WHERE export_reason=?
         ORDER BY COALESCE(period_end_at, created_at) DESC, created_at DESC
         LIMIT 1
       `).get(reason) || null;
     }
-    return this.db.prepare(`
+    return this.syslogDb.prepare(`
       SELECT * FROM law5651_exports ORDER BY created_at DESC LIMIT 1
     `).get() || null;
   }
@@ -3725,7 +4519,7 @@ export class HotspotDatabase {
       : [];
     if (values.length) {
       const placeholders = values.map(() => '?').join(', ');
-      return this.db.prepare(`
+      return this.syslogDb.prepare(`
         SELECT *
         FROM law5651_exports
         WHERE export_reason IN (${placeholders})
@@ -3733,7 +4527,7 @@ export class HotspotDatabase {
         LIMIT ?
       `).all(...values, safeLimit);
     }
-    return this.db.prepare(`
+    return this.syslogDb.prepare(`
       SELECT *
       FROM law5651_exports
       ORDER BY COALESCE(period_end_at, created_at) ${direction}, created_at ${direction}
@@ -3741,8 +4535,28 @@ export class HotspotDatabase {
     `).all(safeLimit);
   }
 
+  listExpiredLaw5651Exports({ cutoff, reasons = [], limit = 50000 } = {}) {
+    const safeCutoff = Math.trunc(Number(cutoff));
+    if (!Number.isFinite(safeCutoff)) return [];
+    const safeLimit = Math.max(1, Math.min(50000, Math.trunc(Number(limit) || 50000)));
+    const values = Array.isArray(reasons)
+      ? reasons.map(reason => String(reason || '').trim()).filter(Boolean)
+      : [];
+    const reasonClause = values.length
+      ? `AND export_reason IN (${values.map(() => '?').join(', ')})`
+      : '';
+    return this.syslogDb.prepare(`
+      SELECT *
+      FROM law5651_exports
+      WHERE COALESCE(period_end_at, last_created_at, created_at) < ?
+        ${reasonClause}
+      ORDER BY COALESCE(period_end_at, last_created_at, created_at) ASC, created_at ASC
+      LIMIT ?
+    `).all(safeCutoff, ...values, safeLimit);
+  }
+
   findLaw5651ExportByPeriod({ reason = 'auto', periodStartAt, periodEndAt }) {
-    return this.db.prepare(`
+    return this.syslogDb.prepare(`
       SELECT * FROM law5651_exports
       WHERE export_reason=? AND period_start_at=? AND period_end_at=?
       ORDER BY created_at DESC

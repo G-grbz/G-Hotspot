@@ -13,7 +13,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/USER/g-hotspot/data
+ReadWritePaths=/home/USER/g-hotspot/data /home/USER/g-hotspot/android/app
 
 [Install]
 WantedBy=default.target

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { projectAbout } from '../src/about.js';
 
-test('project about metadata exposes AGPL license and attribution', () => {
+test('project about metadata exposes LicenseRef-G-Hotspot-NC-1.0 license and attribution', () => {
   const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   const about = projectAbout();
 
@@ -19,15 +19,16 @@ test('project about metadata exposes AGPL license and attribution', () => {
   assert.equal(about.source, 'https://github.com/G-grbz');
 });
 
-test('license and notice files preserve AGPL attribution', () => {
+test('license and notice files preserve LicenseRef-G-Hotspot-NC-1.0 attribution', () => {
   const license = fs.readFileSync(new URL('../LICENSE', import.meta.url), 'utf8');
   const notice = fs.readFileSync(new URL('../NOTICE', import.meta.url), 'utf8');
 
-  assert.match(license, /GNU AFFERO GENERAL PUBLIC LICENSE/u);
-  assert.match(license, /G-Hotspot contributors/u);
+  assert.match(license, /G-Hotspot Noncommercial Source-Available License 1\.0/u);
+  assert.match(license, /Copyright © 2026 G-grbz/u);
+  assert.match(license, /Commercial Use Is Prohibited/u);
   assert.match(notice, /G-Hotspot/u);
   assert.match(notice, /Gökhan GÜRBÜZ/u);
   assert.match(notice, /G-grbz/u);
   assert.match(notice, /https:\/\/github\.com\/G-grbz/u);
-  assert.match(notice, /AGPL-3\.0-only/u);
+  assert.match(notice, /LicenseRef-G-Hotspot-NC-1\.0/u);
 });

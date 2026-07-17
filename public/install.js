@@ -22,6 +22,8 @@ const verificationGroups = [
 const optionLabels = {
   mock: 'Mock / test',
   'opnsense-api': 'OPNsense API',
+  // TODO(pfSense): Restore the pfSense option label when its installer option is enabled.
+  // 'pfsense-api': 'pfSense API',
   netgsm: 'Netgsm',
   iletimerkezi: 'İleti Merkezi',
   twilio: 'Twilio',
@@ -318,6 +320,7 @@ function applySettingsDefaults() {
   setInputValue('#adminUsername', values.ADMIN_USERNAME || 'admin');
   setInputValue('#adminSessionHours', values.ADMIN_SESSION_HOURS || '12');
   setInputValue('#opnsenseBaseUrl', values.OPNSENSE_BASE_URL || '');
+  // TODO(pfSense): Restore the captive portal URL default when its field is enabled.
   setInputValue('#opnsenseZoneId', values.OPNSENSE_ZONE_ID || '0');
   setInputValue('#opnsenseApiKey', values.OPNSENSE_API_KEY || '');
   setInputValue('#opnsenseApiSecret', values.OPNSENSE_API_SECRET || '');
@@ -326,8 +329,11 @@ function applySettingsDefaults() {
 }
 
 function opnsenseSignature() {
+  const mode = selectedGatewayMode();
   return JSON.stringify({
+    mode,
     baseUrl: $('#opnsenseBaseUrl').value.trim(),
+    // TODO(pfSense): Add captivePortalUrl back to this signature when support resumes.
     zoneId: $('#opnsenseZoneId').value.trim(),
     apiKey: $('#opnsenseApiKey').value.trim(),
     apiSecret: $('#opnsenseApiSecret').value,
@@ -342,11 +348,11 @@ function resetOpnsenseTest() {
   state.gatewayNetworks = null;
   renderGatewayNetworkChoices({
     choices: [],
-    error: selectedGatewayMode() === 'opnsense-api'
+    error: selectedGatewayMode() !== 'mock'
       ? 'Run a successful connection test to continue.'
       : ''
   });
-  if (selectedGatewayMode() === 'opnsense-api') {
+  if (selectedGatewayMode() !== 'mock') {
     setTestStatus(t('Run a successful connection test to continue.'));
   } else {
     setTestStatus('');
@@ -355,12 +361,15 @@ function resetOpnsenseTest() {
 }
 
 function syncGatewayMode() {
-  const opnsense = selectedGatewayMode() === 'opnsense-api';
-  $('#opnsenseFields').classList.toggle('hidden', !opnsense);
+  const mode = selectedGatewayMode();
+  const realGateway = mode !== 'mock';
+  $('#opnsenseFields').classList.toggle('hidden', !realGateway);
+  $('#opnsenseZoneFields').classList.toggle('hidden', !realGateway);
+  // TODO(pfSense): Restore the provider-specific portal URL row toggle.
   for (const selector of ['#opnsenseBaseUrl', '#opnsenseApiKey', '#opnsenseApiSecret']) {
-    $(selector).required = opnsense;
+    $(selector).required = realGateway;
   }
-  $('[data-step-indicator="2"]').classList.toggle('disabled', !opnsense);
+  $('[data-step-indicator="2"]').classList.toggle('disabled', mode === 'mock');
   resetOpnsenseTest();
   syncActions();
 }
@@ -385,20 +394,20 @@ function renderGatewayNetworkChoices(payload = {}) {
       : '';
     return;
   }
-  target.innerHTML = `<span>${escapeHtml(t('OPNsense networks'))}</span>${choices.map(choice =>
+  target.innerHTML = `<span>${escapeHtml(t('Gateway networks'))}</span>${choices.map(choice =>
     `<button class="network-choice" type="button" data-network-choice="${escapeHtml(choice.network)}" title="${escapeHtml(choice.label)}">${escapeHtml(choice.network)}</button>`
   ).join('')}`;
 }
 
 async function loadGatewayNetworks() {
-  if (selectedGatewayMode() !== 'opnsense-api' || !state.opnsenseTestOk) return;
+  if (selectedGatewayMode() === 'mock' || !state.opnsenseTestOk) return;
   if (state.gatewayNetworks) {
     renderGatewayNetworkChoices(state.gatewayNetworks);
     return;
   }
   renderGatewayNetworkChoices({
     choices: [],
-    error: 'Loading OPNsense networks…'
+    error: 'Loading gateway networks…'
   });
   try {
     state.gatewayNetworks = await api('/api/install/gateway/networks', {
@@ -409,7 +418,7 @@ async function loadGatewayNetworks() {
   } catch {
     renderGatewayNetworkChoices({
       choices: [],
-      error: 'OPNsense networks could not be discovered automatically. You can enter networks manually.'
+      error: 'Gateway networks could not be discovered automatically. You can enter networks manually.'
     });
   }
 }
@@ -496,9 +505,9 @@ function validateStep(step = state.currentStep, { requireOpnsenseTest = true } =
       return false;
     }
   }
-  if (requireOpnsenseTest && step === 1 && selectedGatewayMode() === 'opnsense-api') {
+  if (requireOpnsenseTest && step === 1 && selectedGatewayMode() !== 'mock') {
     if (!state.opnsenseTestOk || state.opnsenseTestedSignature !== opnsenseSignature()) {
-      showNotice(t('Test OPNsense connection before continuing.'));
+      showNotice(t('Test gateway connection before continuing.'));
       return false;
     }
   }
@@ -527,6 +536,7 @@ function syncActions() {
   const onGateway = state.currentStep === 1;
   const onVerification = state.currentStep === 2;
   const mockGatewayFinish = onGateway && mode === 'mock';
+  const realGateway = mode !== 'mock';
 
   $('#backButton').classList.toggle('hidden', onApplication);
   $('#skipFinishButton').classList.toggle('hidden', !onVerification);
@@ -534,7 +544,7 @@ function syncActions() {
   $('#installButton').classList.toggle('hidden', !(mockGatewayFinish || onVerification));
   $('#installButton').dataset.includeOptional = onVerification ? 'true' : 'false';
   $('#nextButton').disabled = state.submitting ||
-    (onGateway && mode === 'opnsense-api' && (!state.opnsenseTestOk || state.opnsenseTestedSignature !== opnsenseSignature()));
+    (onGateway && realGateway && (!state.opnsenseTestOk || state.opnsenseTestedSignature !== opnsenseSignature()));
   $('#installButton').disabled = state.submitting;
   $('#backButton').disabled = state.submitting;
   $('#skipFinishButton').disabled = state.submitting;
@@ -567,8 +577,9 @@ function baseSettings() {
     OPNSENSE_TLS_REJECT_UNAUTHORIZED: $('#opnsenseTls').checked
   };
 
-  if (settings.GATEWAY_MODE === 'opnsense-api') {
+  if (settings.GATEWAY_MODE !== 'mock') {
     settings.OPNSENSE_BASE_URL = $('#opnsenseBaseUrl').value;
+    // TODO(pfSense): Restore OPNSENSE_CAPTIVE_PORTAL_URL when support resumes.
     settings.OPNSENSE_API_KEY = $('#opnsenseApiKey').value;
     settings.OPNSENSE_API_SECRET = $('#opnsenseApiSecret').value;
   }
@@ -578,7 +589,7 @@ function baseSettings() {
 function optionalSettings() {
   normalizeSmtpTlsFields();
   const settings = {};
-  if (selectedGatewayMode() === 'opnsense-api') {
+  if (selectedGatewayMode() !== 'mock') {
     settings.OPNSENSE_ZONE_MAP = $('#opnsenseZoneMap').value;
   }
 
@@ -636,11 +647,12 @@ async function submitInstall(event, { includeOptional = null, button = null } = 
 async function testOpnsenseConnection() {
   clearNotice();
   if (!validateStep(1, { requireOpnsenseTest: false })) return;
+  const mode = selectedGatewayMode();
   const button = $('#testOpnsenseButton');
   const previousText = button.textContent;
   button.disabled = true;
   button.textContent = t('Testing...');
-  setTestStatus(t('Testing OPNsense connection...'));
+  setTestStatus(t('Testing gateway connection...'));
   state.opnsenseTestOk = false;
   state.opnsenseTestedSignature = '';
   syncActions();
@@ -653,13 +665,14 @@ async function testOpnsenseConnection() {
     });
     state.opnsenseTestOk = true;
     state.opnsenseTestedSignature = signature;
-    setTestStatus(t('OPNsense connection test succeeded for zone {zone}.', {
+    setTestStatus(t('Gateway connection test succeeded for zone {zone}.', {
       zone: String(result.zoneId ?? $('#opnsenseZoneId').value)
     }), 'success');
     void loadGatewayNetworks();
     clearNotice();
   } catch (error) {
-    setTestStatus(t(error.message || 'OPNsense connection test failed.'), 'error');
+    const message = t(error.message || 'Gateway connection test failed.');
+    setTestStatus(message, 'error');
   } finally {
     button.disabled = false;
     button.textContent = previousText;
@@ -673,7 +686,7 @@ function nextStep() {
     goToStep(1);
     return;
   }
-  if (state.currentStep === 1 && selectedGatewayMode() === 'opnsense-api') {
+  if (state.currentStep === 1 && selectedGatewayMode() !== 'mock') {
     goToStep(2);
   }
 }
@@ -687,7 +700,14 @@ function bindEvents() {
   $$('#installForm input[name="GATEWAY_MODE"]').forEach(input =>
     input.addEventListener('change', syncGatewayMode)
   );
-  for (const selector of ['#opnsenseBaseUrl', '#opnsenseZoneId', '#opnsenseApiKey', '#opnsenseApiSecret', '#opnsenseTls']) {
+  for (const selector of [
+    '#opnsenseBaseUrl',
+    // TODO(pfSense): Restore '#opnsenseCaptivePortalUrl' with its installer field.
+    '#opnsenseZoneId',
+    '#opnsenseApiKey',
+    '#opnsenseApiSecret',
+    '#opnsenseTls'
+  ]) {
     $(selector).addEventListener('input', resetOpnsenseTest);
     $(selector).addEventListener('change', resetOpnsenseTest);
   }
@@ -705,8 +725,15 @@ function bindEvents() {
   $('#installForm').addEventListener('submit', submitInstall);
 }
 
+async function preloadInstallFont() {
+  if (!document.fonts?.load) return;
+  const sample = 'G-Hotspot ABCÇĞİÖŞÜ abcçğıöşü 0123456789';
+  await document.fonts.load('400 1em "Inter"', sample).catch(() => []);
+}
+
 async function init() {
   await i18n.ready;
+  await preloadInstallFont();
   await i18n.setAutomaticLanguage('en', 'gh_install_language');
   $('#installLanguage').value = i18n.language;
   $('#defaultLanguage').value = i18n.language;

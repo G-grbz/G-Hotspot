@@ -6,14 +6,15 @@
   <meta name="color-scheme" content="light dark">
   <title>G-Hotspot Administration</title>
   <link rel="icon" href="/img/favicon.ico" sizes="any">
-  <link rel="stylesheet" href="/admin/admin.css?v=1.0.0">
+  <link rel="stylesheet" href="/fonts.css?v=1.1.0">
+  <link rel="stylesheet" href="/admin/admin.css?v=1.1.0">
 </head>
 <body class="i18n-loading">
   <section id="loginScreen" class="login-screen">
     <div class="login-visual">
       <div class="login-visual__content">
         <div class="signal-orbit"><span></span><span></span><span></span><b>G</b></div>
-        <p class="overline">OPNsense Captive Portal</p>
+        <p class="overline">Captive Portal Gateway</p>
         <h1><span>Your entire network,</span><br><span>in one screen.</span></h1>
         <p>Verify guest access, generate vouchers and monitor network usage in detail.</p>
         <div class="login-stats">
@@ -38,7 +39,7 @@
         <label for="loginUsername">Username</label>
         <div class="input-wrap">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 21a8 8 0 0 0-16 0M12 13a5 5 0 1 0 0-10 5 5 0 0 0 0 10Z"/></svg>
-          <input id="loginUsername" name="username" autocomplete="username" value="admin" required>
+          <input id="loginUsername" name="username" autocomplete="username" required>
         </div>
         <label for="loginPassword">Password</label>
         <div class="input-wrap">
@@ -97,7 +98,7 @@
       <div class="sidebar__bottom">
         <div class="gateway-card">
           <span class="status-dot"></span>
-          <div><strong>OPNsense Gateway</strong><span id="gatewayMode">Connecting…</span></div>
+          <div><strong id="gatewayProviderName">Gateway</strong><span id="gatewayMode">Connecting…</span></div>
         </div>
         <button id="sidebarToggle" class="sidebar-toggle" type="button" aria-label="Collapse sidebar" title="Collapse sidebar" aria-pressed="false">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
@@ -146,7 +147,7 @@
               <path d="M20 11a8 8 0 0 0-14.9-4M4 4v5h5"/>
               <path d="M4 13a8 8 0 0 0 14.9 4M20 20v-5h-5"/>
             </svg>
-            <span>Sync OPNsense</span>
+            <span id="syncButtonLabel">Sync Gateway</span>
           </button>
           <div class="admin-profile">
             <button id="releaseStatusButton" class="avatar release-avatar" type="button" aria-label="Check for updates" title="Check for updates">
@@ -239,17 +240,22 @@
               <div id="methodDonut" class="donut-wrap"></div>
               <div id="methodLegend" class="method-legend"></div>
             </article>
+            <article class="panel-card method-card device-os-card">
+              <div class="panel-head"><div><h3>Device OS distribution</h3><p>Active connected devices</p></div></div>
+              <div id="deviceOsDonut" class="donut-wrap"></div>
+              <div id="deviceOsLegend" class="device-os-legend"></div>
+            </article>
           </div>
 
           <div class="traffic-insights-grid">
             <article class="panel-card method-card top-sites-card">
               <div class="panel-head">
-                <div><h3>Top visited sites</h3><p id="topSitesSubtitle">Last 6 hours</p></div>
+                <div><h3>Top visited sites</h3><p id="topSitesSubtitle">Last 1 hour</p></div>
                 <select id="topSitesRange" name="topSitesRange" class="period-select compact-select">
-                  <option value="1">1 hour</option>
-                  <option value="6" selected>6 hours</option>
-                  <option value="12">12 hours</option>
-                  <option value="24">24 hours</option>
+                  <option value="15">15 minutes</option>
+                  <option value="30">30 minutes</option>
+                  <option value="45">45 minutes</option>
+                  <option value="60" selected>1 hour</option>
                 </select>
               </div>
               <div id="topSitesDonut" class="donut-wrap site-donut"></div>
@@ -258,12 +264,12 @@
 
             <article class="panel-card method-card top-sites-card">
               <div class="panel-head">
-                <div><h3>Top local download / upload clients</h3><p id="topBandwidthSubtitle">Last 6 hours</p></div>
+                <div><h3>Top local download / upload clients</h3><p id="topBandwidthSubtitle">Last 1 hour</p></div>
                 <select id="topBandwidthRange" name="topBandwidthRange" class="period-select compact-select">
-                  <option value="1">1 hour</option>
-                  <option value="6" selected>6 hours</option>
-                  <option value="12">12 hours</option>
-                  <option value="24">24 hours</option>
+                  <option value="15">15 minutes</option>
+                  <option value="30">30 minutes</option>
+                  <option value="45">45 minutes</option>
+                  <option value="60" selected>1 hour</option>
                 </select>
               </div>
               <div id="topBandwidthDonut" class="donut-wrap site-donut"></div>
@@ -272,14 +278,12 @@
 
             <article class="panel-card chart-card traffic-usage-card">
               <div class="panel-head">
-                <div><h3>Download / upload traffic</h3><p id="trafficChartSubtitle">Hourly traffic for today</p></div>
+                <div><h3>Download / upload traffic</h3><p id="trafficChartSubtitle">Traffic for the last 1 hour</p></div>
                 <select id="trafficPeriod" name="trafficPeriod" class="period-select">
-                  <option value="hourly">Hourly</option>
-                  <option value="6h">6 hours</option>
-                  <option value="12h">12 hours</option>
-                  <option value="daily">Daily</option>
-                  <option value="weekly">Weekly</option>
-                  <option value="monthly">Monthly</option>
+                  <option value="15m">15 minutes</option>
+                  <option value="30m">30 minutes</option>
+                  <option value="45m">45 minutes</option>
+                  <option value="60m" selected>1 hour</option>
                 </select>
               </div>
               <div id="trafficSummary" class="traffic-summary"></div>
@@ -369,10 +373,10 @@
               <label for="trafficLogStartAt"><span>Start time</span><input id="trafficLogStartAt" name="trafficLogStartAt" type="datetime-local"></label>
               <label for="trafficLogEndAt"><span>End time</span><input id="trafficLogEndAt" name="trafficLogEndAt" type="datetime-local"></label>
             </div>
-            <select id="trafficLogPeriod" name="trafficLogPeriod"><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select>
+            <select id="trafficLogPeriod" name="trafficLogPeriod"><option value="15m">15 minutes</option><option value="30m">30 minutes</option><option value="45m">45 minutes</option><option value="60m" selected>1 hour</option></select>
             <select id="trafficLogKind" name="trafficLogKind"><option value="">All traffic</option><option value="session">Session snapshots</option><option value="flow">Firewall flows</option></select>
             <div class="traffic-log-actions">
-              <a id="trafficLogsExport" class="secondary-button" href="/api/admin/export/traffic-logs.csv?period=daily"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>Download CSV</a>
+              <a id="trafficLogsExport" class="secondary-button" href="/api/admin/export/traffic-logs.csv?period=60m"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>Download CSV</a>
               <button id="trafficLogStreamToggleButton" class="icon-button traffic-log-stream-button" type="button" aria-label="Pause live traffic logs" title="Pause live traffic logs" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg></button>
               <button id="trafficLogSettingsButton" class="icon-button traffic-log-settings-button" type="button" aria-label="Traffic log settings" title="Traffic log settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <circle cx="12" cy="12" r="3"/>
@@ -403,8 +407,13 @@
                     <span>Keep operational traffic logs</span>
                   </label>
                   <div class="setting-field">
-                    <label for="trafficLogsRetentionDays">Retention period (days)</label>
-                    <input id="trafficLogsRetentionDays" name="trafficLogsRetentionDays" type="number" min="1" max="365" value="30">
+                    <label for="trafficLogsRetentionMinutes">Retention period</label>
+                    <select id="trafficLogsRetentionMinutes" name="trafficLogsRetentionMinutes">
+                      <option value="15">15 minutes</option>
+                      <option value="30">30 minutes</option>
+                      <option value="45">45 minutes</option>
+                      <option value="60">1 hour</option>
+                    </select>
                   </div>
                   <label class="switch-field" for="trafficLogsResolveDomains">
                     <input id="trafficLogsResolveDomains" name="trafficLogsResolveDomains" type="checkbox">
@@ -416,6 +425,7 @@
                   </div>
                 </div>
                 <div class="settings-footer">
+                  <button id="trafficLogVacuumButton" class="secondary-button" type="button">Compact database</button>
                   <button id="saveTrafficLogSettings" class="primary-button" type="submit">Save log settings</button>
                 </div>
               </form>
@@ -428,8 +438,8 @@
             <article class="panel-card template-builder-card">
               <form id="opnsenseTemplateForm">
                 <div class="settings-header">
-                  <h2>OPNsense captive portal template</h2>
-                  <p>index.html</p>
+                  <h2 id="opnsenseTemplateHeading">OPNsense captive portal template</h2>
+                  <p id="opnsenseTemplateEntryName">index.html</p>
                 </div>
                 <div class="template-builder-fields">
                   <div class="setting-field">
@@ -440,7 +450,7 @@
                   <div class="setting-field">
                     <label for="opnsenseTemplateTitle">Page title</label>
                     <input id="opnsenseTemplateTitle" name="title" maxlength="120" required>
-                    <small>Shown in the browser tab while OPNsense is redirecting the guest.</small>
+                    <small>Shown in the browser tab while the gateway is redirecting the guest.</small>
                   </div>
                   <div class="setting-field full">
                     <label for="opnsenseTemplateTargetUrl">Redirect URL</label>
@@ -455,7 +465,7 @@
                   <div class="setting-field full">
                     <label for="opnsenseTemplateRedirectText">Redirect paragraph</label>
                     <textarea id="opnsenseTemplateRedirectText" name="redirectText" maxlength="500" required></textarea>
-                    <small>Shown as the first message on the OPNsense redirect page.</small>
+                    <small>Shown as the first message on the gateway redirect page.</small>
                   </div>
                   <div class="setting-field full">
                     <label for="opnsenseTemplateLinkText">Link text</label>
@@ -479,7 +489,7 @@
             </article>
             <article class="panel-card template-preview-card">
               <div class="panel-head">
-                <div><h3>index.html preview</h3><p>opnsense-captiveportal-template.zip</p></div>
+                <div><h3 id="opnsenseTemplatePreviewHeading">index.html preview</h3><p id="opnsenseTemplateArchiveName">opnsense-captiveportal-template.zip</p></div>
               </div>
               <div class="template-browser-preview">
                 <div class="template-browser-preview__bar"><span></span><span></span><span></span></div>
@@ -711,7 +721,7 @@
   </div>
 
   <div id="toastRegion" class="toast-region" aria-live="polite"></div>
-  <script src="/i18n.js?v=1.0.1"></script>
-  <script src="/admin/admin.js?v=1.0.1" defer></script>
+  <script src="/i18n.js?v=1.1.0"></script>
+  <script src="/admin/admin.js?v=1.1.0" defer></script>
 </body>
 </html>

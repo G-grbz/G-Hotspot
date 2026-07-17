@@ -96,6 +96,75 @@ test('OPNsense adapter maps client networks to captive portal zones', async () =
   }
 });
 
+// TODO(pfSense): Re-enable these adapter tests when pfSense support resumes.
+test.skip('pfSense adapter returns browser captive portal login payload', async () => {
+  const result = await authorizeGateway({
+    mode: 'pfsense-api',
+    baseUrl: 'https://192.0.2.1',
+    captivePortalUrl: 'http://192.0.2.1:8000/index.php',
+    zoneId: 4,
+    apiKey: 'portal-user',
+    apiSecret: 'portal-pass',
+    tlsRejectUnauthorized: true
+  }, { user: 'voucher:guest', clientIp: '192.0.2.44' });
+
+  assert.equal(result.zoneId, 4);
+  assert.match(result.sessionId, /^pfsense-browser-login-/u);
+  assert.equal(result.gatewayLogin.provider, 'pfSense');
+  assert.equal(result.gatewayLogin.method, 'POST');
+  assert.equal(result.gatewayLogin.action, 'http://192.0.2.1:8000/index.php?zone=4');
+  assert.equal(result.gatewayLogin.fields.auth_user, 'portal-user');
+  assert.equal(result.gatewayLogin.fields.auth_pass, 'portal-pass');
+  assert.equal(result.gatewayLogin.fields.clientip, '192.0.2.44');
+});
+
+test.skip('pfSense adapter reads ARP and DHCP ownership from REST API package endpoints', async () => {
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    requests.push(request.url);
+    response.writeHead(200, { 'content-type': 'application/json' });
+    if (request.url === '/api/v2/diagnostics/arp_table') {
+      response.end(JSON.stringify({ data: [
+        { ip_address: '192.0.2.44', mac_address: 'aa:bb:cc:dd:ee:ff', interface: 'lan' }
+      ] }));
+      return;
+    }
+    if (request.url === '/api/v2/status/dhcp_server/leases') {
+      response.end(JSON.stringify({ data: [
+        { ip: '192.0.2.45', mac: '11:22:33:44:55:66', hostname: 'phone', if: 'lan', active_status: 'active' }
+      ] }));
+      return;
+    }
+    response.end(JSON.stringify({ data: [] }));
+  });
+
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  const gateway = {
+    mode: 'pfsense-api',
+    baseUrl: `http://127.0.0.1:${port}`,
+    apiKey: 'key',
+    apiSecret: 'secret',
+    tlsRejectUnauthorized: true
+  };
+  try {
+    const arpRows = await listGatewayArpEntries(gateway);
+    const dhcpRows = await listGatewayDhcpLeases(gateway);
+
+    assert.deepEqual(requests, [
+      '/api/v2/diagnostics/arp_table',
+      '/api/v2/status/dhcp_server/leases'
+    ]);
+    assert.equal(arpRows[0].clientIp, '192.0.2.44');
+    assert.equal(arpRows[0].clientMac, 'AA:BB:CC:DD:EE:FF');
+    assert.equal(dhcpRows[0].clientIp, '192.0.2.45');
+    assert.equal(dhcpRows[0].clientMac, '11:22:33:44:55:66');
+    assert.equal(dhcpRows[0].source, 'pfsense-dhcpv4');
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('OPNsense adapter lists and disconnects mapped captive portal zones', async () => {
   const requests = [];
   const server = http.createServer(async (request, response) => {

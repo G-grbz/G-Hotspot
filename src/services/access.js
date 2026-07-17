@@ -118,7 +118,7 @@ async function gatewayClientOwnership(gateway) {
 }
 
 function accessClientMac(gatewayMode, { requestedClientMac = '', gatewayClientMac = '', ownedClientMac = '' }) {
-  if (gatewayMode === 'opnsense-api') {
+  if (gatewayMode !== 'mock') {
     return normalizeMac(ownedClientMac);
   }
   return normalizeMac(requestedClientMac) || normalizeMac(gatewayClientMac);
@@ -132,8 +132,18 @@ function accessResultFromAuthorization(authorization, redirectUrl = '') {
     unlimited: Boolean(authorization.unlimited),
     clientMac: authorization.client_mac || '',
     redirectUrl: authorization.redirect_url || redirectUrl || '',
-    gatewayMode: authorization.gateway_mode
+    gatewayMode: authorization.gateway_mode,
+    gatewayLogin: authorizationGatewayLogin(authorization)
   };
+}
+
+function authorizationGatewayLogin(authorization) {
+  try {
+    const response = JSON.parse(authorization?.gateway_response_json || 'null');
+    return response?.gatewayLogin || null;
+  } catch {
+    return null;
+  }
 }
 
 function activeIpConflictError(authorization) {
@@ -163,7 +173,7 @@ async function restoreExistingAuthorizationAccess({
   db, config, authorization, method, identity, clientIp, clientMac, redirectUrl
 }) {
   let current = authorization;
-  if (config.gateway.mode === 'opnsense-api' && !authorization.gateway_session_id) {
+  if (config.gateway.mode !== 'mock' && !authorization.gateway_session_id) {
     const gateway = await authorizeGateway(config.gateway, {
       user: `${method}:${identity}`.slice(0, 128),
       clientIp
@@ -246,7 +256,7 @@ async function resolveClientIpConflicts({ db, config, method, identity, clientIp
       }
       throw activeIpConflictError(authorization);
     }
-    if (config.gateway.mode === 'opnsense-api' && authorizationMac && currentMac && authorizationMac !== currentMac) {
+    if (config.gateway.mode !== 'mock' && authorizationMac && currentMac && authorizationMac !== currentMac) {
       if (authorization.gateway_session_id) {
         try {
           await disconnectGatewaySession(config.gateway, authorization.gateway_session_id);
@@ -263,7 +273,7 @@ async function resolveClientIpConflicts({ db, config, method, identity, clientIp
 }
 
 export async function grantAccess({
-  db, config, method, identity, clientIp, clientMac, duration, durationMinutes, redirectUrl
+  db, config, method, identity, clientIp, clientMac, duration, durationMinutes, redirectUrl, deviceOs = ''
 }) {
   const accessStartedAt = Date.now();
   normalizeActiveAuthorizationDurations(db, config, { limit: 5000 });
@@ -314,7 +324,8 @@ export async function grantAccess({
       leaseSeconds,
       redirectUrl,
       gatewayResponse: gateway.response,
-      error: ''
+      error: '',
+      deviceOs
     });
     queuePostAccessSync(config, db, authorization, leaseSeconds);
     return {
@@ -324,7 +335,8 @@ export async function grantAccess({
       unlimited,
       clientMac: authorization.client_mac || '',
       redirectUrl: redirectUrl || '',
-      gatewayMode: config.gateway.mode
+      gatewayMode: config.gateway.mode,
+      gatewayLogin: gateway.gatewayLogin || null
     };
   } catch (error) {
     const resolvedClientMac = accessClientMac(config.gateway.mode, {
@@ -343,7 +355,8 @@ export async function grantAccess({
       leaseSeconds,
       redirectUrl,
       gatewayResponse: null,
-      error: error.message
+      error: error.message,
+      deviceOs
     });
     error.authorizationId = authorization.id;
     throw error;

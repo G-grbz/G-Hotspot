@@ -227,7 +227,8 @@ test('OPNsense access stores the DHCP or ARP owner MAC instead of the captive po
       clientIp: '172.16.3.3',
       clientMac: '',
       duration: { value: 2, unit: 'days' },
-      redirectUrl: ''
+      redirectUrl: '',
+      deviceOs: 'android'
     });
     const authorization = db.getAuthorization(result.authorizationId);
     const connect = requests.find(item => item.url === '/api/captiveportal/session/connect/1');
@@ -238,6 +239,7 @@ test('OPNsense access stores the DHCP or ARP owner MAC instead of the captive po
     assert.equal(result.clientMac, '36:90:70:AF:4D:B0');
     assert.equal(authorization.client_ip, '172.16.3.3');
     assert.equal(authorization.client_mac, '36:90:70:AF:4D:B0');
+    assert.equal(authorization.device_os, 'android');
     assert.equal(authorization.gateway_session_id, '1:session-1');
     assert.deepEqual(Object.fromEntries(new URLSearchParams(connect.body)), {
       user: 'email:gkhn.gurbuz@hotmail.com',

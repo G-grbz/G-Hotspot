@@ -17,6 +17,7 @@ import {
   enrichTrafficLogRecords,
   trafficLogSettings
 } from './trafficLogs.js';
+import { createZipArchive } from './opnsenseTemplate.js';
 
 const execFileAsync = promisify(execFile);
 const AUTO_EXPORT_CHECK_MS = 60 * 1000;
@@ -45,7 +46,7 @@ const STORAGE_NOTIFICATION_INTERVALS = {
   daily: 24 * 60 * 60 * 1000,
   monthly: 30 * 24 * 60 * 60 * 1000
 };
-const STORAGE_NOTIFICATION_CHANNELS = ['email', 'sms', 'telegram'];
+const STORAGE_NOTIFICATION_CHANNELS = ['email', 'sms', 'telegram', 'android'];
 const NTP_STATUS_HINT =
   'Install timedatectl with systemd/DBus support, or set SYSLOG_NTP_CHECK_ENABLED=false to hide this check.';
 let syslogNonce = 0;
@@ -60,6 +61,126 @@ function fileHash(filePath) {
 
 function fileSize(filePath) {
   return fs.statSync(filePath).size;
+}
+
+function configFlag(value) {
+  if (typeof value === 'boolean') return value;
+  return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
+}
+
+function exportZipPath(logPath) {
+  return String(logPath).endsWith('.log')
+    ? `${String(logPath).slice(0, -4)}.zip`
+    : `${logPath}.zip`;
+}
+
+function retentionDaysValue(value) {
+  return Math.max(1, Math.min(1000, Math.trunc(Number(value) || 730)));
+}
+
+function exportRetentionCutoff(retentionDays, now = Date.now()) {
+  return Math.trunc(Number(now) || Date.now()) - retentionDaysValue(retentionDays) * 24 * 60 * 60 * 1000;
+}
+
+function pathInsideDirectory(filePath, directory) {
+  const resolvedFile = path.resolve(String(filePath || ''));
+  const resolvedDirectory = path.resolve(String(directory || ''));
+  const relative = path.relative(resolvedDirectory, resolvedFile);
+  return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+function timestampSidecarPaths(logPath) {
+  return [`${logPath}.tsq`, `${logPath}.tsr`];
+}
+
+function logPathFromArchivePath(filePath) {
+  const text = String(filePath || '');
+  return text.endsWith('.zip') ? `${text.slice(0, -4)}.log` : text;
+}
+
+function exportArtifactPaths(row = {}) {
+  const paths = new Set();
+  const add = value => {
+    const text = String(value || '').trim();
+    if (text) paths.add(text);
+  };
+  add(row.file_path);
+  add(row.manifest_path);
+  add(row.timestamp_request_path);
+  add(row.timestamp_token_path);
+  add(row.signature_path);
+
+  const primary = String(row.file_path || '');
+  const logPath = logPathFromArchivePath(primary);
+  if (logPath) {
+    add(logPath);
+    add(exportZipPath(logPath));
+    for (const sidecar of timestampSidecarPaths(logPath)) add(sidecar);
+  }
+  return [...paths];
+}
+
+function retentionFileExtensions(lawConfig = {}) {
+  const extensions = configFlag(lawConfig.exportZipEnabled)
+    ? ['.zip', '.log', '.tsq', '.tsr']
+    : ['.log', '.tsq', '.tsr'];
+  return new Set(extensions);
+}
+
+function removeExportRetentionFile(filePath, exportDirectory, totals, logger = console) {
+  try {
+    if (!pathInsideDirectory(filePath, exportDirectory) || !fs.existsSync(filePath)) return false;
+    const stats = fs.statSync(filePath);
+    if (!stats.isFile()) return false;
+    fs.rmSync(filePath, { force: true });
+    totals.deletedFiles += 1;
+    totals.deletedBytes += Number(stats.size || 0);
+    totals.deletedPaths.push(filePath);
+    return true;
+  } catch (error) {
+    totals.errors.push({ filePath, error: error.message });
+    logger.warn?.(`Expired syslog export file could not be removed: ${filePath}: ${error.message}`);
+    return false;
+  }
+}
+
+function createExportZipArtifact(lawConfig, files = []) {
+  if (!configFlag(lawConfig.exportZipEnabled)) {
+    return {
+      filePath: '',
+      entries: [],
+      sourceFiles: [],
+      sourceFilesDeleted: false
+    };
+  }
+  const sourceFiles = [...new Set(files.filter(Boolean))]
+    .filter(filePath => fs.existsSync(filePath));
+  if (!sourceFiles.length) {
+    return {
+      filePath: '',
+      entries: [],
+      sourceFiles: [],
+      sourceFilesDeleted: false
+    };
+  }
+  const logPath = sourceFiles[0];
+  const archivePath = exportZipPath(logPath);
+  const entries = sourceFiles.map(filePath => ({
+    name: path.basename(filePath),
+    data: fs.readFileSync(filePath)
+  }));
+  fs.writeFileSync(archivePath, createZipArchive(entries), { mode: 0o600 });
+  if (configFlag(lawConfig.exportDeleteSourceAfterZip)) {
+    for (const filePath of sourceFiles) {
+      fs.rmSync(filePath, { force: true });
+    }
+  }
+  return {
+    filePath: archivePath,
+    entries: entries.map(entry => entry.name),
+    sourceFiles,
+    sourceFilesDeleted: configFlag(lawConfig.exportDeleteSourceAfterZip)
+  };
 }
 
 function hmacSha256Hex(key, value) {
@@ -744,6 +865,10 @@ function law5651ExportResultFromRow(row) {
     jsonlPath: '',
     eventsPath: '',
     manifestPath: row.manifest_path || row.file_path,
+    archivePath: String(row.file_path || '').endsWith('.zip') ? row.file_path : '',
+    archiveEntries: [],
+    sourceFiles: [],
+    sourceFilesDeleted: false,
     timestampRequestPath: row.timestamp_request_path || '',
     timestampTokenPath: row.timestamp_token_path || '',
     timestampMode: row.timestamp_mode || 'disabled',
@@ -783,7 +908,7 @@ function nextIntervalExportRunAt(db, now, intervalMs, lawConfig = {}) {
 
 function opnsenseCommunicationReady(db, config = {}, now = Date.now()) {
   const gateway = config.gateway || {};
-  if (gateway.mode !== 'opnsense-api' || gateway.syncEnabled === false) return true;
+  if (!gateway.mode || gateway.mode === 'mock' || gateway.syncEnabled === false) return true;
   const state = db.getRuntimeState?.('opnsense_last_successful_sync_at');
   const lastSuccessfulSyncAt = Math.trunc(Number(state?.value) || 0);
   if (!lastSuccessfulSyncAt) return false;
@@ -795,7 +920,7 @@ function cleanupExpiredLaw5651DatabaseRecords({ db, config, logger = console, no
   const lawConfig = config.law5651 || config.syslog || {};
   if (typeof db.cleanupLaw5651Logs !== 'function') return 0;
   try {
-    return db.cleanupLaw5651Logs(lawConfig.retentionDays || 730, now, {
+    return db.cleanupLaw5651Logs(retentionDaysValue(lawConfig.retentionDays), now, {
       reasons: AUTO_EXPORT_REASONS,
       requireTimestamp: timestampEnabled(lawConfig),
       requireBackup: Boolean(lawConfig.backupEnabled && lawConfig.backupWormRequired)
@@ -804,6 +929,75 @@ function cleanupExpiredLaw5651DatabaseRecords({ db, config, logger = console, no
     logger.warn?.(`Syslog retention cleanup failed: ${error.message}`);
     return 0;
   }
+}
+
+function cleanupExpiredLaw5651ExportDirectoryFiles({ lawConfig, cutoff, totals, logger = console }) {
+  const exportDirectory = lawConfig.exportDirectory;
+  if (!exportDirectory || !fs.existsSync(exportDirectory)) return;
+  const extensions = retentionFileExtensions(lawConfig);
+  const stack = [exportDirectory];
+  while (stack.length) {
+    const directory = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      totals.errors.push({ filePath: directory, error: error.message });
+      logger.warn?.(`Syslog export directory could not be scanned for retention cleanup: ${directory}: ${error.message}`);
+      continue;
+    }
+    for (const entry of entries) {
+      const filePath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (pathInsideDirectory(filePath, exportDirectory)) stack.push(filePath);
+        continue;
+      }
+      if (!entry.isFile() || !extensions.has(path.extname(entry.name).toLowerCase())) continue;
+      try {
+        const stats = fs.statSync(filePath);
+        if (Number(stats.mtimeMs || 0) >= cutoff) continue;
+      } catch (error) {
+        totals.errors.push({ filePath, error: error.message });
+        logger.warn?.(`Syslog export file could not be checked for retention cleanup: ${filePath}: ${error.message}`);
+        continue;
+      }
+      removeExportRetentionFile(filePath, exportDirectory, totals, logger);
+    }
+  }
+}
+
+export function cleanupExpiredLaw5651ExportFiles({ db, config, logger = console, now = Date.now() } = {}) {
+  const lawConfig = config.law5651 || config.syslog || {};
+  const exportDirectory = lawConfig.exportDirectory;
+  const retentionDays = retentionDaysValue(lawConfig.retentionDays);
+  const cutoff = exportRetentionCutoff(retentionDays, now);
+  const totals = {
+    retentionDays,
+    cutoff,
+    exportDirectory: exportDirectory || '',
+    deletedFiles: 0,
+    deletedBytes: 0,
+    deletedPaths: [],
+    errors: []
+  };
+  if (!exportDirectory) return totals;
+
+  try {
+    const rows = typeof db?.listExpiredLaw5651Exports === 'function'
+      ? db.listExpiredLaw5651Exports({ cutoff, reasons: AUTO_EXPORT_REASONS })
+      : [];
+    for (const row of rows) {
+      for (const filePath of exportArtifactPaths(row)) {
+        removeExportRetentionFile(filePath, exportDirectory, totals, logger);
+      }
+    }
+  } catch (error) {
+    totals.errors.push({ filePath: exportDirectory, error: error.message });
+    logger.warn?.(`Syslog export retention metadata cleanup failed: ${error.message}`);
+  }
+
+  cleanupExpiredLaw5651ExportDirectoryFiles({ lawConfig, cutoff, totals, logger });
+  return totals;
 }
 
 function dailyLogLine(row, timeZone) {
@@ -928,6 +1122,14 @@ function isInScope(clientIp, networks) {
   } catch {
     return false;
   }
+}
+
+function trafficLogScopeConfig(config = {}) {
+  return {
+    ...(config.law5651 || {}),
+    networks: config.law5651?.networks || 'any',
+    requireTrafficNetworkScope: false
+  };
 }
 
 function identityRowMac(value) {
@@ -1136,6 +1338,7 @@ export function trafficLogRecordsFromSyslogMessage(
   if (!sourceIp && !destinationIp) return [];
   const sourceInScope = isInScope(sourceIp, lawConfig.networks);
   const destinationInScope = isInScope(destinationIp, lawConfig.networks);
+  if (lawConfig.requireTrafficNetworkScope && !sourceInScope && !destinationInScope) return [];
   let clientIp = '';
   if (sourceInScope && !destinationInScope) clientIp = sourceIp;
   else if (destinationInScope && !sourceInScope) clientIp = destinationIp;
@@ -1715,17 +1918,19 @@ export async function createLaw5651ExportArchive({
     periodEnd
   });
   const previousExportHash = db.law5651Summary().lastExport?.exportHash || '';
-  const exportHash = fileHash(logPath);
   const gap = timestampEvidenceGap(db, lawConfig, periodStart, periodEnd, now);
   const timestamp = gap
     ? evidenceGapTimestamp(lawConfig, gap)
     : await runTimestamp(lawConfig, logPath, tokenPath, timestampRequestPath);
+  const archive = createExportZipArtifact(lawConfig, [logPath, timestamp.requestPath, timestamp.tokenPath]);
+  const exportedFilePath = archive.filePath || logPath;
+  const exportHash = fileHash(exportedFilePath);
   const exportRow = db.createLaw5651Export({
     exportReason: safeReason,
     periodStartAt: periodStart,
     periodEndAt: periodEnd,
-    filePath: logPath,
-    manifestPath: logPath,
+    filePath: exportedFilePath,
+    manifestPath: exportedFilePath,
     timestampRequestPath: timestamp.requestPath,
     timestampTokenPath: timestamp.tokenPath,
     timestampMode: timestamp.mode,
@@ -1760,7 +1965,11 @@ export async function createLaw5651ExportArchive({
       detail: {
         exportId: exportRow.id,
         date: dateLabel,
-        filePath: logPath,
+        filePath: exportedFilePath,
+        sourceFilePath: logPath,
+        archivePath: archive.filePath,
+        archiveEntries: archive.entries,
+        sourceFilesDeleted: archive.sourceFilesDeleted,
         timestampRequestPath: timestamp.requestPath,
         timestampTokenPath: timestamp.tokenPath,
         timestampMode: timestamp.mode,
@@ -1783,10 +1992,15 @@ export async function createLaw5651ExportArchive({
     exportReason: safeReason,
     periodStartAt: periodStart,
     periodEndAt: periodEnd,
-    filePath: logPath,
+    filePath: exportedFilePath,
     jsonlPath: '',
     eventsPath: '',
-    manifestPath: logPath,
+    manifestPath: exportedFilePath,
+    sourceFilePath: logPath,
+    archivePath: archive.filePath,
+    archiveEntries: archive.entries,
+    sourceFiles: archive.sourceFiles,
+    sourceFilesDeleted: archive.sourceFilesDeleted,
     timestampRequestPath: timestamp.requestPath,
     timestampTokenPath: timestamp.tokenPath,
     timestampMode: timestamp.mode,
@@ -1880,7 +2094,11 @@ export function createLaw5651AutoExporter({ db, config, logger = console, notifi
     exportedWindows: 0,
     lastRetentionCleanupAt: null,
     lastRetentionDeleted: 0,
-    totalRetentionDeleted: 0
+    totalRetentionDeleted: 0,
+    lastRetentionDeletedFiles: 0,
+    totalRetentionDeletedFiles: 0,
+    lastRetentionDeletedBytes: 0,
+    totalRetentionDeletedBytes: 0
   };
 
   function refreshState(now = Date.now()) {
@@ -1996,17 +2214,24 @@ export function createLaw5651AutoExporter({ db, config, logger = console, notifi
         : '';
       if (state.lastError) logger.warn?.(state.lastError);
       const deletedExpired = cleanupExpiredLaw5651DatabaseRecords({ db, config, logger, now: current });
+      const deletedFiles = cleanupExpiredLaw5651ExportFiles({ db, config, logger, now: current });
       state.lastRetentionCleanupAt = current;
       state.lastRetentionDeleted = deletedExpired;
       state.totalRetentionDeleted += deletedExpired;
-      if (deletedExpired > 0) {
+      state.lastRetentionDeletedFiles = deletedFiles.deletedFiles;
+      state.totalRetentionDeletedFiles += deletedFiles.deletedFiles;
+      state.lastRetentionDeletedBytes = deletedFiles.deletedBytes;
+      state.totalRetentionDeletedBytes += deletedFiles.deletedBytes;
+      if (deletedExpired > 0 || deletedFiles.deletedFiles > 0) {
         safeRecordEvent(db, {
           eventType: 'syslog_retention_cleanup',
           severity: 'info',
-          message: `Syslog retention cleanup removed ${deletedExpired} archived records from the database.`,
+          message: `Syslog retention cleanup removed ${deletedExpired} archived records from the database and ${deletedFiles.deletedFiles} expired export files.`,
           detail: {
             deletedExpired,
-            retentionDays: lawConfig.retentionDays || 730
+            deletedFiles: deletedFiles.deletedFiles,
+            deletedBytes: deletedFiles.deletedBytes,
+            retentionDays: retentionDaysValue(lawConfig.retentionDays)
           }
         }, logger);
       }
@@ -2544,7 +2769,7 @@ export function createLaw5651SyslogServer({
       if (typeof db.appendTrafficLogs === 'function' && settings.enabled) {
         const trafficRecords = trafficLogRecordsFromSyslogMessage(
           text,
-          config.law5651,
+          trafficLogScopeConfig(config),
           settings,
           receivedAt,
           syslogNonce,
@@ -2558,10 +2783,10 @@ export function createLaw5651SyslogServer({
             : { ...config, databasePath: db.filePath };
           db.appendTrafficLogs(enriched);
           appendTrafficLogFileRecords(trafficFileConfig, enriched);
-          db.cleanupTrafficLogs?.(settings.retentionDays);
+          db.cleanupTrafficLogs?.(settings.retentionMinutes);
           if (receivedAt - trafficLogFileCleanupAt >= TRAFFIC_LOG_FILE_CLEANUP_INTERVAL_MS) {
             trafficLogFileCleanupAt = receivedAt;
-            cleanupTrafficLogFile(trafficFileConfig, settings.retentionDays, receivedAt);
+            cleanupTrafficLogFile(trafficFileConfig, settings.retentionMinutes, receivedAt);
           }
         }
       }

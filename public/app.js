@@ -1,3 +1,7 @@
+const userAgent = navigator.userAgent || '';
+const isAndroidWebView = /Android/i.test(userAgent) && (/\bwv\b/i.test(userAgent) || /Version\/4\.0/i.test(userAgent));
+if (isAndroidWebView) document.documentElement.classList.add('android-webview');
+
 const state = {
   emailChallengeId: '',
   whatsappChallengeId: '',
@@ -25,7 +29,7 @@ const ADMIN_APPROVAL_PENDING_KEY = 'gh_admin_approval_pending';
 const DEFAULT_LOGO_URL = '/img/logo.png';
 const DEFAULT_NETWORK_LABEL_TEXT = 'GUEST NETWORK';
 const DEFAULT_VERIFICATION_PROMPT_TEXT = 'Choose a verification method to open internet access.';
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const VOUCHER_CODE_LENGTH = 12;
 const COUNTRY_MODAL_CLOSE_ANIMATION_MS = 180;
 const COUNTRY_POPOVER_MARGIN = 10;
@@ -853,6 +857,26 @@ function syncCountryCodeControls() {
   }
 }
 
+function adminApprovalContactUsesPhone(value) {
+  const contact = String(value || '');
+  return /^\d{2}/u.test(contact) && !/[@\p{L}]/u.test(contact);
+}
+
+function syncAdminApprovalCountryCodeVisibility() {
+  const contact = document.querySelector('#adminApprovalContact');
+  const select = document.querySelector('#adminApprovalCountryCode');
+  if (!contact || !select) return;
+  const trigger = ensureCountryCodeTrigger(select);
+  const visible = adminApprovalContactUsesPhone(contact.value);
+  contact.closest('.phone-entry--contact')?.classList.toggle('country-code-visible', visible);
+  trigger.classList.toggle('hidden', !visible);
+  trigger.setAttribute('aria-hidden', visible ? 'false' : 'true');
+  trigger.tabIndex = visible ? 0 : -1;
+  if (!visible && activeCountryCodeSelect === select) {
+    closeCountryCodeModal({ restoreFocus: false });
+  }
+}
+
 function populateCountryCodeSelects() {
   const codes = phoneCountryCodes();
   const defaultCountryCode = normalizeCountryCode(state.config?.defaultCountryCode) || codes[0] || '';
@@ -870,6 +894,7 @@ function populateCountryCodeSelects() {
     select.disabled = codes.length <= 1;
   }
   syncCountryCodeControls();
+  syncAdminApprovalCountryCodeVisibility();
 }
 
 function renderCountryCodeOptions() {
@@ -1065,7 +1090,31 @@ function success(payload) {
   clearTelegramPending();
   clearAdminApprovalPending();
   showNotice(t('Verification completed. Your internet access is now open.'), 'success');
+  if (payload.gatewayLogin?.action) {
+    submitGatewayLogin(payload);
+    return;
+  }
   setTimeout(() => location.replace(payload.sessionUrl || '/session'), 150);
+}
+
+function submitGatewayLogin(payload) {
+  const login = payload.gatewayLogin || {};
+  const form = document.createElement('form');
+  form.method = String(login.method || 'POST').toUpperCase() === 'GET' ? 'GET' : 'POST';
+  form.action = login.action;
+  form.style.display = 'none';
+  const fields = { ...(login.fields || {}) };
+  const finalUrl = payload.redirectUrl || payload.sessionUrl || '/session';
+  fields.redirurl ||= new URL(finalUrl, location.href).toString();
+  for (const [name, value] of Object.entries(fields)) {
+    const input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = name;
+    input.value = String(value ?? '');
+    form.appendChild(input);
+  }
+  document.body.appendChild(form);
+  setTimeout(() => form.submit(), 150);
 }
 
 function storageGet(key) {
@@ -1393,7 +1442,9 @@ document.querySelector('#adminApprovalForm').addEventListener('submit', async ev
   try {
     const fullName = document.querySelector('#adminApprovalFullName').value;
     const contact = document.querySelector('#adminApprovalContact').value;
-    const countryCode = document.querySelector('#adminApprovalCountryCode').value;
+    const countryCode = adminApprovalContactUsesPhone(contact)
+      ? document.querySelector('#adminApprovalCountryCode').value
+      : '';
     const payload = await api('/api/v1/admin-approval/request', {
       method: 'POST',
       body: JSON.stringify({ fullName, contact, countryCode, ...commonPayload() })
@@ -1420,6 +1471,10 @@ document.querySelector('#adminApprovalNew').addEventListener('click', () => {
   clearNotice();
   document.querySelector('#adminApprovalFullName').focus();
 });
+
+for (const eventName of ['input', 'change', 'focus']) {
+  document.querySelector('#adminApprovalContact').addEventListener(eventName, syncAdminApprovalCountryCodeVisibility);
+}
 
 document.querySelector('#emailRequestForm').addEventListener('submit', async event => {
   event.preventDefault();
@@ -1781,6 +1836,7 @@ document.addEventListener('gh:language', () => {
   document.querySelector('#languageSelect').value = i18n.language;
   renderProjectAttribution();
   syncCountryCodeControls();
+  syncAdminApprovalCountryCodeVisibility();
   if (countryCodeModal && !countryCodeModal.classList.contains('hidden')) {
     renderCountryCodeOptions();
   }
@@ -1795,9 +1851,17 @@ document.addEventListener('gh:language', () => {
   }
 });
 
+async function preloadPortalFonts() {
+  if (!document.fonts?.load) return;
+  const families = ['Manrope', 'Roboto Condensed', 'Satisfy'];
+  const sample = 'G-Hotspot ABCÇĞİÖŞÜ abcçğıöşü 0123456789';
+  await Promise.allSettled(families.map(family => document.fonts.load(`400 1em "${family}"`, sample)));
+}
+
 (async function init() {
   try {
     await i18n.ready;
+    await preloadPortalFonts();
     state.config = await api('/api/v1/config', { headers: {} });
     await loadProjectAttribution();
     if (!clientMac) clientMac = normalizeMac(state.config.clientMac);

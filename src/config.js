@@ -18,9 +18,16 @@ loadSystemSettingsIntoEnv();
 const ACCESS_DURATION_UNITS = new Set(['hours', 'days', 'months', 'years', 'unlimited']);
 const RETRY_INTERVAL_UNITS = new Set(['minutes', ...ACCESS_DURATION_UNITS]);
 const TELEGRAM_MODES = new Set(['webhook', 'polling']);
+const GATEWAY_MODES = [
+  'mock',
+  'opnsense-api'
+  // TODO(pfSense): Re-enable 'pfsense-api' after the adapter and login flow are completed.
+  // 'pfsense-api'
+];
 const NOTIFICATION_FREQUENCIES = ['state-change', 'hourly', 'daily', 'monthly'];
 const SYSLOG_AUTO_EXPORT_INTERVALS = ['1h', '6h', '12h', '24h', 'daily'];
 const SYSLOG_TIMESTAMP_MODES = ['disabled', 'kamusm', 'rfc3161', 'api-key'];
+const TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES = [15, 30, 45, 60];
 const TEMPORARY_APP_SECRET = randomBytes(48).toString('base64url');
 export const DEFAULT_PORTAL_TERMS_TEXT =
   'By continuing, you accept the terms of use for this guest network.';
@@ -116,6 +123,24 @@ function envAlias(name, legacyName, fallback = '') {
 function envAliasPreserveEmpty(name, legacyName, fallback = '') {
   const value = process.env[name] ?? (legacyName ? process.env[legacyName] : undefined);
   return value == null ? fallback : value;
+}
+
+function normalizeTrafficLogRetentionMinutes(value, fallback = 60) {
+  const parsed = Math.trunc(Number(value));
+  const minutes = Number.isFinite(parsed) ? parsed : fallback;
+  if (minutes <= TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES[0]) return TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES[0];
+  return TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES.find(option => minutes <= option) ||
+    TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES.at(-1);
+}
+
+function trafficLogRetentionMinutesEnv() {
+  if (process.env.TRAFFIC_LOGS_RETENTION_MINUTES != null && process.env.TRAFFIC_LOGS_RETENTION_MINUTES !== '') {
+    return normalizeTrafficLogRetentionMinutes(process.env.TRAFFIC_LOGS_RETENTION_MINUTES);
+  }
+  if (process.env.TRAFFIC_LOGS_RETENTION_DAYS != null && process.env.TRAFFIC_LOGS_RETENTION_DAYS !== '') {
+    return normalizeTrafficLogRetentionMinutes(Number.parseInt(process.env.TRAFFIC_LOGS_RETENTION_DAYS, 10) * 24 * 60);
+  }
+  return 60;
 }
 
 function envBooleanAlias(name, legacyName, fallback = false) {
@@ -290,6 +315,21 @@ function parseGatewayZoneMap(value) {
     });
 }
 
+function gatewayBoolean(name, fallback = false) {
+  const value = process.env[name] ?? '';
+  if (value == null || value === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+}
+
+function gatewayInteger(name, fallback, options = {}) {
+  const raw = process.env[name] ?? '';
+  const value = raw == null || raw === '' ? fallback : Number.parseInt(raw, 10);
+  if (!Number.isInteger(value)) throw new Error(`${name} must be an integer`);
+  if (options.min != null && value < options.min) throw new Error(`${name} must be >= ${options.min}`);
+  if (options.max != null && value > options.max) throw new Error(`${name} must be <= ${options.max}`);
+  return value;
+}
+
 function buildConfig() {
   const installed = isSystemInstalled();
   const configuredAppSecret = process.env.APP_SECRET ?? '';
@@ -301,8 +341,8 @@ function buildConfig() {
   }
 
   const gatewayMode = process.env.GATEWAY_MODE || 'mock';
-  if (!['mock', 'opnsense-api'].includes(gatewayMode)) {
-    throw new Error('GATEWAY_MODE must be mock or opnsense-api');
+  if (!GATEWAY_MODES.includes(gatewayMode)) {
+    throw new Error(`GATEWAY_MODE must be one of: ${GATEWAY_MODES.join(', ')}`);
   }
 
   const smsProvider = process.env.SMS_PROVIDER || 'netgsm';
@@ -324,6 +364,10 @@ function buildConfig() {
   const smtpConfigured = Boolean(process.env.SMTP_HOST && smtpUser);
   const legacyDownloadSpeedMbps = envInteger('DOWNLOAD_SPEED_LIMIT_MBPS', 0, { min: 0, max: 100000 });
   const legacyUploadSpeedMbps = envInteger('UPLOAD_SPEED_LIMIT_MBPS', 0, { min: 0, max: 100000 });
+  const gatewayNetworkFallback = process.env.OPNSENSE_SHAPER_NETWORK || 'any';
+  const gatewayShaperInterface = process.env.OPNSENSE_SHAPER_INTERFACE || 'wan';
+  const gatewayBaseUrl = (process.env.OPNSENSE_BASE_URL || '').replace(/\/$/, '');
+  // TODO(pfSense): Restore OPNSENSE_CAPTIVE_PORTAL_URL when pfSense support resumes.
   const defaultCountryCode = normalizeCountryCode(process.env.DEFAULT_COUNTRY_CODE || '90') || '90';
   if (!COUNTRY_CALLING_CODES.includes(defaultCountryCode)) {
     throw new Error(`DEFAULT_COUNTRY_CODE must be a known country code: ${defaultCountryCode}`);
@@ -429,19 +473,21 @@ function buildConfig() {
     },
     gateway: {
       mode: gatewayMode,
-      baseUrl: (process.env.OPNSENSE_BASE_URL || '').replace(/\/$/, ''),
+      baseUrl: gatewayBaseUrl,
+      captivePortalUrl: '',
       zoneId: envInteger('OPNSENSE_ZONE_ID', 0, { min: 0, max: 19 }),
       zoneMap: parseGatewayZoneMap(process.env.OPNSENSE_ZONE_MAP),
       apiKey: process.env.OPNSENSE_API_KEY || '',
       apiSecret: process.env.OPNSENSE_API_SECRET || '',
-      tlsRejectUnauthorized: envBoolean('OPNSENSE_TLS_REJECT_UNAUTHORIZED', true),
-      syncEnabled: envBoolean('OPNSENSE_SYNC_ENABLED', true),
-      syncIntervalSeconds: envInteger('OPNSENSE_SYNC_INTERVAL_SECONDS', 10, { min: 5, max: 3600 }),
-      keaLeaseSyncEnabled: envBoolean('OPNSENSE_KEA_LEASE_SYNC_ENABLED', true),
-      cookieIpMoveEnabled: envBoolean('OPNSENSE_COOKIE_IP_MOVE_ENABLED', true),
-      sessionCookieRequired: envBoolean('OPNSENSE_SESSION_COOKIE_REQUIRED', false),
-      shaperInterface: process.env.OPNSENSE_SHAPER_INTERFACE || 'wan',
-      shaperNetwork: process.env.OPNSENSE_SHAPER_NETWORK || 'any',
+      tlsRejectUnauthorized: gatewayBoolean('OPNSENSE_TLS_REJECT_UNAUTHORIZED', true),
+      syncEnabled: gatewayBoolean('OPNSENSE_SYNC_ENABLED', true),
+      syncIntervalSeconds: gatewayInteger('OPNSENSE_SYNC_INTERVAL_SECONDS', 10, { min: 5, max: 3600 }),
+      keaLeaseSyncEnabled: gatewayBoolean('OPNSENSE_KEA_LEASE_SYNC_ENABLED', true),
+      dhcpLeaseSyncEnabled: gatewayBoolean('OPNSENSE_KEA_LEASE_SYNC_ENABLED', true),
+      cookieIpMoveEnabled: gatewayBoolean('OPNSENSE_COOKIE_IP_MOVE_ENABLED', true),
+      sessionCookieRequired: gatewayBoolean('OPNSENSE_SESSION_COOKIE_REQUIRED', false),
+      shaperInterface: gatewayShaperInterface,
+      shaperNetwork: gatewayNetworkFallback,
       downloadSpeedMbps: legacyDownloadSpeedMbps,
       uploadSpeedMbps: legacyUploadSpeedMbps,
       bandwidthProfiles: bandwidthProfiles(legacyDownloadSpeedMbps, legacyUploadSpeedMbps)
@@ -449,12 +495,18 @@ function buildConfig() {
     law5651: {
       enabled: envBooleanAlias('SYSLOG_ENABLED', 'LOG5651_ENABLED', false),
       networks: normalizeNetworkList(
-        envAlias('SYSLOG_NETWORKS', 'LOG5651_NETWORKS', process.env.OPNSENSE_SHAPER_NETWORK || 'any')
+        envAlias('SYSLOG_NETWORKS', 'LOG5651_NETWORKS', gatewayNetworkFallback)
       ),
       timeZone: normalizeTimeZone(envAlias('SYSLOG_TIME_ZONE', 'LOG5651_TIME_ZONE', '')),
       retentionDays: envIntegerAlias('SYSLOG_RETENTION_DAYS', 'LOG5651_RETENTION_DAYS', 730, { min: 1, max: 1000 }),
       exportDirectory: path.resolve(
         envAlias('SYSLOG_EXPORT_DIR', 'LOG5651_EXPORT_DIR', path.join(path.dirname(databasePath), 'syslog'))
+      ),
+      exportZipEnabled: envBooleanAlias('SYSLOG_EXPORT_ZIP_ENABLED', 'LOG5651_EXPORT_ZIP_ENABLED', false),
+      exportDeleteSourceAfterZip: envBooleanAlias(
+        'SYSLOG_EXPORT_DELETE_SOURCE_AFTER_ZIP',
+        'LOG5651_EXPORT_DELETE_SOURCE_AFTER_ZIP',
+        false
       ),
       storageAlertPercent: envIntegerAlias('SYSLOG_STORAGE_ALERT_PERCENT', 'LOG5651_STORAGE_ALERT_PERCENT', 85, { min: 1, max: 100 }),
       storageBlockPercent: envIntegerAlias('SYSLOG_STORAGE_BLOCK_PERCENT', 'LOG5651_STORAGE_BLOCK_PERCENT', 99, { min: 1, max: 100 }),
@@ -502,7 +554,7 @@ function buildConfig() {
     },
     trafficLogs: {
       enabled: envBoolean('TRAFFIC_LOGS_ENABLED', true),
-      retentionDays: envInteger('TRAFFIC_LOGS_RETENTION_DAYS', 30, { min: 1, max: 365 }),
+      retentionMinutes: trafficLogRetentionMinutesEnv(),
       resolveDomains: envBoolean('TRAFFIC_LOGS_RESOLVE_DOMAINS', true),
       liveRefreshSeconds: envInteger('TRAFFIC_LOGS_LIVE_REFRESH_SECONDS', 5, { min: 2, max: 60 }),
       logDirectory: path.resolve(path.dirname(databasePath), 'traffic-records')
@@ -535,6 +587,16 @@ function buildConfig() {
         NOTIFICATION_FREQUENCIES
       ),
       telegramStartupEnabled: envBoolean('NOTIFICATION_TELEGRAM_STARTUP_ENABLED', legacyStartupNotification),
+      androidEnabled: envBoolean('NOTIFICATION_ANDROID_ENABLED', false),
+      androidRepeatFrequency: envOptionAlias(
+        'NOTIFICATION_ANDROID_REPEAT_FREQUENCY',
+        null,
+        legacyRepeatFrequency,
+        NOTIFICATION_FREQUENCIES
+      ),
+      androidStartupEnabled: envBoolean('NOTIFICATION_ANDROID_STARTUP_ENABLED', legacyStartupNotification),
+      androidPollIntervalSeconds: envInteger('ANDROID_APP_POLL_INTERVAL_SECONDS', 20, { min: 5, max: 300 }),
+      androidFcmServiceAccountFile: envText('ANDROID_FCM_SERVICE_ACCOUNT_FILE', '').trim(),
       syslogEmailTemplateMarkdown: process.env.NOTIFICATION_SYSLOG_EMAIL_TEMPLATE_MARKDOWN ||
         DEFAULT_SYSLOG_NOTIFICATION_EMAIL_MARKDOWN,
       syslogSmsTemplate: process.env.NOTIFICATION_SYSLOG_SMS_TEMPLATE ||
@@ -562,6 +624,11 @@ function buildConfig() {
         'NOTIFICATION_SYSLOG_STORAGE_ENABLED',
         true
       ),
+      androidSyslogStorageEnabled: envBooleanAlias(
+        'NOTIFICATION_ANDROID_SYSLOG_STORAGE_ENABLED',
+        'NOTIFICATION_SYSLOG_STORAGE_ENABLED',
+        true
+      ),
       emailSyslogKamusmSuccessEnabled: envBooleanAlias(
         'NOTIFICATION_EMAIL_SYSLOG_KAMUSM_SUCCESS_ENABLED',
         'NOTIFICATION_SYSLOG_KAMUSM_SUCCESS_ENABLED',
@@ -574,6 +641,11 @@ function buildConfig() {
       ),
       telegramSyslogKamusmSuccessEnabled: envBooleanAlias(
         'NOTIFICATION_TELEGRAM_SYSLOG_KAMUSM_SUCCESS_ENABLED',
+        'NOTIFICATION_SYSLOG_KAMUSM_SUCCESS_ENABLED',
+        true
+      ),
+      androidSyslogKamusmSuccessEnabled: envBooleanAlias(
+        'NOTIFICATION_ANDROID_SYSLOG_KAMUSM_SUCCESS_ENABLED',
         'NOTIFICATION_SYSLOG_KAMUSM_SUCCESS_ENABLED',
         true
       ),
@@ -592,6 +664,11 @@ function buildConfig() {
         'NOTIFICATION_SYSLOG_KAMUSM_FAILURE_ENABLED',
         true
       ),
+      androidSyslogKamusmFailureEnabled: envBooleanAlias(
+        'NOTIFICATION_ANDROID_SYSLOG_KAMUSM_FAILURE_ENABLED',
+        'NOTIFICATION_SYSLOG_KAMUSM_FAILURE_ENABLED',
+        true
+      ),
       emailAdminApprovalEnabled: envBooleanAlias(
         'NOTIFICATION_EMAIL_ADMIN_APPROVAL_ENABLED',
         'NOTIFICATION_ADMIN_APPROVAL_ENABLED',
@@ -602,24 +679,35 @@ function buildConfig() {
         'NOTIFICATION_ADMIN_APPROVAL_ENABLED',
         true
       ),
+      androidAdminApprovalEnabled: envBooleanAlias(
+        'NOTIFICATION_ANDROID_ADMIN_APPROVAL_ENABLED',
+        'NOTIFICATION_ADMIN_APPROVAL_ENABLED',
+        true
+      ),
       emailSystemStartupEnabled: envBoolean('NOTIFICATION_EMAIL_SYSTEM_STARTUP_ENABLED', false),
       smsSystemStartupEnabled: envBoolean('NOTIFICATION_SMS_SYSTEM_STARTUP_ENABLED', false),
       telegramSystemStartupEnabled: envBoolean('NOTIFICATION_TELEGRAM_SYSTEM_STARTUP_ENABLED', false),
+      androidSystemStartupEnabled: envBoolean('NOTIFICATION_ANDROID_SYSTEM_STARTUP_ENABLED', false),
       emailOpnsenseDownEnabled: envBoolean('NOTIFICATION_EMAIL_OPNSENSE_DOWN_ENABLED', false),
       smsOpnsenseDownEnabled: envBoolean('NOTIFICATION_SMS_OPNSENSE_DOWN_ENABLED', false),
       telegramOpnsenseDownEnabled: envBoolean('NOTIFICATION_TELEGRAM_OPNSENSE_DOWN_ENABLED', false),
+      androidOpnsenseDownEnabled: envBoolean('NOTIFICATION_ANDROID_OPNSENSE_DOWN_ENABLED', false),
       emailUserVerifiedEnabled: envBoolean('NOTIFICATION_EMAIL_USER_VERIFIED_ENABLED', false),
       smsUserVerifiedEnabled: envBoolean('NOTIFICATION_SMS_USER_VERIFIED_ENABLED', false),
       telegramUserVerifiedEnabled: envBoolean('NOTIFICATION_TELEGRAM_USER_VERIFIED_ENABLED', false),
+      androidUserVerifiedEnabled: envBoolean('NOTIFICATION_ANDROID_USER_VERIFIED_ENABLED', false),
       emailAccessExpiredEnabled: envBoolean('NOTIFICATION_EMAIL_ACCESS_EXPIRED_ENABLED', false),
       smsAccessExpiredEnabled: envBoolean('NOTIFICATION_SMS_ACCESS_EXPIRED_ENABLED', false),
       telegramAccessExpiredEnabled: envBoolean('NOTIFICATION_TELEGRAM_ACCESS_EXPIRED_ENABLED', false),
+      androidAccessExpiredEnabled: envBoolean('NOTIFICATION_ANDROID_ACCESS_EXPIRED_ENABLED', false),
       emailAdminLoginEnabled: envBoolean('NOTIFICATION_EMAIL_ADMIN_LOGIN_ENABLED', false),
       smsAdminLoginEnabled: envBoolean('NOTIFICATION_SMS_ADMIN_LOGIN_ENABLED', false),
       telegramAdminLoginEnabled: envBoolean('NOTIFICATION_TELEGRAM_ADMIN_LOGIN_ENABLED', false),
+      androidAdminLoginEnabled: envBoolean('NOTIFICATION_ANDROID_ADMIN_LOGIN_ENABLED', false),
       emailAdminLoginFailedEnabled: envBoolean('NOTIFICATION_EMAIL_ADMIN_LOGIN_FAILED_ENABLED', false),
       smsAdminLoginFailedEnabled: envBoolean('NOTIFICATION_SMS_ADMIN_LOGIN_FAILED_ENABLED', false),
       telegramAdminLoginFailedEnabled: envBoolean('NOTIFICATION_TELEGRAM_ADMIN_LOGIN_FAILED_ENABLED', false),
+      androidAdminLoginFailedEnabled: envBoolean('NOTIFICATION_ANDROID_ADMIN_LOGIN_FAILED_ENABLED', false),
       syslogStorageEnabled: envBoolean('NOTIFICATION_SYSLOG_STORAGE_ENABLED', true),
       syslogKamusmSuccessEnabled: envBoolean('NOTIFICATION_SYSLOG_KAMUSM_SUCCESS_ENABLED', true),
       syslogKamusmFailureEnabled: envBoolean('NOTIFICATION_SYSLOG_KAMUSM_FAILURE_ENABLED', true),
@@ -794,7 +882,7 @@ export function reloadConfig({ preserveKeys = [], loadSystem = false } = {}) {
   if (!config.installRequired &&
       config.gateway.mode === 'opnsense-api' &&
       (!config.gateway.baseUrl || !config.gateway.apiKey || !config.gateway.apiSecret)) {
-    throw new Error('OPNsense API mode requires OPNSENSE_BASE_URL, OPNSENSE_API_KEY and OPNSENSE_API_SECRET');
+    throw new Error('Gateway API mode requires OPNSENSE_BASE_URL, OPNSENSE_API_KEY and OPNSENSE_API_SECRET');
   }
   return config;
 }

@@ -109,6 +109,10 @@ export function renderOpnsenseTemplateHtml(input = {}) {
 `;
 }
 
+export function renderGatewayTemplateHtml(input = {}) {
+  return renderOpnsenseTemplateHtml(input);
+}
+
 function crc32(buffer) {
   let crc = 0xffffffff;
   for (const byte of buffer) {
@@ -196,10 +200,13 @@ export function createZipArchive(entries) {
 }
 
 export function createOpnsenseTemplateZip(input = {}) {
-  const html = renderOpnsenseTemplateHtml(input);
+  const options = normalizeOpnsenseTemplateOptions(input);
+  const html = renderOpnsenseTemplateHtml(options);
+  const entryName = 'index.html';
   return {
     filename: 'opnsense-captiveportal-template.zip',
+    entryName,
     html,
-    buffer: createZipArchive([{ name: 'index.html', data: html }])
+    buffer: createZipArchive([{ name: entryName, data: html }])
   };
 }

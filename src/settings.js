@@ -49,6 +49,8 @@ const legacySettingKeys = new Map([
   ['SYSLOG_TIME_ZONE', 'LOG5651_TIME_ZONE'],
   ['SYSLOG_RETENTION_DAYS', 'LOG5651_RETENTION_DAYS'],
   ['SYSLOG_EXPORT_DIR', 'LOG5651_EXPORT_DIR'],
+  ['SYSLOG_EXPORT_ZIP_ENABLED', 'LOG5651_EXPORT_ZIP_ENABLED'],
+  ['SYSLOG_EXPORT_DELETE_SOURCE_AFTER_ZIP', 'LOG5651_EXPORT_DELETE_SOURCE_AFTER_ZIP'],
   ['SYSLOG_AUTO_EXPORT_INTERVAL', 'LOG5651_AUTO_EXPORT_INTERVAL'],
   ['SYSLOG_STORAGE_ALERT_PERCENT', 'LOG5651_STORAGE_ALERT_PERCENT'],
   ['SYSLOG_STORAGE_BLOCK_PERCENT', 'LOG5651_STORAGE_BLOCK_PERCENT'],
@@ -75,12 +77,16 @@ const legacySettingKeys = new Map([
   ['SYSLOG_NTP_CHECK_ENABLED', 'LOG5651_NTP_CHECK_ENABLED'],
   ['NOTIFICATION_EMAIL_SYSLOG_STORAGE_ENABLED', 'NOTIFICATION_SYSLOG_STORAGE_ENABLED'],
   ['NOTIFICATION_SMS_SYSLOG_STORAGE_ENABLED', 'NOTIFICATION_SYSLOG_STORAGE_ENABLED'],
+  ['NOTIFICATION_ANDROID_SYSLOG_STORAGE_ENABLED', 'NOTIFICATION_SYSLOG_STORAGE_ENABLED'],
   ['NOTIFICATION_EMAIL_SYSLOG_KAMUSM_SUCCESS_ENABLED', 'NOTIFICATION_SYSLOG_KAMUSM_SUCCESS_ENABLED'],
   ['NOTIFICATION_SMS_SYSLOG_KAMUSM_SUCCESS_ENABLED', 'NOTIFICATION_SYSLOG_KAMUSM_SUCCESS_ENABLED'],
+  ['NOTIFICATION_ANDROID_SYSLOG_KAMUSM_SUCCESS_ENABLED', 'NOTIFICATION_SYSLOG_KAMUSM_SUCCESS_ENABLED'],
   ['NOTIFICATION_EMAIL_SYSLOG_KAMUSM_FAILURE_ENABLED', 'NOTIFICATION_SYSLOG_KAMUSM_FAILURE_ENABLED'],
   ['NOTIFICATION_SMS_SYSLOG_KAMUSM_FAILURE_ENABLED', 'NOTIFICATION_SYSLOG_KAMUSM_FAILURE_ENABLED'],
+  ['NOTIFICATION_ANDROID_SYSLOG_KAMUSM_FAILURE_ENABLED', 'NOTIFICATION_SYSLOG_KAMUSM_FAILURE_ENABLED'],
   ['NOTIFICATION_EMAIL_ADMIN_APPROVAL_ENABLED', 'NOTIFICATION_ADMIN_APPROVAL_ENABLED'],
   ['NOTIFICATION_SMS_ADMIN_APPROVAL_ENABLED', 'NOTIFICATION_ADMIN_APPROVAL_ENABLED'],
+  ['NOTIFICATION_ANDROID_ADMIN_APPROVAL_ENABLED', 'NOTIFICATION_ADMIN_APPROVAL_ENABLED'],
   ...QUOTA_METHODS.flatMap(({ prefix }) => [
     [`${prefix}_DOWNLOAD_SPEED_LIMIT_MBPS`, 'DOWNLOAD_SPEED_LIMIT_MBPS'],
     [`${prefix}_UPLOAD_SPEED_LIMIT_MBPS`, 'UPLOAD_SPEED_LIMIT_MBPS']
@@ -97,17 +103,34 @@ const quotaSectionLabels = {
   sms: 'SMS'
 };
 
+function gatewayModeVisible(...modes) {
+  return { visibleWhenValue: { key: 'GATEWAY_MODE', value: modes.flat().join('|') } };
+}
+
+// TODO(pfSense): Restore gatewayModeText when provider-specific admin labels are needed again.
+// function gatewayModeText(opnsenseText, pfsenseText) {
+//   return {
+//     key: 'GATEWAY_MODE',
+//     values: {
+//       'opnsense-api': opnsenseText,
+//       'pfsense-api': pfsenseText
+//     }
+//   };
+// }
+
 function quotaFields() {
   const fields = [
-    field('OPNSENSE_SHAPER_INTERFACE', 'Traffic shaper interface', {
+    field('OPNSENSE_SHAPER_INTERFACE', 'OPNsense traffic interface', {
       defaultValue: 'wan',
       placeholder: 'wan',
-      section: 'OPNsense traffic shaper'
+      section: 'Gateway traffic accounting',
+      ...gatewayModeVisible('opnsense-api')
     }),
-    field('OPNSENSE_SHAPER_NETWORK', 'Guest network or CIDR', {
+    field('OPNSENSE_SHAPER_NETWORK', 'OPNsense guest network or CIDR', {
       defaultValue: 'any',
       placeholder: '172.16.2.100 - 172.16.2.254',
-      warning: 'Accepts an IP, CIDR, comma-separated list or start-end IPv4 range.'
+      warning: 'Accepts an IP, CIDR, comma-separated list or start-end IPv4 range.',
+      ...gatewayModeVisible('opnsense-api')
     })
   ];
   for (const { method, prefix } of QUOTA_METHODS) {
@@ -119,14 +142,14 @@ function quotaFields() {
         max: 100000,
         defaultValue: '0',
         section,
-        warning: 'Set to 0 for unlimited speed. The API user needs the "Firewall: Shaper" privilege.'
+        warning: 'Set to 0 for unlimited speed. The gateway API user must be allowed to manage bandwidth limits.'
       }),
       field(`${prefix}_UPLOAD_SPEED_LIMIT_MBPS`, 'Upload speed limit per user (Mbps)', {
         type: 'number',
         min: 0,
         max: 100000,
         defaultValue: '0',
-        warning: 'Set to 0 for unlimited speed. The API user needs the "Firewall: Shaper" privilege.'
+        warning: 'Set to 0 for unlimited speed. The gateway API user must be allowed to manage bandwidth limits.'
       }),
       field(`${prefix}_QUOTA_PERIOD`, 'AKN period', {
         type: 'select',
@@ -301,50 +324,88 @@ export const settingsSchema = [
   },
   {
     id: 'opnsense',
-    label: 'OPNsense',
-    description: 'Captive Portal Session API connection.',
+    label: 'Gateway',
+    description: 'Captive portal gateway API connection.',
     fields: [
-      field('GATEWAY_MODE', 'Gateway mode', { type: 'select', options: ['mock', 'opnsense-api'] }),
-      field('OPNSENSE_BASE_URL', 'Base URL'),
-      field('OPNSENSE_ZONE_ID', 'Zone ID', { type: 'number', min: 0, max: 19 }),
-      field('OPNSENSE_ZONE_MAP', 'Client network zone map', {
+      field('GATEWAY_MODE', 'Gateway mode', {
+        type: 'select',
+        options: [
+          'mock',
+          'opnsense-api'
+          // TODO(pfSense): Re-enable after the pfSense integration is completed.
+          // 'pfsense-api'
+        ]
+      }),
+      field('OPNSENSE_BASE_URL', 'OPNsense API base URL', {
+        ...gatewayModeVisible('opnsense-api')
+      }),
+      /*
+       * TODO(pfSense): Restore this field together with the pfSense gateway option.
+       * field('OPNSENSE_CAPTIVE_PORTAL_URL', 'pfSense captive portal URL', {
+       *   placeholder: 'http://192.168.1.1:8000/index.php',
+       *   warning: 'Only needed when pfSense captive portal login is not served from the API base URL.',
+       *   ...gatewayModeVisible('pfsense-api')
+       * }),
+       */
+      field('OPNSENSE_ZONE_ID', 'OPNsense zone ID', {
+        type: 'number',
+        min: 0,
+        max: 19,
+        ...gatewayModeVisible('opnsense-api')
+      }),
+      field('OPNSENSE_ZONE_MAP', 'OPNsense client network zone map', {
         type: 'textarea',
         section: 'Captive portal zones',
         placeholder: '172.16.2.0/24=0\n172.16.3.0/24=1',
-        warning: 'Optional. Match client IPs to different captive portal zone IDs; falls back to Zone ID.'
+        warning: 'Optional. Match client IPs to different captive portal zone IDs; falls back to Zone ID.',
+        ...gatewayModeVisible('opnsense-api')
       }),
-      field('OPNSENSE_API_KEY', 'API key', { type: 'secret' }),
-      field('OPNSENSE_API_SECRET', 'API secret', { type: 'secret' }),
-      field('OPNSENSE_TLS_REJECT_UNAUTHORIZED', 'Verify TLS certificate', { type: 'boolean' }),
-      field('OPNSENSE_SYNC_ENABLED', 'Enable automatic session synchronization', {
+      field('OPNSENSE_API_KEY', 'OPNsense API key', {
+        type: 'secret',
+        ...gatewayModeVisible('opnsense-api')
+      }),
+      field('OPNSENSE_API_SECRET', 'OPNsense API secret', {
+        type: 'secret',
+        ...gatewayModeVisible('opnsense-api')
+      }),
+      field('OPNSENSE_TLS_REJECT_UNAUTHORIZED', 'Verify OPNsense TLS certificate', {
+        type: 'boolean',
+        ...gatewayModeVisible('opnsense-api')
+      }),
+      field('OPNSENSE_SYNC_ENABLED', 'Enable automatic OPNsense session synchronization', {
         type: 'boolean',
         defaultValue: 'true',
         section: 'Session synchronization',
-        warning: 'Disable this if OPNsense becomes unstable; manual Sync OPNsense remains available.'
+        warning: 'Disable this if OPNsense becomes unstable; manual Sync OPNsense remains available.',
+        ...gatewayModeVisible('opnsense-api')
       }),
-      field('OPNSENSE_SYNC_INTERVAL_SECONDS', 'Synchronization interval in seconds', {
+      field('OPNSENSE_SYNC_INTERVAL_SECONDS', 'OPNsense synchronization interval in seconds', {
         type: 'number',
         min: 5,
         max: 3600,
         defaultValue: '10',
         section: 'Session synchronization',
-        warning: 'Lower values close stale IP sessions faster but call the OPNsense API more often.'
+        warning: 'Lower values close stale IP sessions faster but call the OPNsense API more often.',
+        ...gatewayModeVisible('opnsense-api')
       }),
-      field('OPNSENSE_KEA_LEASE_SYNC_ENABLED', 'Align Kea DHCP lease lifetime with access duration', {
+      field('OPNSENSE_KEA_LEASE_SYNC_ENABLED', 'Align OPNsense Kea DHCP lease lifetime with access duration', {
         type: 'boolean',
         defaultValue: 'true',
         section: 'Session synchronization',
-        warning: 'Creates G-Hotspot managed Kea DHCPv4 reservations with DHCP lease-time option 51.'
+        warning: 'Creates G-Hotspot managed Kea DHCPv4 reservations with DHCP lease-time option 51.',
+        ...gatewayModeVisible('opnsense-api')
       }),
-      field('OPNSENSE_COOKIE_IP_MOVE_ENABLED', 'Move verified cookie session after IP changes', {
+      field('OPNSENSE_COOKIE_IP_MOVE_ENABLED', 'Move verified OPNsense session after IP changes', {
         type: 'boolean',
         defaultValue: 'true',
-        warning: 'When a verified browser keeps its session cookie, access can follow the device to its new IP address.'
+        warning: 'When a verified browser keeps its session cookie, access can follow the device to its new IP address.',
+        ...gatewayModeVisible('opnsense-api')
       }),
-      field('OPNSENSE_SESSION_COOKIE_REQUIRED', 'Require session cookie for verified devices', {
+      field('OPNSENSE_SESSION_COOKIE_REQUIRED', 'Require browser session cookie for OPNsense access', {
         type: 'boolean',
         defaultValue: 'false',
-        warning: 'When enabled, devices without a valid session cookie must verify again even if their IP has an active session. To access session details later at xx:port/session, users should complete verification in a regular browser and then open the session page from that same browser. Otherwise, access can still be moved with the verification cookie, but session details will not be available from a browser that does not have that cookie.'
+        warning: 'When enabled, devices without a valid session cookie must verify again even if their IP has an active session. To access session details later at xx:port/session, users should complete verification in a regular browser and then open the session page from that same browser. Otherwise, access can still be moved with the verification cookie, but session details will not be available from a browser that does not have that cookie.',
+        ...gatewayModeVisible('opnsense-api')
       })
     ]
   },
@@ -357,14 +418,14 @@ export const settingsSchema = [
   {
     id: 'syslog',
     label: 'Syslog',
-    description: 'Structured traffic records for selected OPNsense networks.',
+    description: 'Structured traffic records for selected gateway networks.',
     fields: [
       field('SYSLOG_ENABLED', 'Enable syslog logging', {
         type: 'boolean',
         defaultValue: 'false',
         warning: 'Records are appended with timestamps and hash-chain integrity metadata.'
       }),
-      field('SYSLOG_NETWORKS', 'Logged OPNsense networks', {
+      field('SYSLOG_NETWORKS', 'Logged gateway networks', {
         type: 'textarea',
         defaultValue: 'any',
         placeholder: '172.16.2.0/24, 10.10.10.20 - 10.10.10.80',
@@ -381,11 +442,22 @@ export const settingsSchema = [
         min: 1,
         max: 1000,
         defaultValue: '730',
-        warning: 'Syslog traffic retention must stay within the applicable legal retention window.'
+        warning: 'Syslog traffic retention must stay within the applicable legal retention window. Records older than the entered day count are automatically deleted from the database and the configured syslog export directory on disk.'
       }),
       field('SYSLOG_EXPORT_DIR', 'Log directory', {
         defaultValue: './data/syslog',
         warning: 'Automatic export files are written here as .log files; timestamp tokens use the matching .tsr extension.'
+      }),
+      field('SYSLOG_EXPORT_ZIP_ENABLED', 'Create ZIP after syslog export', {
+        type: 'boolean',
+        defaultValue: 'false',
+        warning: 'When enabled, each exported .log file is also written as a .zip archive. Timestamp request and reply files are included when present.'
+      }),
+      field('SYSLOG_EXPORT_DELETE_SOURCE_AFTER_ZIP', 'Delete source files after ZIP is created', {
+        type: 'boolean',
+        defaultValue: 'false',
+        visibleWhen: 'SYSLOG_EXPORT_ZIP_ENABLED',
+        warning: 'Only applies when ZIP creation is enabled. The .log, .tsq and .tsr source files are removed after the ZIP is created.'
       }),
       field('SYSLOG_AUTO_EXPORT_INTERVAL', 'Automatic export interval', {
         type: 'select',
@@ -409,11 +481,11 @@ export const settingsSchema = [
         defaultValue: '99',
         warning: 'New portal sessions are refused when syslog storage reaches this usage.'
       }),
-      field('SYSLOG_RECEIVER_ENABLED', 'Enable OPNsense firewall syslog receiver', {
+      field('SYSLOG_RECEIVER_ENABLED', 'Enable firewall syslog receiver', {
         type: 'boolean',
         defaultValue: 'false',
         restartRequired: true,
-        section: 'OPNsense firewall flow logs',
+        section: 'Firewall flow logs',
         warning: 'Required for logging non-captive-portal devices on the selected networks.'
       }),
       field('SYSLOG_RECEIVER_HOST', 'Syslog listen host', {
@@ -426,7 +498,7 @@ export const settingsSchema = [
         max: 65535,
         defaultValue: '5514',
         restartRequired: true,
-        warning: 'Configure OPNsense remote syslog/firewall log target to this host and port.'
+        warning: 'Configure the gateway remote syslog/firewall log target to this host and port.'
       }),
       field('SYSLOG_HEALTH_CHECK_INTERVAL_SECONDS', 'Health check interval (seconds)', {
         type: 'number',
@@ -626,7 +698,7 @@ export const settingsSchema = [
         defaultValue: 'false',
         visibleWhen: 'NOTIFICATION_EMAIL_ENABLED'
       }),
-      field('NOTIFICATION_EMAIL_OPNSENSE_DOWN_ENABLED', 'OPNsense outage', {
+      field('NOTIFICATION_EMAIL_OPNSENSE_DOWN_ENABLED', 'Gateway outage', {
         type: 'boolean',
         defaultValue: 'false',
         visibleWhen: 'NOTIFICATION_EMAIL_ENABLED'
@@ -671,7 +743,7 @@ export const settingsSchema = [
         defaultValue: 'false',
         visibleWhen: 'NOTIFICATION_SMS_ENABLED'
       }),
-      field('NOTIFICATION_SMS_OPNSENSE_DOWN_ENABLED', 'OPNsense outage', {
+      field('NOTIFICATION_SMS_OPNSENSE_DOWN_ENABLED', 'Gateway outage', {
         type: 'boolean',
         defaultValue: 'false',
         visibleWhen: 'NOTIFICATION_SMS_ENABLED'
@@ -716,7 +788,7 @@ export const settingsSchema = [
         defaultValue: 'false',
         visibleWhen: 'NOTIFICATION_TELEGRAM_ENABLED'
       }),
-      field('NOTIFICATION_TELEGRAM_OPNSENSE_DOWN_ENABLED', 'OPNsense outage', {
+      field('NOTIFICATION_TELEGRAM_OPNSENSE_DOWN_ENABLED', 'Gateway outage', {
         type: 'boolean',
         defaultValue: 'false',
         visibleWhen: 'NOTIFICATION_TELEGRAM_ENABLED'
@@ -829,6 +901,96 @@ export const settingsSchema = [
         visibleWhen: 'NOTIFICATION_SMS_ENABLED',
         visibleWhenAny: ['NOTIFICATION_SMS_ADMIN_APPROVAL_ENABLED'],
         warning: 'Available placeholders: {appName}, {fullName}, {contact}, {decisionText}, {decisionAt}, {validity}, {validUntil}, {status}.'
+      })
+    ]
+  },
+  {
+    id: 'android-notifications',
+    label: 'Android notifications',
+    description: 'Firebase push delivery, Android alert subscriptions, and paired admin devices.',
+    fields: [
+      field('NOTIFICATION_ANDROID_ENABLED', 'Send to Android app', {
+        type: 'boolean',
+        defaultValue: 'false',
+        warning: 'Queues alerts for registered G-Hotspot Android admin devices.'
+      }),
+      field('ANDROID_FCM_SERVICE_ACCOUNT_FILE', 'Firebase service account JSON file', {
+        defaultValue: '',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED',
+        warning: 'Absolute server path to the Firebase service account JSON. Keep this file outside the public directory.'
+      }),
+      field('ANDROID_APP_POLL_INTERVAL_SECONDS', 'Android app poll interval (seconds)', {
+        type: 'number',
+        min: 5,
+        max: 300,
+        defaultValue: '20',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED',
+        warning: 'Used only as a fallback when Firebase push is unavailable.'
+      }),
+      field('NOTIFICATION_ANDROID_REPEAT_FREQUENCY', 'Android notification frequency', {
+        type: 'select',
+        options: ['state-change', 'hourly', 'daily', 'monthly'],
+        defaultValue: 'state-change',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED',
+        warning: 'Threshold changes are sent immediately; this controls repeated Android reminders while an alert remains active.'
+      }),
+      field('NOTIFICATION_ANDROID_STARTUP_ENABLED', 'Send Android notification on every system startup', {
+        type: 'boolean',
+        defaultValue: 'false',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED',
+        warning: 'If an alert is already active when the service starts, an Android reminder is sent once.'
+      }),
+      field('NOTIFICATION_ANDROID_SYSLOG_STORAGE_ENABLED', 'Syslog storage fullness alerts', {
+        type: 'boolean',
+        defaultValue: 'true',
+        section: 'Alert types',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED'
+      }),
+      field('NOTIFICATION_ANDROID_SYSLOG_KAMUSM_SUCCESS_ENABLED', 'Timestamp success notifications', {
+        type: 'boolean',
+        defaultValue: 'true',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED'
+      }),
+      field('NOTIFICATION_ANDROID_SYSLOG_KAMUSM_FAILURE_ENABLED', 'Timestamp failure notifications', {
+        type: 'boolean',
+        defaultValue: 'true',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED'
+      }),
+      field('NOTIFICATION_ANDROID_ADMIN_APPROVAL_ENABLED', 'Admin approval requests', {
+        type: 'boolean',
+        defaultValue: 'true',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED',
+        warning: 'Sends actionable Android notifications for new admin approval requests.'
+      }),
+      field('NOTIFICATION_ANDROID_SYSTEM_STARTUP_ENABLED', 'System startup', {
+        type: 'boolean',
+        defaultValue: 'false',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED'
+      }),
+      field('NOTIFICATION_ANDROID_OPNSENSE_DOWN_ENABLED', 'Gateway outage', {
+        type: 'boolean',
+        defaultValue: 'false',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED'
+      }),
+      field('NOTIFICATION_ANDROID_USER_VERIFIED_ENABLED', 'User verified', {
+        type: 'boolean',
+        defaultValue: 'false',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED'
+      }),
+      field('NOTIFICATION_ANDROID_ACCESS_EXPIRED_ENABLED', 'Access expired', {
+        type: 'boolean',
+        defaultValue: 'false',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED'
+      }),
+      field('NOTIFICATION_ANDROID_ADMIN_LOGIN_ENABLED', 'Admin sign-in', {
+        type: 'boolean',
+        defaultValue: 'false',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED'
+      }),
+      field('NOTIFICATION_ANDROID_ADMIN_LOGIN_FAILED_ENABLED', 'Failed admin sign-in attempt', {
+        type: 'boolean',
+        defaultValue: 'false',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED'
       })
     ]
   },
@@ -1246,22 +1408,33 @@ const installSettingKeys = new Set([
   'ADMIN_SESSION_HOURS',
   'GATEWAY_MODE',
   'OPNSENSE_BASE_URL',
+  // TODO(pfSense): Restore OPNSENSE_CAPTIVE_PORTAL_URL when pfSense support resumes.
+  // 'OPNSENSE_CAPTIVE_PORTAL_URL',
   'OPNSENSE_ZONE_ID',
   'OPNSENSE_API_KEY',
   'OPNSENSE_API_SECRET',
   'OPNSENSE_TLS_REJECT_UNAUTHORIZED',
   ...installOptionalSettingKeys
 ]);
+const TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES = [15, 30, 45, 60];
+
+function normalizeTrafficLogRetentionMinutes(value, fallback = 60) {
+  const parsed = Math.trunc(Number(value));
+  const minutes = Number.isFinite(parsed) ? parsed : fallback;
+  if (minutes <= TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES[0]) return TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES[0];
+  return TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES.find(option => minutes <= option) ||
+    TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES.at(-1);
+}
+
 const trafficLogFields = [
   field('TRAFFIC_LOGS_ENABLED', 'Enable operational traffic logs', {
     type: 'boolean',
     defaultValue: 'true'
   }),
-  field('TRAFFIC_LOGS_RETENTION_DAYS', 'Retention period (days)', {
-    type: 'number',
-    min: 1,
-    max: 365,
-    defaultValue: '30'
+  field('TRAFFIC_LOGS_RETENTION_MINUTES', 'Retention period', {
+    type: 'select',
+    options: ['15', '30', '45', '60'],
+    defaultValue: '60'
   }),
   field('TRAFFIC_LOGS_RESOLVE_DOMAINS', 'Resolve destination domains', {
     type: 'boolean',
@@ -1294,6 +1467,16 @@ function integerSetting(value, fallback, { min, max } = {}) {
 function trafficLogPublicValues(values, includeProcessEnv) {
   const output = {};
   for (const field of trafficLogFields) {
+    if (field.key === 'TRAFFIC_LOGS_RETENTION_MINUTES') {
+      const direct = values[field.key] ?? (includeProcessEnv ? process.env[field.key] : undefined);
+      const legacyDays = values.TRAFFIC_LOGS_RETENTION_DAYS ??
+        (includeProcessEnv ? process.env.TRAFFIC_LOGS_RETENTION_DAYS : undefined);
+      output[field.key] = String(normalizeTrafficLogRetentionMinutes(
+        direct ?? (legacyDays == null || legacyDays === '' ? undefined : Number(legacyDays) * 24 * 60),
+        Number(field.defaultValue)
+      ));
+      continue;
+    }
     output[field.key] = values[field.key] ??
       (includeProcessEnv ? process.env[field.key] : undefined) ??
       field.defaultValue ??
@@ -1482,17 +1665,20 @@ export function getTrafficLogSettings(envPath = null) {
 function collectTrafficLogChanges(input) {
   const changes = {};
   const enabledField = trafficLogField('TRAFFIC_LOGS_ENABLED');
-  const retentionField = trafficLogField('TRAFFIC_LOGS_RETENTION_DAYS');
+  const retentionField = trafficLogField('TRAFFIC_LOGS_RETENTION_MINUTES');
   const resolveField = trafficLogField('TRAFFIC_LOGS_RESOLVE_DOMAINS');
   const refreshField = trafficLogField('TRAFFIC_LOGS_LIVE_REFRESH_SECONDS');
   if (Object.hasOwn(input || {}, 'TRAFFIC_LOGS_ENABLED')) {
     changes.TRAFFIC_LOGS_ENABLED = String(booleanSetting(input.TRAFFIC_LOGS_ENABLED, enabledField.defaultValue === 'true'));
   }
-  if (Object.hasOwn(input || {}, 'TRAFFIC_LOGS_RETENTION_DAYS')) {
-    changes.TRAFFIC_LOGS_RETENTION_DAYS = String(integerSetting(
-      input.TRAFFIC_LOGS_RETENTION_DAYS,
-      Number(retentionField.defaultValue),
-      { min: retentionField.min, max: retentionField.max }
+  if (Object.hasOwn(input || {}, 'TRAFFIC_LOGS_RETENTION_MINUTES') ||
+      Object.hasOwn(input || {}, 'TRAFFIC_LOGS_RETENTION_DAYS')) {
+    const retentionInput = Object.hasOwn(input || {}, 'TRAFFIC_LOGS_RETENTION_MINUTES')
+      ? input.TRAFFIC_LOGS_RETENTION_MINUTES
+      : Number(input.TRAFFIC_LOGS_RETENTION_DAYS) * 24 * 60;
+    changes.TRAFFIC_LOGS_RETENTION_MINUTES = String(normalizeTrafficLogRetentionMinutes(
+      retentionInput,
+      Number(retentionField.defaultValue)
     ));
   }
   if (Object.hasOwn(input || {}, 'TRAFFIC_LOGS_RESOLVE_DOMAINS')) {
@@ -1561,16 +1747,16 @@ function installBoolean(value, fallback) {
   return String(booleanSetting(value, fallback));
 }
 
-function installUrl(value) {
-  const text = requiredInstallText(value, 'OPNsense base URL').replace(/\/+$/u, '');
+function installUrl(value, label = 'Gateway base URL') {
+  const text = requiredInstallText(value, label).replace(/\/+$/u, '');
   let url;
   try {
     url = new URL(text);
   } catch {
-    throw new Error('OPNsense base URL must be a valid URL');
+    throw new Error(`${label} must be a valid URL`);
   }
   if (!['http:', 'https:'].includes(url.protocol)) {
-    throw new Error('OPNsense base URL must start with http:// or https://');
+    throw new Error(`${label} must start with http:// or https://`);
   }
   return text;
 }
@@ -1591,10 +1777,14 @@ export function getInstallStatus() {
 export function installOpnsenseGateway(input = {}) {
   const source = input.settings && typeof input.settings === 'object' ? input.settings : input;
   const mode = normalizedGatewayMode(source.GATEWAY_MODE);
-  if (mode !== 'opnsense-api') throw new Error('GATEWAY_MODE must be opnsense-api');
+  if (mode !== 'opnsense-api') {
+    throw new Error('GATEWAY_MODE must be opnsense-api');
+  }
   return {
     mode,
-    baseUrl: installUrl(source.OPNSENSE_BASE_URL),
+    baseUrl: installUrl(source.OPNSENSE_BASE_URL, 'OPNsense base URL'),
+    // TODO(pfSense): Populate this from OPNSENSE_CAPTIVE_PORTAL_URL when support resumes.
+    captivePortalUrl: '',
     zoneId: installInteger(source.OPNSENSE_ZONE_ID, 0, {
       min: 0,
       max: 19,
@@ -1636,11 +1826,15 @@ export function completeInstallation(input = {}) {
   };
 
   if (mode === 'opnsense-api') {
-    changes.OPNSENSE_BASE_URL = installUrl(source.OPNSENSE_BASE_URL);
+    changes.OPNSENSE_BASE_URL = installUrl(source.OPNSENSE_BASE_URL, 'OPNsense base URL');
     changes.OPNSENSE_API_KEY = requiredInstallText(source.OPNSENSE_API_KEY, 'OPNsense API key');
     changes.OPNSENSE_API_SECRET = requiredInstallText(source.OPNSENSE_API_SECRET, 'OPNsense API secret');
   } else {
-    for (const key of ['OPNSENSE_BASE_URL', 'OPNSENSE_API_KEY', 'OPNSENSE_API_SECRET']) {
+    for (const key of [
+      'OPNSENSE_BASE_URL',
+      'OPNSENSE_API_KEY',
+      'OPNSENSE_API_SECRET'
+    ]) {
       if (source[key] != null) changes[key] = String(source[key] || '').trim();
     }
   }

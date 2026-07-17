@@ -6,7 +6,8 @@ import { normalizeMac } from '../lib/security.js';
 import { authorizationQuotaBlocked } from './quotas.js';
 
 function requestApi(url, {
-  username, password, rejectUnauthorized, method = 'GET', form = null, json = null, timeout = 15000
+  username, password, rejectUnauthorized, method = 'GET', form = null, json = null, timeout = 15000,
+  providerName = 'Gateway'
 }) {
   return new Promise((resolve, reject) => {
     const target = new URL(url);
@@ -43,7 +44,7 @@ function requestApi(url, {
         try { parsed = text ? JSON.parse(text) : {}; } catch {}
         if ((response.statusCode || 500) >= 400) {
           const error = new Error(
-            `OPNsense API returned HTTP ${response.statusCode}: ${text.slice(0, 500)}`
+            `${providerName} API returned HTTP ${response.statusCode}: ${text.slice(0, 500)}`
           );
           error.statusCode = response.statusCode;
           error.response = parsed;
@@ -53,7 +54,7 @@ function requestApi(url, {
         resolve(parsed);
       });
     });
-    request.on('timeout', () => request.destroy(new Error('OPNsense API request timed out')));
+    request.on('timeout', () => request.destroy(new Error(`${providerName} API request timed out`)));
     request.on('error', reject);
     request.end(body);
   });
@@ -75,6 +76,18 @@ const MIN_DHCP_LEASE_SECONDS = 60;
 const CLIENT_OWNERSHIP_CACHE_TTL_MS = 5000;
 let appliedBandwidthKey = '';
 const clientOwnershipCache = new Map();
+
+function gatewayProviderName(gateway = {}) {
+  return gateway.mode === 'pfsense-api' ? 'pfSense' : 'OPNsense';
+}
+
+function gatewayIsPfsense(gateway = {}) {
+  return gateway.mode === 'pfsense-api';
+}
+
+function gatewayIsOpnsense(gateway = {}) {
+  return gateway.mode === 'opnsense-api';
+}
 
 function defaultZoneId(gateway) {
   return Number(gateway.zoneId || 0);
@@ -116,6 +129,7 @@ async function gatewayRequest(gateway, endpoint, options = {}) {
       username: gateway.apiKey,
       password: gateway.apiSecret,
       rejectUnauthorized: gateway.tlsRejectUnauthorized,
+      providerName: gatewayProviderName(gateway),
       ...options
     });
   } catch (error) {
@@ -136,6 +150,8 @@ function responseRows(response) {
   if (Array.isArray(response?.rows)) return response.rows;
   if (Array.isArray(response?.items)) return response.items;
   if (Array.isArray(response?.data)) return response.data;
+  if (Array.isArray(response?.data?.rows)) return response.data.rows;
+  if (Array.isArray(response?.data?.items)) return response.data.items;
   return [];
 }
 
@@ -482,6 +498,9 @@ export async function ensureGatewayBandwidthLimits(gateway, { force = false, aut
       uploadSpeedMbps: gateway.uploadSpeedMbps || 0
     };
   }
+  if (gatewayIsPfsense(gateway)) {
+    return { applied: false, skipped: true, reason: 'gateway_not_opnsense' };
+  }
   if (gateway.bandwidthProfiles && Array.isArray(authorizations)) {
     return ensureGatewayBandwidthProfiles(gateway, authorizations, { force });
   }
@@ -557,12 +576,31 @@ export async function authorizeGateway(gateway, { user, clientIp }) {
       }
     };
   }
+  if (gatewayIsPfsense(gateway)) {
+    const sessionId = `pfsense-browser-login-${randomUUID()}`;
+    const gatewayLogin = pfsenseGatewayLogin(gateway, { user, clientIp, zoneId });
+    return {
+      sessionId,
+      storedSessionId: storedGatewaySessionId(gateway, sessionId, zoneId),
+      clientMac: '',
+      zoneId,
+      gatewayLogin,
+      response: {
+        status: 'pfsense-browser-login-required',
+        user,
+        ipAddress: clientIp,
+        gHotspotZoneId: zoneId,
+        gatewayLogin
+      }
+    };
+  }
 
   const endpoint = `${gateway.baseUrl}/api/captiveportal/session/connect/${zoneId}`;
   const response = await requestApi(endpoint, {
     username: gateway.apiKey,
     password: gateway.apiSecret,
     rejectUnauthorized: gateway.tlsRejectUnauthorized,
+    providerName: gatewayProviderName(gateway),
     method: 'POST',
     form: { user, ip: clientIp }
   });
@@ -582,12 +620,40 @@ export async function authorizeGateway(gateway, { user, clientIp }) {
   };
 }
 
+function pfsenseGatewayLogin(gateway, { user, clientIp, zoneId }) {
+  const action = pfsenseCaptivePortalUrl(gateway, zoneId);
+  return {
+    provider: 'pfSense',
+    method: 'POST',
+    action,
+    fields: {
+      auth_user: gateway.portalUsername || gateway.apiKey || user,
+      auth_pass: gateway.portalPassword || gateway.apiSecret || '',
+      zone: String(zoneId),
+      redirurl: '',
+      accept: 'Continue',
+      user,
+      ip: clientIp,
+      clientip: clientIp
+    }
+  };
+}
+
+function pfsenseCaptivePortalUrl(gateway, zoneId) {
+  const raw = String(gateway.captivePortalUrl || gateway.portalUrl || gateway.baseUrl || '').trim();
+  const target = new URL(raw || 'http://127.0.0.1/');
+  if (!target.pathname || target.pathname === '/') target.pathname = '/index.php';
+  if (!target.searchParams.has('zone')) target.searchParams.set('zone', String(zoneId));
+  return target.toString();
+}
+
 async function listGatewaySessionsForZone(gateway, zoneId, annotateZone) {
   const endpoint = `${gateway.baseUrl}/api/captiveportal/session/list/${zoneId}`;
   const response = await requestApi(endpoint, {
     username: gateway.apiKey,
     password: gateway.apiSecret,
-    rejectUnauthorized: gateway.tlsRejectUnauthorized
+    rejectUnauthorized: gateway.tlsRejectUnauthorized,
+    providerName: gatewayProviderName(gateway)
   });
   const rows = Array.isArray(response)
     ? response
@@ -601,6 +667,7 @@ async function listGatewaySessionsForZone(gateway, zoneId, annotateZone) {
 
 export async function listGatewaySessions(gateway) {
   if (gateway.mode === 'mock') return [];
+  if (gatewayIsPfsense(gateway)) return [];
   const zoneIds = gatewayZoneIds(gateway);
   const annotateZone = (gateway.zoneMap || []).length || zoneIds.length > 1;
   const results = await Promise.all(
@@ -611,7 +678,10 @@ export async function listGatewaySessions(gateway) {
 
 export async function listGatewayArpEntries(gateway) {
   if (gateway.mode === 'mock') return [];
-  const response = await gatewayRequest(gateway, '/api/diagnostics/interface/get_arp');
+  const endpoints = gatewayIsPfsense(gateway)
+    ? ['/api/v2/diagnostics/arp_table']
+    : ['/api/diagnostics/interface/get_arp'];
+  const response = await firstGatewayResponse(gateway, endpoints);
   return responseRows(response).map(row => ({
     clientIp: firstIpv4(textField(row, [
       'ipAddress', 'ip_address', 'ip-address', 'ip', 'address', 'host', 'hostname'
@@ -624,7 +694,21 @@ export async function listGatewayArpEntries(gateway) {
   })).filter(row => row.clientIp && row.clientMac);
 }
 
-function leaseRow(row) {
+async function firstGatewayResponse(gateway, endpoints, options = {}) {
+  let lastError = null;
+  for (const endpoint of endpoints) {
+    try {
+      return await gatewayRequest(gateway, endpoint, options[endpoint] || {});
+    } catch (error) {
+      lastError = error;
+      if (![403, 404, 405].includes(Number(error.statusCode || 0))) throw error;
+    }
+  }
+  if (lastError) throw lastError;
+  return [];
+}
+
+function leaseRow(row, source = 'opnsense-dhcpv4') {
   return {
     clientIp: firstIpv4(textField(row, [
       'ipAddress', 'ip_address', 'ip-address', 'address', 'ip', 'leaseAddress', 'lease_address'
@@ -635,26 +719,29 @@ function leaseRow(row) {
     ]) || JSON.stringify(row)),
     deviceName: textField(row, ['hostname', 'hostName', 'clientHostname', 'name', 'descr', 'description']),
     interface: textField(row, ['interface', 'if', 'ifDescr', 'if_descr']),
-    state: textField(row, ['state', 'status', 'binding_state']),
-    source: 'opnsense-dhcpv4',
+    state: textField(row, ['state', 'status', 'binding_state', 'active_status', 'online_status', 'act', 'online']),
+    source,
     raw: row
   };
 }
 
 export async function listGatewayDhcpLeases(gateway) {
   if (gateway.mode === 'mock') return [];
-  const candidates = [
-    { endpoint: '/api/kea/leases4/search', options: { method: 'POST', json: {} } },
-    { endpoint: '/api/kea/leases/search', options: { method: 'POST', json: {} } },
-    { endpoint: '/api/dhcpv4/leases/searchLease' },
-    { endpoint: '/api/dhcpv4/leases/search' },
-    { endpoint: '/api/kea/dhcpv4/searchLease' }
-  ];
+  const source = gatewayIsPfsense(gateway) ? 'pfsense-dhcpv4' : 'opnsense-dhcpv4';
+  const candidates = gatewayIsPfsense(gateway)
+    ? [{ endpoint: '/api/v2/status/dhcp_server/leases' }]
+    : [
+        { endpoint: '/api/kea/leases4/search', options: { method: 'POST', json: {} } },
+        { endpoint: '/api/kea/leases/search', options: { method: 'POST', json: {} } },
+        { endpoint: '/api/dhcpv4/leases/searchLease' },
+        { endpoint: '/api/dhcpv4/leases/search' },
+        { endpoint: '/api/kea/dhcpv4/searchLease' }
+      ];
   let lastError = null;
   for (const candidate of candidates) {
     try {
       const response = await gatewayRequest(gateway, candidate.endpoint, candidate.options || {});
-      const rows = responseRows(response).map(leaseRow)
+      const rows = responseRows(response).map(row => leaseRow(row, source))
         .filter(row => row.clientIp && row.clientMac);
       if (rows.length || responseRows(response).length) return rows;
     } catch (error) {
@@ -690,7 +777,7 @@ export async function listGatewayClientOwnership(gateway, {
   cacheTtlMs = CLIENT_OWNERSHIP_CACHE_TTL_MS,
   context = 'resolving client ownership'
 } = {}) {
-  if (gateway.mode !== 'opnsense-api') return clientOwnership([]);
+  if (gateway.mode === 'mock') return clientOwnership([]);
   const key = clientOwnershipCacheKey(gateway);
   const now = Date.now();
   const ttl = Math.max(0, Number(cacheTtlMs) || 0);
@@ -704,10 +791,10 @@ export async function listGatewayClientOwnership(gateway, {
       listGatewayDhcpLeases(gateway)
     ]);
     if (arpResult.status === 'rejected') {
-      console.warn(`OPNsense ARP lookup failed while ${context}: ${arpResult.reason.message}`);
+      console.warn(`${gatewayProviderName(gateway)} ARP lookup failed while ${context}: ${arpResult.reason.message}`);
     }
     if (dhcpResult.status === 'rejected') {
-      console.warn(`OPNsense DHCP lease lookup failed while ${context}: ${dhcpResult.reason.message}`);
+      console.warn(`${gatewayProviderName(gateway)} DHCP lease lookup failed while ${context}: ${dhcpResult.reason.message}`);
     }
     const value = clientOwnership([
       ...(arpResult.status === 'fulfilled' ? arpResult.value : []),
@@ -998,7 +1085,7 @@ async function ensureKeaReservation(gateway, payload) {
 export async function ensureGatewayKeaDhcpLease(gateway, {
   authorizationId, clientIp, clientMac, expiresAt, leaseSeconds, method, identity
 }) {
-  if (gateway.mode !== 'opnsense-api') return { applied: false, skipped: true, reason: 'gateway_not_opnsense' };
+  if (!gatewayIsOpnsense(gateway)) return { applied: false, skipped: true, reason: 'gateway_not_opnsense' };
   const ip = firstIpv4(clientIp);
   const mac = normalizeMac(clientMac);
   const id = String(authorizationId || '').trim();
@@ -1034,7 +1121,7 @@ export async function ensureGatewayKeaDhcpLease(gateway, {
 }
 
 export async function deleteGatewayKeaDhcpLease(gateway, authorization) {
-  if (gateway.mode !== 'opnsense-api') return { deleted: 0, skipped: true, reason: 'gateway_not_opnsense' };
+  if (!gatewayIsOpnsense(gateway)) return { deleted: 0, skipped: true, reason: 'gateway_not_opnsense' };
   const authorizationId = String(authorization?.id || authorization?.authorizationId || '').trim();
   const clientIp = firstIpv4(authorization?.client_ip || authorization?.clientIp);
   const clientMac = normalizeMac(authorization?.client_mac || authorization?.clientMac);
@@ -1135,6 +1222,7 @@ function collectInterfaceChoices(value, output = new Map()) {
 
 export async function listGatewayNetworkChoices(gateway) {
   if (gateway.mode === 'mock') return [];
+  if (gatewayIsPfsense(gateway)) return [];
   const endpoints = [
     '/api/interfaces/overview/export',
     '/api/interfaces/overview/search'
@@ -1168,12 +1256,14 @@ export async function listGatewayNetworkChoices(gateway) {
 
 export async function listGatewayInterfaces(gateway) {
   if (gateway.mode === 'mock') return [];
-  const endpoints = [
-    '/api/interfaces/overview/export',
-    '/api/interfaces/overview/search',
-    '/api/diagnostics/interface/get_interface_statistics',
-    '/api/diagnostics/interface/getInterfaceStatistics'
-  ];
+  const endpoints = gatewayIsPfsense(gateway)
+    ? ['/api/v2/status/interfaces', '/api/v2/interface']
+    : [
+        '/api/interfaces/overview/export',
+        '/api/interfaces/overview/search',
+        '/api/diagnostics/interface/get_interface_statistics',
+        '/api/diagnostics/interface/getInterfaceStatistics'
+      ];
   const choices = new Map();
   let lastError = null;
   for (const endpoint of endpoints) {
@@ -1203,12 +1293,14 @@ export async function readGatewayInterfaceTrafficCounters(gateway, interfaceName
       sampledAt: Date.now()
     };
   }
-  const endpoints = [
-    '/api/diagnostics/interface/get_interface_statistics',
-    '/api/diagnostics/interface/getInterfaceStatistics',
-    '/api/diagnostics/traffic/interface',
-    '/api/interfaces/overview/export'
-  ];
+  const endpoints = gatewayIsPfsense(gateway)
+    ? ['/api/v2/status/interfaces']
+    : [
+        '/api/diagnostics/interface/get_interface_statistics',
+        '/api/diagnostics/interface/getInterfaceStatistics',
+        '/api/diagnostics/traffic/interface',
+        '/api/interfaces/overview/export'
+      ];
   let lastError = null;
   let forbiddenError = null;
   for (const endpoint of endpoints) {
@@ -1224,27 +1316,34 @@ export async function readGatewayInterfaceTrafficCounters(gateway, interfaceName
       }
     } catch (error) {
       if (error.statusCode === 403) {
-        error.code = 'opnsense_interface_forbidden';
-        error.message = 'OPNsense API user is missing the "Diagnostics: Netstat" privilege.';
+        error.code = gatewayIsPfsense(gateway) ? 'pfsense_interface_forbidden' : 'opnsense_interface_forbidden';
+        error.message = `${gatewayProviderName(gateway)} API user is missing the interface statistics privilege.`;
         forbiddenError = error;
       }
       lastError = error;
       if (error.statusCode && error.statusCode !== 404 && error.statusCode !== 403) break;
     }
   }
-  const error = forbiddenError || lastError || new Error(`OPNsense interface counters were not found for ${interfaceName}`);
-  if (!error.code) error.code = error.statusCode === 403 ? 'opnsense_interface_forbidden' : 'opnsense_interface_counters_unavailable';
+  const error = forbiddenError || lastError ||
+    new Error(`${gatewayProviderName(gateway)} interface counters were not found for ${interfaceName}`);
+  if (!error.code) {
+    error.code = error.statusCode === 403
+      ? `${gatewayIsPfsense(gateway) ? 'pfsense' : 'opnsense'}_interface_forbidden`
+      : `${gatewayIsPfsense(gateway) ? 'pfsense' : 'opnsense'}_interface_counters_unavailable`;
+  }
   throw error;
 }
 
 export async function disconnectGatewaySession(gateway, sessionId) {
   if (gateway.mode === 'mock') return { status: 'mock-disconnected', sessionId };
+  if (gatewayIsPfsense(gateway)) return { skipped: true, reason: 'pfsense_browser_managed_session', sessionId };
   const stored = splitGatewaySessionId(gateway, sessionId);
   const endpoint = `${gateway.baseUrl}/api/captiveportal/session/disconnect/${stored.zoneId}`;
   return requestApi(endpoint, {
     username: gateway.apiKey,
     password: gateway.apiSecret,
     rejectUnauthorized: gateway.tlsRejectUnauthorized,
+    providerName: gatewayProviderName(gateway),
     method: 'POST',
     form: { sessionId: stored.sessionId }
   });
