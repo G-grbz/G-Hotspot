@@ -2,6 +2,7 @@ const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
 const i18n = window.GH_I18N;
 const t = (text, variables) => i18n.t(text, variables);
+const ADMIN_PASSWORD_MIN_LENGTH = 8;
 
 const stepTitles = [
   'Application settings',
@@ -497,8 +498,29 @@ function syncOptionalControls() {
   syncSmtpTlsFields();
 }
 
+function adminPasswordMeetsRequirements(value) {
+  const password = String(value || '');
+  return password.length >= ADMIN_PASSWORD_MIN_LENGTH && /\p{L}/u.test(password) && /\p{N}/u.test(password) && /\p{Lu}/u.test(password);
+}
+
+function validateAdminPassword({ report = true } = {}) {
+  const input = $('#adminPassword');
+  if (!input) return true;
+
+  input.setCustomValidity('');
+  if (!adminPasswordMeetsRequirements(input.value)) {
+    input.setCustomValidity(t('Admin password must contain at least 8 characters, including one letter, one uppercase letter, and one number.'));
+    if (report) input.reportValidity();
+    return false;
+  }
+  return true;
+}
+
 function validateStep(step = state.currentStep, { requireOpnsenseTest = true } = {}) {
   const root = $(`[data-step="${step}"]`);
+
+  if (step === 0 && !validateAdminPassword()) return false;
+
   const fields = [...root.querySelectorAll('input, select, textarea')]
     .filter(input => !input.disabled && !input.closest('.hidden'));
   for (const input of fields) {
@@ -545,7 +567,8 @@ function syncActions() {
   $('#nextButton').classList.toggle('hidden', mockGatewayFinish || onVerification);
   $('#installButton').classList.toggle('hidden', !(mockGatewayFinish || onVerification));
   $('#installButton').dataset.includeOptional = onVerification ? 'true' : 'false';
-  $('#nextButton').disabled = state.submitting ||
+  const invalidApplicationPassword = onApplication && !adminPasswordMeetsRequirements($('#adminPassword')?.value);
+  $('#nextButton').disabled = state.submitting || invalidApplicationPassword ||
     (onGateway && realGateway && (!state.opnsenseTestOk || state.opnsenseTestedSignature !== opnsenseSignature()));
   $('#installButton').disabled = state.submitting;
   $('#backButton').disabled = state.submitting;
@@ -622,6 +645,12 @@ function formSettings({ includeOptional = true } = {}) {
 async function submitInstall(event, { includeOptional = null, button = null } = {}) {
   event?.preventDefault();
   clearNotice();
+
+  if (!validateAdminPassword({ report: false })) {
+    goToStep(0);
+    validateAdminPassword();
+    return;
+  }
 
   if (!validateStep(state.currentStep)) return;
   const shouldIncludeOptional = includeOptional ?? ($('#installButton').dataset.includeOptional === 'true');
@@ -713,6 +742,10 @@ function bindEvents() {
     $(selector).addEventListener('input', resetOpnsenseTest);
     $(selector).addEventListener('change', resetOpnsenseTest);
   }
+  $('#adminPassword').addEventListener('input', () => {
+    validateAdminPassword({ report: false });
+    syncActions();
+  });
   $('#generateSecretButton').addEventListener('click', generateSecret);
   $('#testOpnsenseButton').addEventListener('click', testOpnsenseConnection);
   $('#opnsenseNetworkChoices').addEventListener('click', event => {

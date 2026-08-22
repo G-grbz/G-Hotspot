@@ -1561,7 +1561,9 @@ function changedRestartKeys(changes) {
 
 function validatedAdminPassword(value) {
   const password = String(value ?? '');
-  if (password.length < 12) throw new Error('Admin password must contain at least 12 characters');
+  if (password.length < 8 || !/\p{L}/u.test(password) || !/\p{N}/u.test(password) || !/\p{Lu}/u.test(password)) {
+    throw new Error('Admin password must contain at least 8 characters, including one letter, one uppercase letter, and one number');
+  }
   if (password.length > 1024) throw new Error('Admin password is too long');
   return password;
 }

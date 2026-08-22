@@ -63,7 +63,8 @@
             </div>
             <div>
               <label for="adminPassword">Password</label>
-              <input id="adminPassword" name="ADMIN_PASSWORD" type="password" autocomplete="new-password" required>
+              <input id="adminPassword" name="ADMIN_PASSWORD" type="password" autocomplete="new-password" minlength="8" maxlength="1024" required>
+              <small>Minimum 8 characters, including one letter, one uppercase letter, and one number.</small>
             </div>
           </div>
 
@@ -168,6 +169,6 @@
   </main>
 
   <script src="/i18n.js"></script>
-  <script src="/install.js?v=1.1.0"></script>
+  <script src="/install.js?v=1.1.3"></script>
 </body>
 </html>

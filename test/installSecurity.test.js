@@ -33,7 +33,7 @@ function requestJson(port, pathname, headers = {}) {
         const raw = Buffer.concat(chunks).toString('utf8');
         let body = {};
         try { body = raw ? JSON.parse(raw) : {}; } catch {}
-        resolve({ statusCode: response.statusCode, body });
+        resolve({ statusCode: response.statusCode, headers: response.headers, raw, body });
       });
     });
     request.once('error', reject);
@@ -63,6 +63,20 @@ async function stopChild(child) {
   if (child.exitCode == null) child.kill('SIGKILL');
 }
 
+test('installer enforces the admin password complexity rule before advancing', () => {
+  const installHtml = fs.readFileSync(path.resolve('public/install.html'), 'utf8');
+  const installJs = fs.readFileSync(path.resolve('public/install.js'), 'utf8');
+  const tr = JSON.parse(fs.readFileSync(path.resolve('public/i18n/tr.json'), 'utf8'));
+
+  assert.match(installHtml, /id="adminPassword"[^>]+minlength="8"/u);
+  assert.match(installJs, /const ADMIN_PASSWORD_MIN_LENGTH = 8;/u);
+  assert.match(installJs, /step === 0 && !validateAdminPassword\(\)/u);
+  assert.match(installJs, /adminPasswordMeetsRequirements/u);
+  assert.match(installJs, /\\p\{Lu\}/u);
+  assert.equal(tr['Minimum 8 characters, including one letter, one uppercase letter, and one number.'], 'En az 8 karakter; en az bir harf, bir büyük harf ve bir rakam içermelidir.');
+  assert.equal(tr['Admin password must contain at least 8 characters, including one letter, one uppercase letter, and one number.'], 'Yönetici parolası en az 8 karakter olmalı; en az bir harf, bir büyük harf ve bir rakam içermelidir.');
+});
+
 test('installer APIs allow direct localhost and require setup token for remote/proxied requests', { timeout: 15000 }, async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-install-security-'));
   const port = await freePort();
@@ -87,6 +101,19 @@ test('installer APIs allow direct localhost and require setup token for remote/p
 
     const localhost = await requestJson(port, '/api/install/settings');
     assert.equal(localhost.statusCode, 200);
+
+    const installFonts = await requestJson(port, '/fonts.css', { host: `172.16.2.2:${port}` });
+    assert.equal(installFonts.statusCode, 200);
+    assert.match(String(installFonts.headers['content-type'] || ''), /^text\/css/u);
+    assert.match(installFonts.raw, /@font-face/u);
+
+    const installFontFile = await requestJson(port, '/fonts/inter-latin.woff2', { host: `172.16.2.2:${port}` });
+    assert.equal(installFontFile.statusCode, 200);
+    assert.notEqual(String(installFontFile.headers['content-type'] || ''), 'application/json');
+
+    const lanHttpStatus = await requestJson(port, '/api/install/status', { host: `172.16.2.2:${port}` });
+    assert.equal(lanHttpStatus.statusCode, 200);
+    assert.equal(lanHttpStatus.headers['cross-origin-opener-policy'], undefined);
 
     const remoteHost = await requestJson(port, '/api/install/settings', { host: 'setup.example.invalid' });
     assert.equal(remoteHost.statusCode, 401);

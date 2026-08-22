@@ -146,14 +146,39 @@ function requireInstallAccess(request, url) {
   );
 }
 
+function requestHostname(request) {
+  try {
+    return new URL(`http://${request.headers.host || 'localhost'}`).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function isHttpsRequest(request) {
+  if (request.socket.encrypted) return true;
+  if (!config.trustProxy) return false;
+  return String(request.headers['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase() === 'https';
+}
+
+function isPotentiallyTrustworthyRequest(request) {
+  if (isHttpsRequest(request)) return true;
+  const host = requestHostname(request);
+  return host === 'localhost' || host === '::1' || host === '127.0.0.1' || /^127\./u.test(host);
+}
+
 function applySecurityHeaders(request, response) {
   response.setHeader('x-content-type-options', 'nosniff');
   response.setHeader('x-frame-options', 'DENY');
   response.setHeader('referrer-policy', 'no-referrer');
   response.setHeader('permissions-policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
-  response.setHeader('cross-origin-opener-policy', 'same-origin');
+  if (isPotentiallyTrustworthyRequest(request)) {
+    response.setHeader('cross-origin-opener-policy', 'same-origin');
+  }
   response.setHeader('cross-origin-resource-policy', 'same-origin');
-  if (request.socket.encrypted || String(config.publicBaseUrl || '').startsWith('https://')) {
+  if (isHttpsRequest(request)) {
     response.setHeader('strict-transport-security', 'max-age=31536000; includeSubDomains');
   }
 }
@@ -251,8 +276,10 @@ function isInstallAssetPath(pathname) {
   return pathname === '/favicon.ico' ||
     pathname === '/install.css' ||
     pathname === '/install.js' ||
+    pathname === '/fonts.css' ||
     pathname === '/i18n.js' ||
     pathname === '/img/favicon.ico' ||
+    pathname.startsWith('/fonts/') ||
     pathname.startsWith('/i18n/');
 }
 
