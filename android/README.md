@@ -42,6 +42,38 @@ G-Hotspot is run through the
 hardened example systemd unit, keep its `android/app` `ReadWritePaths` entry so
 the service can update the configuration and publish the finished APK.
 
+## GitHub release APK
+
+Tagged releases build the Android APK on GitHub Actions using JDK 17, Gradle 9.1.0
+and the Android SDK required by AGP 9.0.1. The release APK is signed after alignment
+with a persistent signing key restored only for the workflow run. Never commit the
+keystore or its passwords.
+
+Required repository Actions secrets:
+
+```text
+ANDROID_RELEASE_KEYSTORE_BASE64
+ANDROID_RELEASE_KEYSTORE_PASSWORD
+ANDROID_RELEASE_KEY_ALIAS
+ANDROID_RELEASE_KEY_PASSWORD
+```
+
+Optional Firebase configuration for the GitHub-built APK:
+
+```text
+ANDROID_GOOGLE_SERVICES_JSON_BASE64
+```
+
+If the Firebase secret is omitted, the build still succeeds and uses the polling
+fallback. The Firebase service-account private key used by the G-Hotspot server must
+never be embedded in the APK or stored in this repository.
+
+The release signing key must be backed up securely and kept for the lifetime of the
+Android application. Android will not install an update signed by a different key over
+an existing installation. APKs previously generated with a local/debug signing key
+therefore cannot be updated in place by a GitHub release APK signed with a new key;
+they must be reinstalled once when moving to the release key.
+
 ## Runtime
 
 1. Enable `NOTIFICATION_ANDROID_ENABLED` in G-Hotspot notification settings.

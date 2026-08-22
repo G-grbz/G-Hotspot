@@ -738,7 +738,7 @@ public class MainActivity extends Activity {
             PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
             return info.versionName;
         } catch (Exception ignored) {
-            return "1.1.0";
+            return "1.2.0";
         }
     }
 

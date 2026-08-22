@@ -1,0 +1,246 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, sign, attest and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24.x
+          package-manager-cache: false
+
+      - name: Validate release tag and source branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          EXPECTED_TAG="v${VERSION}"
+
+          if [[ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${VERSION}. Expected ${EXPECTED_TAG}."
+            exit 1
+          fi
+
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::Release tag must point to a commit contained in origin/main."
+            exit 1
+          fi
+
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "ARCHIVE=G-Hotspot-v${VERSION}.zip" >> "${GITHUB_ENV}"
+          echo "SBOM=G-Hotspot-v${VERSION}.sbom.cdx.json" >> "${GITHUB_ENV}"
+          echo "APK=G-Hotspot-v${VERSION}-android.apk" >> "${GITHUB_ENV}"
+          echo "APK_CERT=G-Hotspot-v${VERSION}-android-signing-cert.txt" >> "${GITHUB_ENV}"
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Validate source and version consistency
+        run: npm run check
+
+      - name: Run test suite
+        run: npm test
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5.7.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4.0.1
+        with:
+          packages: ''
+
+      - name: Install Android platform and build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;36.0.0"
+
+      - name: Set up Gradle 9.1.0
+        uses: gradle/actions/setup-gradle@v6.3.0
+        with:
+          gradle-version: '9.1.0'
+
+      - name: Restore optional Firebase Android configuration
+        env:
+          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${GOOGLE_SERVICES_JSON_BASE64:-}" ]]; then
+            printf '%s' "${GOOGLE_SERVICES_JSON_BASE64}" | base64 --decode > android/app/google-services.json
+            chmod 600 android/app/google-services.json
+            echo "Firebase Android configuration restored for this build."
+          else
+            echo "::notice::ANDROID_GOOGLE_SERVICES_JSON_BASE64 is not configured; the APK will use the polling fallback instead of Firebase push."
+          fi
+
+      - name: Validate and restore Android release signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for pair in \
+            "ANDROID_RELEASE_KEYSTORE_BASE64=${KEYSTORE_BASE64:-}" \
+            "ANDROID_RELEASE_KEYSTORE_PASSWORD=${KEYSTORE_PASSWORD:-}" \
+            "ANDROID_RELEASE_KEY_ALIAS=${KEY_ALIAS:-}" \
+            "ANDROID_RELEASE_KEY_PASSWORD=${KEY_PASSWORD:-}"; do
+            name="${pair%%=*}"
+            value="${pair#*=}"
+            if [[ -z "${value}" ]]; then
+              echo "::error::Required GitHub Actions secret ${name} is not configured."
+              missing=1
+            fi
+          done
+          if [[ "${missing}" -ne 0 ]]; then
+            exit 1
+          fi
+
+          KEYSTORE_FILE="${RUNNER_TEMP}/g-hotspot-release.keystore"
+          printf '%s' "${KEYSTORE_BASE64}" | base64 --decode > "${KEYSTORE_FILE}"
+          chmod 600 "${KEYSTORE_FILE}"
+
+          keytool -list \
+            -keystore "${KEYSTORE_FILE}" \
+            -storepass "${KEYSTORE_PASSWORD}" \
+            -alias "${KEY_ALIAS}" >/dev/null
+
+          echo "ANDROID_KEYSTORE_FILE=${KEYSTORE_FILE}" >> "${GITHUB_ENV}"
+
+      - name: Build Android release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon -p android :app:assembleRelease
+
+          UNSIGNED_APK="android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          if [[ ! -f "${UNSIGNED_APK}" ]]; then
+            echo "::error::Expected unsigned release APK was not produced: ${UNSIGNED_APK}"
+            exit 1
+          fi
+
+          mkdir -p dist
+          BUILD_TOOLS="${ANDROID_SDK_ROOT}/build-tools/36.0.0"
+          "${BUILD_TOOLS}/zipalign" -p -f 4 "${UNSIGNED_APK}" "dist/${APK}.aligned"
+
+      - name: Sign and verify Android release APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="${ANDROID_SDK_ROOT}/build-tools/36.0.0"
+
+          "${BUILD_TOOLS}/apksigner" sign \
+            --ks "${ANDROID_KEYSTORE_FILE}" \
+            --ks-key-alias "${KEY_ALIAS}" \
+            --ks-pass env:KEYSTORE_PASSWORD \
+            --key-pass env:KEY_PASSWORD \
+            --out "dist/${APK}" \
+            "dist/${APK}.aligned"
+
+          rm -f "dist/${APK}.aligned"
+          "${BUILD_TOOLS}/apksigner" verify --verbose "dist/${APK}"
+          "${BUILD_TOOLS}/apksigner" verify --print-certs "dist/${APK}" | tee "dist/${APK_CERT}"
+
+      - name: Build source archive and SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          # Package only files committed in the tagged revision. Runtime DBs,
+          # environment files, keys, node_modules and other untracked data
+          # therefore cannot leak into the release archive.
+          git archive \
+            --format=zip \
+            --prefix="G-Hotspot-v${VERSION}/" \
+            --output="dist/${ARCHIVE}" \
+            "${GITHUB_SHA}"
+
+          npm sbom \
+            --package-lock-only \
+            --sbom-format=cyclonedx \
+            --sbom-type=application \
+            > "dist/${SBOM}"
+
+      - name: Generate and verify SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum "${ARCHIVE}" "${APK}" "${APK_CERT}" "${SBOM}" > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+
+      - name: Attest release provenance
+        uses: actions/attest@v4.2.1
+        with:
+          subject-path: |
+            dist/${{ env.ARCHIVE }}
+            dist/${{ env.APK }}
+            dist/${{ env.APK_CERT }}
+            dist/${{ env.SBOM }}
+            dist/SHA256SUMS
+          create-storage-record: false
+
+      - name: Attest source SBOM
+        uses: actions/attest@v4.2.1
+        with:
+          subject-path: dist/${{ env.ARCHIVE }}
+          sbom-path: dist/${{ env.SBOM }}
+          create-storage-record: false
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            "dist/${ARCHIVE}#G-Hotspot ${VERSION} source package" \
+            "dist/${APK}#Signed G-Hotspot Android APK" \
+            "dist/${APK_CERT}#Android signing certificate fingerprint" \
+            "dist/${SBOM}#CycloneDX SBOM" \
+            "dist/SHA256SUMS#SHA-256 checksums" \
+            --verify-tag \
+            --generate-notes \
+            --title "G-Hotspot v${VERSION}"

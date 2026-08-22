@@ -29,7 +29,7 @@ Türkçe: G-Hotspot, OPNsense captive portal için hazırlanmış hafif bir Node
 
 ## Current Status
 
-* Version: `1.1.0`
+* Version: `1.2.0`
 * Runtime: Node.js `>=24.0.0`
 * Database: built-in `node:sqlite`
 * License: G-Hotspot Noncommercial Source-Available License 1.0
@@ -157,6 +157,38 @@ WhatsApp ayarları için [Türkçe dokümantasyona](docs/README.tr.md) bakın.
 Security-sensitive changes are checked by the GitHub Actions CI and CodeQL workflows.
 Please report suspected vulnerabilities privately and do not disclose them in public issues.
 See [SECURITY.md](SECURITY.md) for the supported-version and reporting policy.
+
+### Release integrity
+
+Version tags such as `v1.2.0` are built by the GitHub Actions release workflow. The
+workflow refuses tags that do not match `package.json`, re-runs checks/tests/audit,
+builds and verifies the Android app, packages only files committed in the tagged
+revision with `git archive`, generates a CycloneDX SBOM and `SHA256SUMS`, and creates
+GitHub artifact attestations before publishing the release. The Android APK is built
+on the GitHub runner and signed with a persistent release key stored only in GitHub
+Actions secrets; signing material is never committed to the repository.
+
+After downloading a release, verify its checksum:
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+With GitHub CLI, the release archive provenance can also be verified against this
+repository:
+
+```bash
+gh attestation verify G-Hotspot-v1.2.0.zip --repo G-grbz/G-Hotspot
+gh attestation verify G-Hotspot-v1.2.0-android.apk --repo G-grbz/G-Hotspot
+```
+
+The release workflow requires the repository secrets
+`ANDROID_RELEASE_KEYSTORE_BASE64`, `ANDROID_RELEASE_KEYSTORE_PASSWORD`,
+`ANDROID_RELEASE_KEY_ALIAS` and `ANDROID_RELEASE_KEY_PASSWORD`. Optional Firebase
+push support in the GitHub-built APK can be enabled with
+`ANDROID_GOOGLE_SERVICES_JSON_BASE64`; without it, the APK keeps the polling fallback.
+See [Android release signing](docs/ANDROID_RELEASE_SIGNING.md) for the one-time key
+setup and GitHub Actions secret configuration.
 
 ## License and Attribution
 

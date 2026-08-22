@@ -45,3 +45,41 @@ jobs:
       - name: Dependency audit
         if: matrix.node-version == '24.x'
         run: npm audit --omit=dev --audit-level=high
+
+  android:
+    name: Android build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5.7.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4.0.1
+        with:
+          packages: ''
+
+      - name: Install Android platform and build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;36.0.0"
+
+      - name: Set up Gradle 9.1.0
+        uses: gradle/actions/setup-gradle@v6.3.0
+        with:
+          gradle-version: '9.1.0'
+
+      - name: Build Android debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon -p android :app:assembleDebug
+          test -f android/app/build/outputs/apk/debug/g-hotspot.apk

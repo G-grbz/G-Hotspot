@@ -26,7 +26,7 @@ This document covers installation, production setup, OPNsense API privileges, Ke
 
 Current repository state:
 
-- Application version: `1.1.0`
+- Application version: `1.2.0`
 - Required Node.js version: `>=24.0.0`
 - Database: built-in Node.js `node:sqlite`
 - Default gateway mode: `mock`

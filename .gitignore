@@ -19,3 +19,12 @@ data/
 .DS_Store
 *.swp
 *.swo
+
+# Local release artifacts
+dist/
+
+# Android signing material
+*.jks
+*.keystore
+*.p12
+key.properties
