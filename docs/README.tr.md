@@ -494,10 +494,11 @@ Reverse proxy kullanıyorsanız:
 
 ```dotenv
 TRUST_PROXY=true
+TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
 PUBLIC_BASE_URL=https://hotspot.example.com
 ```
 
-`TRUST_PROXY=true`, `X-Forwarded-For` başlığını güvenilir kabul eder. G-Hotspot doğrudan internete açıksa etkinleştirmeyin.
+`TRUST_PROXY=true` proxy header desteğini açar; ancak forwarded headerlar yalnızca doğrudan bağlantı `TRUSTED_PROXY_CIDRS` ile eşleşiyorsa kabul edilir. Varsayılan liste yalnızca localhost proxylerini güvenilir sayar. Reverse proxy başka bir makinedeyse yalnızca o proxy IP/CIDR değerini ekleyin; istemci/LAN ağının tamamını trusted proxy olarak tanımlamayın.
 
 Self-signed OPNsense sertifikasıyla ilk test:
 
@@ -880,7 +881,7 @@ Sistem servisi olarak çalıştıracaksanız kullanıcı, dizin izinleri ve `Rea
 - `APP_SECRET` en az 32 karakter, rastgele ve benzersiz olmalıdır.
 - OPNsense API kullanıcısına tam admin yetkisi vermeyin.
 - Üretimde HTTPS kullanın.
-- `TRUST_PROXY=true` sadece güvenilir reverse proxy arkasında kullanılmalıdır.
+- `TRUST_PROXY=true` sadece güvenilir reverse proxy arkasında kullanılmalı ve `TRUSTED_PROXY_CIDRS` yalnızca G-Hotspot’a doğrudan bağlanan proxy adresleriyle sınırlandırılmalıdır.
 - `OPNSENSE_TLS_REJECT_UNAUTHORIZED=false` sadece ilk testte kullanılmalıdır.
 - Meta webhook için `META_APP_SECRET` kullanın.
 - Provider tokenlarını ve SMS/SMTP şifrelerini paylaşmayın.

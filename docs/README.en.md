@@ -493,10 +493,11 @@ Behind a reverse proxy:
 
 ```dotenv
 TRUST_PROXY=true
+TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
 PUBLIC_BASE_URL=https://hotspot.example.com
 ```
 
-`TRUST_PROXY=true` trusts `X-Forwarded-For`. Do not enable it if G-Hotspot is directly exposed.
+`TRUST_PROXY=true` enables proxy-header support, but forwarded headers are accepted only when the direct peer matches `TRUSTED_PROXY_CIDRS`. The default allowlist trusts only local loopback proxies. Add the exact reverse-proxy IP/CIDR when the proxy runs on another host; never use a broad client/LAN subnet as the trusted proxy list.
 
 First test with a self-signed OPNsense certificate:
 
@@ -879,7 +880,7 @@ If you run it as a system service, adjust the user, directory permissions and `R
 - `APP_SECRET` must be at least 32 random, unique characters.
 - Do not give the OPNsense API user full admin privileges.
 - Use HTTPS in production.
-- Use `TRUST_PROXY=true` only behind a trusted reverse proxy.
+- Use `TRUST_PROXY=true` only behind a trusted reverse proxy and restrict `TRUSTED_PROXY_CIDRS` to the proxy addresses that connect directly to G-Hotspot.
 - Use `OPNSENSE_TLS_REJECT_UNAUTHORIZED=false` only for initial testing.
 - Use `META_APP_SECRET` for Meta webhook signature verification.
 - Do not share provider tokens or SMS/SMTP passwords.

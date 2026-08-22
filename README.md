@@ -1,5 +1,8 @@
 # G-Hotspot
 
+[![CI](https://github.com/G-grbz/G-Hotspot/actions/workflows/ci.yml/badge.svg)](https://github.com/G-grbz/G-Hotspot/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/G-grbz/G-Hotspot/actions/workflows/codeql.yml/badge.svg)](https://github.com/G-grbz/G-Hotspot/actions/workflows/codeql.yml)
+
 G-Hotspot is a lightweight Node.js captive portal companion for OPNsense. It provides voucher, e-mail OTP, WhatsApp OTP, SMS OTP, Telegram OTP, T.C. identity verification and admin approval flows, then opens the verified client session through the OPNsense Captive Portal Session API.
 
 Türkçe: G-Hotspot, OPNsense captive portal için hazırlanmış hafif bir Node.js doğrulama servisidir. Voucher, e-posta OTP, WhatsApp OTP, SMS OTP, Telegram OTP, T.C. kimlik doğrulama ve yönetici onayı akışlarını sunar; doğrulanan istemciye OPNsense Captive Portal Session API üzerinden internet erişimi açar.
@@ -146,7 +149,14 @@ WhatsApp ayarları için [Türkçe dokümantasyona](docs/README.tr.md) bakın.
 * Use `GATEWAY_MODE=opnsense-api` with an OPNsense API user that has only the required effective privileges.
 * Kea DHCP is required for the managed DHCP lease/reservation synchronization feature. Disable `OPNSENSE_KEA_LEASE_SYNC_ENABLED` if your OPNsense DHCP setup is not Kea-compatible.
 * Put the portal and provider webhooks behind HTTPS in production.
+* When `TRUST_PROXY=true`, restrict `TRUSTED_PROXY_CIDRS` to the exact reverse proxy IP addresses or CIDRs that connect directly to G-Hotspot. Forwarded headers from other peers are ignored.
 * Do not treat the 5651/syslog feature as a legal compliance guarantee without live testing and legal/process review.
+
+## Security
+
+Security-sensitive changes are checked by the GitHub Actions CI and CodeQL workflows.
+Please report suspected vulnerabilities privately and do not disclose them in public issues.
+See [SECURITY.md](SECURITY.md) for the supported-version and reporting policy.
 
 ## License and Attribution
 

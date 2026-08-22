@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { BlockList, isIP } from 'node:net';
 import { normalizeIp } from './security.js';
 
 const MIME_TYPES = new Map([
@@ -64,11 +65,64 @@ export async function readJson(request, maxBytes = 32768) {
   }
 }
 
-export function getClientIp(request, trustProxy = false) {
-  if (trustProxy) {
+const DEFAULT_TRUSTED_PROXY_CIDRS = '127.0.0.1/32,::1/128';
+const trustedProxyMatcherCache = new Map();
+
+function normalizeProxyAddress(value) {
+  const text = normalizeIp(String(value || '').trim().replace(/^\[|\]$/gu, ''));
+  return isIP(text) ? text : '';
+}
+
+export function normalizeTrustedProxyCidrs(value = DEFAULT_TRUSTED_PROXY_CIDRS) {
+  const input = String(value || DEFAULT_TRUSTED_PROXY_CIDRS);
+  const normalized = [];
+  for (const rawEntry of input.split(/[\n;,]+/u)) {
+    const entry = rawEntry.trim();
+    if (!entry) continue;
+    const slashIndex = entry.lastIndexOf('/');
+    const address = normalizeProxyAddress(slashIndex >= 0 ? entry.slice(0, slashIndex) : entry);
+    if (!address) throw new Error(`Invalid trusted proxy address: ${entry}`);
+    const version = isIP(address);
+    const maxPrefix = version === 4 ? 32 : 128;
+    const prefix = slashIndex >= 0 ? Number(entry.slice(slashIndex + 1)) : maxPrefix;
+    if (!Number.isInteger(prefix) || prefix < 0 || prefix > maxPrefix) {
+      throw new Error(`Invalid trusted proxy CIDR prefix: ${entry}`);
+    }
+    normalized.push(`${address}/${prefix}`);
+  }
+  if (!normalized.length) return DEFAULT_TRUSTED_PROXY_CIDRS;
+  return [...new Set(normalized)].join(',');
+}
+
+function trustedProxyMatcher(value) {
+  const normalized = normalizeTrustedProxyCidrs(value);
+  if (trustedProxyMatcherCache.has(normalized)) return trustedProxyMatcherCache.get(normalized);
+  const matcher = new BlockList();
+  for (const entry of normalized.split(',')) {
+    const slashIndex = entry.lastIndexOf('/');
+    const address = entry.slice(0, slashIndex);
+    const prefix = Number(entry.slice(slashIndex + 1));
+    const type = isIP(address) === 6 ? 'ipv6' : 'ipv4';
+    matcher.addSubnet(address, prefix, type);
+  }
+  trustedProxyMatcherCache.set(normalized, matcher);
+  return matcher;
+}
+
+export function isTrustedProxyRequest(request, trustProxy = false, trustedProxyCidrs = DEFAULT_TRUSTED_PROXY_CIDRS) {
+  if (!trustProxy) return false;
+  const remoteAddress = normalizeProxyAddress(request.socket?.remoteAddress || '');
+  if (!remoteAddress) return false;
+  const type = isIP(remoteAddress) === 6 ? 'ipv6' : 'ipv4';
+  return trustedProxyMatcher(trustedProxyCidrs).check(remoteAddress, type);
+}
+
+export function getClientIp(request, trustProxy = false, trustedProxyCidrs = DEFAULT_TRUSTED_PROXY_CIDRS) {
+  if (isTrustedProxyRequest(request, trustProxy, trustedProxyCidrs)) {
     const forwarded = request.headers['x-forwarded-for'];
     if (typeof forwarded === 'string' && forwarded) {
-      return normalizeIp(forwarded.split(',')[0]);
+      const candidate = normalizeProxyAddress(forwarded.split(',')[0]);
+      if (candidate) return candidate;
     }
   }
   return normalizeIp(request.socket.remoteAddress || '0.0.0.0');
@@ -86,7 +140,19 @@ export function serveStatic(response, publicDir, pathname) {
     'content-type': MIME_TYPES.get(extension) || 'application/octet-stream',
     'content-length': body.length,
     'cache-control': extension === '.html' ? 'no-store' : 'public, max-age=3600',
-    'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://api.ipify.org; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    'content-security-policy': [
+      "default-src 'self'",
+      "script-src 'self'",
+      "script-src-attr 'none'",
+      "style-src 'self'",
+      "font-src 'self'",
+      "img-src 'self' data:",
+      pathname.startsWith('/admin') ? "connect-src 'self' https://api.ipify.org" : "connect-src 'self'",
+      "object-src 'none'",
+      "base-uri 'none'",
+      "form-action 'self'",
+      "frame-ancestors 'none'"
+    ].join('; '),
     'referrer-policy': 'no-referrer',
     'x-content-type-options': 'nosniff',
     'x-frame-options': 'DENY'

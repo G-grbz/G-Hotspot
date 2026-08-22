@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
 import { HotspotDatabase, deviceOsFromUserAgent } from './db.js';
-import { HttpError, getClientIp, readJson, sendJson, sendText, serveStatic } from './lib/http.js';
+import { HttpError, getClientIp, isTrustedProxyRequest, readJson, sendJson, sendText, serveStatic } from './lib/http.js';
 import {
   COUNTRY_CALLING_CODES, generateOtp, generateSecret, isAllowedCountryCode, isValidEmail,
   isValidPhoneForCountry, keyedHash, normalizeCountryCode, normalizePhoneForCountry, safeEqualHex,
@@ -156,7 +156,7 @@ function requestHostname(request) {
 
 function isHttpsRequest(request) {
   if (request.socket.encrypted) return true;
-  if (!config.trustProxy) return false;
+  if (!isTrustedProxyRequest(request, config.trustProxy, config.trustedProxyCidrs)) return false;
   return String(request.headers['x-forwarded-proto'] || '')
     .split(',')[0]
     .trim()
@@ -621,7 +621,7 @@ async function restoreAuthorizationForClient(
 
 async function currentAuthorization(request, url = null, { allowQuotaBlocked = false } = {}) {
   db.clearExpiredAuthorizationQuotaBlocks?.();
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const now = Date.now();
   const claimedClientMac = queryClientMac(url);
   let confirmedClientMac = config.gateway.mode !== 'mock' ? '' : claimedClientMac;
@@ -1078,7 +1078,7 @@ async function handleAdminApprovalRequest(request, response) {
     throw new HttpError(503, 'Admin approval verification is not configured', 'admin_approval_disabled');
   }
   const { value } = await readJson(request);
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const fullName = normalizeFullName(value.fullName || value.name);
   const language = requestLanguage(request, value.language, config.defaultLanguage);
   if (!isValidFullName(fullName)) {
@@ -1117,7 +1117,7 @@ async function handleAdminApprovalRequest(request, response) {
 function sendApprovedAdminApprovalStatus(request, response, approvalRequest) {
   const storedAuthorization = approvalRequest.authorization_id
     ? db.getAuthorization(approvalRequest.authorization_id)
-    : db.getActiveAuthorizationForClient(getClientIp(request, config.trustProxy));
+    : db.getActiveAuthorizationForClient(getClientIp(request, config.trustProxy, config.trustedProxyCidrs));
   const authorization = authorizationWithEffectiveAccess(config, storedAuthorization);
   if (authorization) setUserSessionCookie(response, authorization);
   sendJson(response, 200, {
@@ -1134,7 +1134,7 @@ function sendApprovedAdminApprovalStatus(request, response, approvalRequest) {
 async function handleAdminApprovalStatus(request, response, id) {
   const approvalRequest = db.getAdminApprovalRequest(id);
   if (!approvalRequest) throw new HttpError(404, 'Admin approval request not found', 'admin_approval_not_found');
-  if (approvalRequest.client_ip !== getClientIp(request, config.trustProxy)) {
+  if (approvalRequest.client_ip !== getClientIp(request, config.trustProxy, config.trustedProxyCidrs)) {
     throw new HttpError(403, 'This verification belongs to another device', 'client_mismatch');
   }
   if (approvalRequest.status === 'pending' && Number(approvalRequest.request_expires_at) < Date.now()) {
@@ -1207,7 +1207,7 @@ async function completeChallenge(challenge, method, identity) {
 async function handleVoucher(request, response) {
   if (!config.voucher.enabled) throw new HttpError(503, 'Voucher verification is disabled', 'voucher_disabled');
   const { value } = await readJson(request);
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const code = normalizeVoucher(value.code);
   if (code.length < 8 || code.length > 32) throw new HttpError(400, 'Invalid voucher code', 'invalid_voucher');
   enforceRateLimit('voucher_redeem', clientIp, '', 10, 15 * 60 * 1000);
@@ -1242,7 +1242,7 @@ async function handleVoucher(request, response) {
 async function handleEmailRequest(request, response) {
   if (!config.smtp.enabled) throw new HttpError(503, 'E-mail verification is not configured', 'email_disabled');
   const { value } = await readJson(request);
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const email = normalizeEmail(value.email);
   const language = requestLanguage(request, value.language, config.defaultLanguage);
   if (!isValidEmail(email)) throw new HttpError(400, 'Enter a valid e-mail address', 'invalid_email');
@@ -1284,7 +1284,7 @@ async function handleEmailRequest(request, response) {
 async function handleSmsRequest(request, response) {
   if (!config.sms.enabled) throw new HttpError(503, 'SMS verification is not configured', 'sms_disabled');
   const { value } = await readJson(request);
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const phone = phoneFromRequest(value);
   assertReverificationAllowed('sms', phone);
   const cooldownClaimedAt = claimIpRequestInterval('sms', clientIp);
@@ -1326,7 +1326,7 @@ async function handleSmsRequest(request, response) {
 
 async function handleSmsVerify(request, response) {
   const { value } = await readJson(request);
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const challenge = db.getChallenge(String(value.challengeId || ''));
   if (!challenge || challenge.kind !== 'sms') {
     throw new HttpError(404, 'Verification request not found', 'challenge_not_found');
@@ -1366,7 +1366,7 @@ async function handleSmsVerify(request, response) {
 async function handleNviRequest(request, response) {
   if (!config.nvi.enabled) throw new HttpError(503, 'NVI verification is not configured', 'nvi_disabled');
   const { value } = await readJson(request);
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const tckn = normalizeTckn(value.tckn || value.tcKimlikNo || value.identity);
   const firstName = normalizeNviName(value.firstName || value.name || value.ad);
   const lastName = normalizeNviName(value.lastName || value.surname || value.soyad);
@@ -1446,7 +1446,7 @@ async function handleNviRequest(request, response) {
 
 async function handleNviVerify(request, response) {
   const { value } = await readJson(request);
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const challenge = db.getChallenge(String(value.challengeId || ''));
   if (!challenge || challenge.kind !== 'nvi') {
     throw new HttpError(404, 'Verification request not found', 'challenge_not_found');
@@ -1487,7 +1487,7 @@ async function handleNviVerify(request, response) {
 
 async function handleEmailVerify(request, response) {
   const { value } = await readJson(request);
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const challenge = db.getChallenge(String(value.challengeId || ''));
   if (!challenge || challenge.kind !== 'email') throw new HttpError(404, 'Verification request not found', 'challenge_not_found');
   if (challenge.client_ip !== clientIp) throw new HttpError(403, 'This verification belongs to another device', 'client_mismatch');
@@ -1523,7 +1523,7 @@ async function handleEmailVerify(request, response) {
 async function handleWhatsAppRequest(request, response) {
   if (!config.whatsapp.enabled) throw new HttpError(503, 'WhatsApp verification is not configured', 'whatsapp_disabled');
   const { value } = await readJson(request);
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const phone = phoneFromRequest(value);
   assertReverificationAllowed('whatsapp', phone);
   const cooldownClaimedAt = claimIpRequestInterval('whatsapp', clientIp);
@@ -1565,7 +1565,7 @@ async function handleWhatsAppRequest(request, response) {
 
 async function handleWhatsAppVerify(request, response) {
   const { value } = await readJson(request);
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const challenge = db.getChallenge(String(value.challengeId || ''));
   if (!challenge || challenge.kind !== 'whatsapp') {
     throw new HttpError(404, 'Verification request not found', 'challenge_not_found');
@@ -1607,7 +1607,7 @@ async function handleWhatsAppVerify(request, response) {
 async function handleTelegramRequest(request, response) {
   if (!config.telegram.enabled) throw new HttpError(503, 'Telegram verification is not configured', 'telegram_disabled');
   const { value } = await readJson(request);
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const phone = phoneFromRequest(value);
   const language = requestLanguage(request, value.language, config.defaultLanguage);
   assertReverificationAllowed('telegram', phone);
@@ -1655,7 +1655,7 @@ function handleTelegramResume(request, response, challengeId) {
 
 function handleTelegramCurrent(request, response, options = {}) {
   if (!config.telegram.enabled) throw new HttpError(503, 'Telegram verification is not configured', 'telegram_disabled');
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const challenge = db.getPendingChallengeByClient('telegram', clientIp);
   if (!challenge) {
     if (options.optional) {
@@ -1672,7 +1672,7 @@ function telegramResumePayload(request, challenge) {
       challenge.status !== 'pending' || Number(challenge.expires_at) < Date.now()) {
     throw new HttpError(404, 'Telegram verification request not found', 'challenge_not_found');
   }
-  if (challenge.client_ip !== getClientIp(request, config.trustProxy)) {
+  if (challenge.client_ip !== getClientIp(request, config.trustProxy, config.trustedProxyCidrs)) {
     throw new HttpError(403, 'This verification belongs to another device', 'client_mismatch');
   }
   return {
@@ -1687,7 +1687,7 @@ function telegramResumePayload(request, challenge) {
 
 async function handleTelegramVerify(request, response) {
   const { value } = await readJson(request);
-  const clientIp = getClientIp(request, config.trustProxy);
+  const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const challenge = db.getChallenge(String(value.challengeId || ''));
   if (!challenge || challenge.kind !== 'telegram') {
     throw new HttpError(404, 'Verification request not found', 'challenge_not_found');
@@ -2020,7 +2020,7 @@ async function route(request, response) {
 
   if (await admin.handle(request, response, url)) return;
   if (request.method === 'POST' && url.pathname === '/api/android/pairing/claim') {
-    const clientIp = getClientIp(request, config.trustProxy);
+    const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
     enforceRateLimit('android_pairing_claim', clientIp, '', 20, 15 * 60 * 1000);
     const { value } = await readJson(request);
     const code = normalizeAndroidPairingCode(value.code);
@@ -2136,7 +2136,7 @@ async function route(request, response) {
   }
   if (request.method === 'GET' && url.pathname === '/api/v1/config') {
     const assets = appearanceAssets(config);
-    const clientIp = getClientIp(request, config.trustProxy);
+    const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
     sendJson(response, 200, {
       appName: config.appName,
       voucherEnabled: config.voucher.enabled,
@@ -2172,7 +2172,7 @@ async function route(request, response) {
     return;
   }
   if (request.method === 'GET' && url.pathname === '/api/v1/client-mac') {
-    const clientIp = getClientIp(request, config.trustProxy);
+    const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
     sendJson(response, 200, {
       clientIp,
       clientMac: await requestClientMac(url, clientIp)
@@ -2255,7 +2255,7 @@ async function route(request, response) {
     const id = decodeURIComponent(url.pathname.slice('/api/v1/whatsapp/status/'.length));
     const challenge = db.getChallenge(id);
     if (!challenge || challenge.kind !== 'whatsapp') throw new HttpError(404, 'Verification request not found', 'challenge_not_found');
-    if (challenge.client_ip !== getClientIp(request, config.trustProxy)) throw new HttpError(403, 'This verification belongs to another device', 'client_mismatch');
+    if (challenge.client_ip !== getClientIp(request, config.trustProxy, config.trustedProxyCidrs)) throw new HttpError(403, 'This verification belongs to another device', 'client_mismatch');
     sendJson(response, 200, challengePublic(challenge));
     return;
   }

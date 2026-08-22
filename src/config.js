@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { envBoolean, envInteger } from './lib/env.js';
+import { normalizeTrustedProxyCidrs } from './lib/http.js';
 import { normalizeLanguage } from './lib/languages.js';
 import { isSystemInstalled, loadSystemSettingsIntoEnv } from './system.js';
 import {
@@ -396,6 +397,7 @@ function buildConfig() {
       port: process.env.PORT
     }),
     trustProxy: envBoolean('TRUST_PROXY', false),
+    trustedProxyCidrs: normalizeTrustedProxyCidrs(process.env.TRUSTED_PROXY_CIDRS),
     defaultCountryCode,
     allowedCountryCodes: countryCodeList(process.env.ALLOWED_COUNTRY_CODES),
     defaultLanguage: normalizeLanguage(process.env.DEFAULT_LANGUAGE, 'en'),

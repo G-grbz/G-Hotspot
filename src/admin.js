@@ -1,5 +1,5 @@
 import { generateSecret, generateVoucherCode, keyedHash, normalizeIp, normalizeVoucher, safeEqualHex, verifyPasswordAsync } from './lib/security.js';
-import { HttpError, getClientIp, readBody, readJson, sendJson } from './lib/http.js';
+import { HttpError, getClientIp, isTrustedProxyRequest, readBody, readJson, sendJson } from './lib/http.js';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import { isIP } from 'node:net';
@@ -579,7 +579,7 @@ export function createAdminController({
       targetType,
       targetId,
       detail,
-      clientIp: getClientIp(request, config.trustProxy)
+      clientIp: getClientIp(request, config.trustProxy, config.trustedProxyCidrs)
     });
   }
 
@@ -771,20 +771,20 @@ export function createAdminController({
   }
 
   function notificationClientIp(request, reportedPublicIp = '') {
-    const forwarded = typeof request.headers['x-forwarded-for'] === 'string'
+    const trustForwarded = isTrustedProxyRequest(request, config.trustProxy, config.trustedProxyCidrs);
+    const forwarded = trustForwarded && typeof request.headers['x-forwarded-for'] === 'string'
       ? request.headers['x-forwarded-for'].split(',')
       : [];
-    const forwardedHeader = typeof request.headers.forwarded === 'string'
+    const forwardedHeader = trustForwarded && typeof request.headers.forwarded === 'string'
       ? [...request.headers.forwarded.matchAll(/for="?([^;,"]+)/giu)].map(match => match[1])
       : [];
-    const candidates = [
+    const candidates = trustForwarded ? [
       request.headers['cf-connecting-ip'],
       request.headers['x-real-ip'],
       request.headers['x-client-ip'],
       ...forwarded,
       ...forwardedHeader
-    ].map(cleanIpCandidate)
-      .filter(Boolean);
+    ].map(cleanIpCandidate).filter(Boolean) : [];
     const publicIp = candidates.map(publicIpCandidate).find(Boolean);
     if (publicIp) return publicIp;
     const browserPublicIp = publicIpCandidate(reportedPublicIp);
@@ -792,14 +792,15 @@ export function createAdminController({
     for (const candidate of candidates) {
       if (candidate !== '0.0.0.0') return candidate;
     }
-    return getClientIp(request, config.trustProxy);
+    return getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   }
 
   function opnsenseTemplateDefaultTargetUrl(request) {
-    const forwardedProto = config.trustProxy && typeof request.headers['x-forwarded-proto'] === 'string'
+    const trustForwarded = isTrustedProxyRequest(request, config.trustProxy, config.trustedProxyCidrs);
+    const forwardedProto = trustForwarded && typeof request.headers['x-forwarded-proto'] === 'string'
       ? request.headers['x-forwarded-proto'].split(',')[0].trim()
       : '';
-    const forwardedHost = config.trustProxy && typeof request.headers['x-forwarded-host'] === 'string'
+    const forwardedHost = trustForwarded && typeof request.headers['x-forwarded-host'] === 'string'
       ? request.headers['x-forwarded-host'].split(',')[0].trim()
       : '';
     const protocol = forwardedProto || (request.socket.encrypted ? 'https' : 'http');
@@ -1538,7 +1539,7 @@ export function createAdminController({
       appVersion: String(value.appVersion || '').slice(0, 40),
       platformVersion: String(value.platformVersion || '').slice(0, 80),
       userAgent: String(request.headers['user-agent'] || '').slice(0, 300),
-      clientIp: getClientIp(request, config.trustProxy)
+      clientIp: getClientIp(request, config.trustProxy, config.trustedProxyCidrs)
     };
     if (existing) {
       const device = db.updateAndroidDevice(existing.id, metadata);
@@ -1774,7 +1775,7 @@ export function createAdminController({
 
     if (request.method === 'POST' && path === '/api/admin/login') {
       if (!config.admin.enabled) throw new HttpError(503, 'Configure an admin password to enable the admin panel', 'admin_disabled');
-      const clientIp = getClientIp(request, config.trustProxy);
+      const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
       if (db.countEvents('admin_login', clientIp, '', Date.now() - 15 * 60 * 1000) >= 10) {
         throw new HttpError(429, 'Too many login attempts. Try again later.', 'rate_limited');
       }

@@ -191,7 +191,14 @@ export const settingsSchema = [
         warning: 'Leave empty to allow all country codes. Use one country code per line, comma or semicolon.'
       }),
       field('SESSION_MINUTES', 'Default session duration (minutes)', { type: 'number', min: 1, max: 10080 }),
-      field('TRUST_PROXY', 'Trust reverse proxy headers', { type: 'boolean' }),
+      field('TRUST_PROXY', 'Trust reverse proxy headers', {
+        type: 'boolean',
+        warning: 'Only forwarded headers received from TRUSTED_PROXY_CIDRS are trusted.'
+      }),
+      field('TRUSTED_PROXY_CIDRS', 'Trusted proxy IPs / CIDRs', {
+        placeholder: '127.0.0.1/32, ::1/128',
+        warning: 'Required when TRUST_PROXY is enabled. Add only the reverse proxy addresses that connect directly to G-Hotspot.'
+      }),
       field('HOST', 'Listen host', { restartRequired: true, section: 'Runtime service' }),
       field('PORT', 'Listen port', { type: 'number', min: 1, max: 65535, restartRequired: true }),
       field('DATABASE_PATH', 'Database path', { restartRequired: true }),
