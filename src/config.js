@@ -11,7 +11,13 @@ import {
   ipv4InNetworkList,
   normalizeNetworkList
 } from './lib/network.js';
-import { COUNTRY_CALLING_CODES, isKnownCountryCode, normalizeCountryCode } from './lib/security.js';
+import {
+  COUNTRY_CALLING_CODES,
+  hashPassword,
+  isKnownCountryCode,
+  isPasswordHash,
+  normalizeCountryCode
+} from './lib/security.js';
 import { QUOTA_METHODS, QUOTA_PERIODS } from './services/quotas.js';
 
 loadSystemSettingsIntoEnv();
@@ -345,6 +351,13 @@ function buildConfig() {
   if (!GATEWAY_MODES.includes(gatewayMode)) {
     throw new Error(`GATEWAY_MODE must be one of: ${GATEWAY_MODES.join(', ')}`);
   }
+  const configuredAdminPasswordHash = String(process.env.ADMIN_PASSWORD_HASH || '').trim();
+  if (configuredAdminPasswordHash && !isPasswordHash(configuredAdminPasswordHash)) {
+    throw new Error('ADMIN_PASSWORD_HASH must be a valid scrypt password hash');
+  }
+  const legacyAdminPassword = String(process.env.ADMIN_PASSWORD || '');
+  const adminPasswordHash = configuredAdminPasswordHash ||
+    (legacyAdminPassword ? hashPassword(legacyAdminPassword) : '');
 
   const smsProvider = process.env.SMS_PROVIDER || 'netgsm';
   if (!['netgsm', 'iletimerkezi', 'twilio', 'custom'].includes(smsProvider)) {
@@ -468,10 +481,9 @@ function buildConfig() {
       timeoutSeconds: envInteger('NVI_TIMEOUT_SECONDS', 30, { min: 3, max: 60 })
     },
     admin: {
-      enabled: installed && Boolean(process.env.ADMIN_PASSWORD_HASH || process.env.ADMIN_PASSWORD),
+      enabled: installed && Boolean(adminPasswordHash),
       username: process.env.ADMIN_USERNAME || 'admin',
-      passwordHash: process.env.ADMIN_PASSWORD_HASH || '',
-      legacyPassword: process.env.ADMIN_PASSWORD || '',
+      passwordHash: adminPasswordHash,
       sessionHours: envInteger('ADMIN_SESSION_HOURS', 12, { min: 1, max: 168 })
     },
     gateway: {
@@ -600,6 +612,7 @@ function buildConfig() {
       androidStartupEnabled: envBoolean('NOTIFICATION_ANDROID_STARTUP_ENABLED', legacyStartupNotification),
       androidPollIntervalSeconds: envInteger('ANDROID_APP_POLL_INTERVAL_SECONDS', 20, { min: 5, max: 300 }),
       androidFcmServiceAccountFile: envText('ANDROID_FCM_SERVICE_ACCOUNT_FILE', '').trim(),
+      androidFcmProjectId: envText('ANDROID_FCM_PROJECT_ID', '').trim(),
       syslogEmailTemplateMarkdown: process.env.NOTIFICATION_SYSLOG_EMAIL_TEMPLATE_MARKDOWN ||
         DEFAULT_SYSLOG_NOTIFICATION_EMAIL_MARKDOWN,
       syslogSmsTemplate: process.env.NOTIFICATION_SYSLOG_SMS_TEMPLATE ||

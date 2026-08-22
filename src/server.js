@@ -193,8 +193,10 @@ function cookieValue(request, name) {
 
 function androidBearerToken(request) {
   const authorization = String(request.headers.authorization || '');
-  const bearer = authorization.match(/^Bearer\s+(.+)$/iu);
-  if (bearer) return bearer[1].trim();
+  const separator = authorization.indexOf(' ');
+  if (separator > 0 && authorization.slice(0, separator).toLowerCase() === 'bearer') {
+    return authorization.slice(separator + 1).trim();
+  }
   return String(request.headers['x-gh-android-token'] || '').trim();
 }
 
@@ -309,10 +311,6 @@ function authorizationLeaseSeconds(authorization) {
   return Math.ceil((expiresAt - createdAt) / 1000);
 }
 
-function queryClientMac(url) {
-  return normalizeMac(url?.searchParams?.get('client_mac') || url?.searchParams?.get('mac') || '');
-}
-
 function textField(row, names) {
   for (const name of names) {
     const value = row?.[name];
@@ -365,33 +363,9 @@ function normalizeGatewaySessionRow(row) {
   };
 }
 
-function authorizationGatewayResponseIp(authorization) {
-  try {
-    const response = JSON.parse(authorization?.gateway_response_json || 'null');
-    const ip = textField(response || {}, ['ipAddress', 'ip_address', 'ip', 'address']);
-    return isIpv4(ip) ? ip : '';
-  } catch {
-    return '';
-  }
-}
-
-function preferredAuthorizationIp(row, authorization) {
-  const responseIp = authorizationGatewayResponseIp(authorization);
-  if (responseIp && row.clientIps.includes(responseIp)) return responseIp;
-  return authorization?.client_ip || '';
-}
-
 function alignGatewaySessionRow(row, clientIp) {
   if (isIpv4(clientIp) && row.clientIp !== clientIp && row.clientIps.includes(clientIp)) {
     return { ...row, clientIp, clientMac: '' };
-  }
-  return row;
-}
-
-function alignGatewaySessionToAuthorization(row, authorization) {
-  const clientIp = preferredAuthorizationIp(row, authorization);
-  if (isIpv4(clientIp) && row.clientIp !== clientIp && row.clientIps.includes(clientIp)) {
-    return { ...row, clientIp, clientMac: '', alignedFromGatewayList: true };
   }
   return row;
 }
@@ -400,9 +374,7 @@ async function gatewayClientOwnership(context = 'restoring session') {
   return listGatewayClientOwnership(config.gateway, { context });
 }
 
-async function requestClientMac(url, clientIp) {
-  const providedClientMac = queryClientMac(url);
-  if (providedClientMac) return providedClientMac;
+async function requestClientMac(clientIp) {
   if (config.gateway.mode === 'mock' || !clientIp) return '';
   return (await gatewayClientOwnership('resolving portal client MAC')).ipToMac.get(clientIp) || '';
 }
@@ -435,7 +407,11 @@ async function existingGatewaySessionForClient(authorization, clientIp, clientMa
       return db.getAuthorization(authorization.id);
     }
   } catch (error) {
-    console.warn(`Existing gateway session lookup failed for ${clientIp}: ${error.message}`);
+    console.warn(JSON.stringify({
+      event: 'gateway_session_lookup_failed',
+      clientIp,
+      error: String(error?.message || 'Unknown error').slice(0, 500)
+    }));
   }
   return null;
 }
@@ -555,6 +531,16 @@ async function closeConflictingAuthorizationForIp(clientIp, currentClientMac, sk
   return false;
 }
 
+function signedUserSessionRecord(request) {
+  const token = cookieValue(request, USER_COOKIE_NAME);
+  const separator = token.lastIndexOf('.');
+  if (separator <= 0) return null;
+  const id = token.slice(0, separator);
+  const signature = token.slice(separator + 1);
+  if (!id || !safeEqualHex(keyedHash(config.appSecret, id), signature)) return null;
+  return db.getAuthorization(id) || null;
+}
+
 async function restoreAuthorizationForClient(
   authorization,
   clientIp,
@@ -579,7 +565,11 @@ async function restoreAuthorizationForClient(
         try {
           return await moveAuthorizationToClient(authorization, clientIp, currentClientMac || authorizationMac);
         } catch (error) {
-          console.warn(`Active session could not be restored for ${clientIp}: ${error.message}`);
+          console.warn(JSON.stringify({
+            event: 'active_session_restore_failed',
+            clientIp,
+            error: String(error?.message || 'Unknown error').slice(0, 500)
+          }));
           return null;
         }
       }
@@ -614,7 +604,11 @@ async function restoreAuthorizationForClient(
   try {
     return await moveAuthorizationToClient(authorization, clientIp, currentClientMac || authorizationMac);
   } catch (error) {
-    console.warn(`Active session could not be moved to ${clientIp}: ${error.message}`);
+    console.warn(JSON.stringify({
+      event: 'active_session_move_failed',
+      clientIp,
+      error: String(error?.message || 'Unknown error').slice(0, 500)
+    }));
     return null;
   }
 }
@@ -623,8 +617,7 @@ async function currentAuthorization(request, url = null, { allowQuotaBlocked = f
   db.clearExpiredAuthorizationQuotaBlocks?.();
   const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
   const now = Date.now();
-  const claimedClientMac = queryClientMac(url);
-  let confirmedClientMac = config.gateway.mode !== 'mock' ? '' : claimedClientMac;
+  let confirmedClientMac = '';
   let confirmedClientMacLoaded = config.gateway.mode === 'mock';
   let ownership = null;
   let ownershipLoaded = false;
@@ -643,37 +636,31 @@ async function currentAuthorization(request, url = null, { allowQuotaBlocked = f
     return confirmedClientMac;
   }
 
-  const token = cookieValue(request, USER_COOKIE_NAME);
-  if (token) {
-    const separator = token.lastIndexOf('.');
-    const id = separator > 0 ? token.slice(0, separator) : '';
-    const signature = separator > 0 ? token.slice(separator + 1) : '';
-    if (id && safeEqualHex(keyedHash(config.appSecret, id), signature)) {
-      const authorization = db.getAuthorization(id);
-      const effectiveAuthorization = authorizationWithEffectiveAccess(config, authorization);
-      if (authorizationQuotaBlocked(effectiveAuthorization, now)) {
-        if (allowQuotaBlocked &&
-            isActiveAuthorization(effectiveAuthorization, now) &&
-            effectiveAuthorization.client_ip === clientIp) {
-          return rememberRequestDeviceOs(request, effectiveAuthorization);
-        }
-      } else if (isUsableAuthorization(effectiveAuthorization, now)) {
-        if (config.gateway.mode !== 'mock' &&
-            effectiveAuthorization.client_ip === clientIp &&
-            effectiveAuthorization.gateway_session_id &&
-            effectiveAuthorization.client_mac) {
-          queueAuthorizationMaintenance(effectiveAuthorization);
-          return rememberRequestDeviceOs(request, effectiveAuthorization);
-        }
-        const restored = await restoreAuthorizationForClient(
-          effectiveAuthorization,
-          clientIp,
-          await getConfirmedClientMac(),
-          config.gateway.mode !== 'mock' ? await getOwnership() : null,
-          { allowIpMove: config.gateway.cookieIpMoveEnabled }
-        );
-        if (restored) return rememberRequestDeviceOs(request, restored);
+  const sessionRecord = signedUserSessionRecord(request);
+  if (sessionRecord) {
+    const effectiveAuthorization = authorizationWithEffectiveAccess(config, sessionRecord);
+    if (authorizationQuotaBlocked(effectiveAuthorization, now)) {
+      if (allowQuotaBlocked &&
+          isActiveAuthorization(effectiveAuthorization, now) &&
+          effectiveAuthorization.client_ip === clientIp) {
+        return rememberRequestDeviceOs(request, effectiveAuthorization);
       }
+    } else if (isUsableAuthorization(effectiveAuthorization, now)) {
+      if (config.gateway.mode !== 'mock' &&
+          effectiveAuthorization.client_ip === clientIp &&
+          effectiveAuthorization.gateway_session_id &&
+          effectiveAuthorization.client_mac) {
+        queueAuthorizationMaintenance(effectiveAuthorization);
+        return rememberRequestDeviceOs(request, effectiveAuthorization);
+      }
+      const restored = await restoreAuthorizationForClient(
+        effectiveAuthorization,
+        clientIp,
+        await getConfirmedClientMac(),
+        config.gateway.mode !== 'mock' ? await getOwnership() : null,
+        { allowIpMove: config.gateway.cookieIpMoveEnabled }
+      );
+      if (restored) return rememberRequestDeviceOs(request, restored);
     }
   }
   if (config.gateway.sessionCookieRequired) return null;
@@ -2175,7 +2162,7 @@ async function route(request, response) {
     const clientIp = getClientIp(request, config.trustProxy, config.trustedProxyCidrs);
     sendJson(response, 200, {
       clientIp,
-      clientMac: await requestClientMac(url, clientIp)
+      clientMac: await requestClientMac(clientIp)
     });
     return;
   }
@@ -2292,7 +2279,7 @@ const server = http.createServer(async (request, response) => {
     if (response.headersSent) return;
     const status = error instanceof HttpError ? error.statusCode : 500;
     if (status >= 500 && !(error instanceof HttpError && error.code === 'install_required')) {
-      console.error(error);
+      console.error('Internal request failed');
     }
     sendJson(response, status, {
       error: error instanceof HttpError ? error.code : 'internal_error',

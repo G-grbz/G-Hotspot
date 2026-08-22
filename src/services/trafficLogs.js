@@ -3,6 +3,7 @@ import path from 'node:path';
 import dns from 'node:dns/promises';
 import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
+import { openRegularFileSync } from '../lib/files.js';
 import { normalizeMac } from '../lib/security.js';
 import { ipv4InNetworkList, isPrivateIpv4, normalizeNetworkList } from '../lib/network.js';
 
@@ -25,7 +26,7 @@ const fileRowCaches = new Map();
 const fileIndexCaches = new Map();
 const fileWindowIndexCaches = new Map();
 
-function sha256Hex(value) {
+function contentDigestHex(value) {
   return createHash('sha256').update(String(value)).digest('hex');
 }
 
@@ -170,11 +171,11 @@ function trafficLogFileRowFromRecord(record = {}, { sequence = 0, loggedAt = Dat
   const rawKind = rowText(record.kind, 32).toLowerCase();
   const kind = ['flow', 'session', 'interface'].includes(rawKind) ? rawKind : 'session';
   const dedupeKey = rowText(recordValue(record, 'dedupe_key', 'dedupeKey'), 180) ||
-    `file|${sha256Hex(JSON.stringify([record.kind, record.source, record.clientIp, record.sourceIp, createdAt]))}`;
+    `file|${contentDigestHex(JSON.stringify([record.kind, record.source, record.clientIp, record.sourceIp, createdAt]))}`;
   const rawJson = recordValue(record, 'raw_json', 'rawJson', '');
   const row = {
     sequence,
-    id: rowText(record.id, 80) || sha256Hex(`${dedupeKey}|${createdAt}`),
+    id: rowText(record.id, 80) || contentDigestHex(`${dedupeKey}|${createdAt}`),
     dedupe_key: dedupeKey,
     kind,
     source: rowText(record.source || 'opnsense', 80),
@@ -237,17 +238,12 @@ function parseTrafficLogFileText(text, startSequence = 1) {
   };
 }
 
-function readFileRange(filePath, start, end) {
+function readFileRange(descriptor, start, end) {
   const size = Math.max(0, end - start);
   if (!size) return '';
-  const file = fs.openSync(filePath, 'r');
-  try {
-    const buffer = Buffer.allocUnsafe(size);
-    const bytesRead = fs.readSync(file, buffer, 0, size, start);
-    return buffer.toString('utf8', 0, bytesRead);
-  } finally {
-    fs.closeSync(file);
-  }
+  const buffer = Buffer.allocUnsafe(size);
+  const bytesRead = fs.readSync(descriptor, buffer, 0, size, start);
+  return buffer.toString('utf8', 0, bytesRead);
 }
 
 function scanTrafficLogFileRange(filePath, {
@@ -546,19 +542,36 @@ function trafficLogFileIndexRow(entry = {}) {
 }
 
 function readTrafficLogFileRows(filePath) {
-  if (!fs.existsSync(filePath)) {
+  let descriptor;
+  try {
+    descriptor = openRegularFileSync(filePath);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
     fileRowCaches.delete(filePath);
     return [];
   }
-  const stat = fs.statSync(filePath);
-  const cached = fileRowCaches.get(filePath);
-  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.rows;
-  if (cached && stat.size > cached.size) {
-    const parsed = parseTrafficLogFileText(
-      `${cached.remainder || ''}${readFileRange(filePath, cached.size, stat.size)}`,
-      cached.nextSequence
-    );
-    const rows = cached.rows.concat(parsed.rows);
+  try {
+    const stat = fs.fstatSync(descriptor);
+    const cached = fileRowCaches.get(filePath);
+    if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.rows;
+    if (cached && stat.size > cached.size) {
+      const parsed = parseTrafficLogFileText(
+        `${cached.remainder || ''}${readFileRange(descriptor, cached.size, stat.size)}`,
+        cached.nextSequence
+      );
+      const rows = cached.rows.concat(parsed.rows);
+      fileRowCaches.set(filePath, {
+        rows,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        remainder: parsed.remainder,
+        nextSequence: parsed.nextSequence
+      });
+      return rows;
+    }
+    const text = fs.readFileSync(descriptor, 'utf8');
+    const parsed = parseTrafficLogFileText(text);
+    const rows = parsed.rows;
     fileRowCaches.set(filePath, {
       rows,
       size: stat.size,
@@ -567,18 +580,9 @@ function readTrafficLogFileRows(filePath) {
       nextSequence: parsed.nextSequence
     });
     return rows;
+  } finally {
+    fs.closeSync(descriptor);
   }
-  const text = fs.readFileSync(filePath, 'utf8');
-  const parsed = parseTrafficLogFileText(text);
-  const rows = parsed.rows;
-  fileRowCaches.set(filePath, {
-    rows,
-    size: stat.size,
-    mtimeMs: stat.mtimeMs,
-    remainder: parsed.remainder,
-    nextSequence: parsed.nextSequence
-  });
-  return rows;
 }
 
 function clearTrafficLogFileCaches(filePath) {
@@ -1308,7 +1312,7 @@ export function trafficLogRecordFromSession(session = {}, authorization = null, 
     } : {})
   };
   return {
-    dedupeKey: `session|${sha256Hex(payload)}`,
+    dedupeKey: `session|${contentDigestHex(payload)}`,
     kind: 'session',
     source: 'opnsense-session',
     clientIp,
@@ -1356,7 +1360,7 @@ export function trafficLogRecordsFromFlowRecords(records = [], settings = {}) {
       record.rawJson || ''
     ].join('|');
     return {
-      dedupeKey: `flow|${sha256Hex(payload)}`,
+      dedupeKey: `flow|${contentDigestHex(payload)}`,
       kind: 'flow',
       source: cleanText(record.source || 'opnsense-filterlog', 80),
       clientIp,

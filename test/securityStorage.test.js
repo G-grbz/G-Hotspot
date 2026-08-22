@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { readRegularFileIfExistsSync } from '../src/lib/files.js';
 import { hashPassword, verifyPassword, verifyPasswordAsync } from '../src/lib/security.js';
 import { readSystemSettings, writeSystemSettings } from '../src/system.js';
 
@@ -95,8 +96,15 @@ test('legacy plaintext secrets are migrated and removed from SQLite storage', ()
 
     for (const name of fs.readdirSync(directory)) {
       const filePath = path.join(directory, name);
-      if (!fs.statSync(filePath).isFile()) continue;
-      const bytes = fs.readFileSync(filePath);
+      let snapshot;
+      try {
+        snapshot = readRegularFileIfExistsSync(filePath);
+      } catch (error) {
+        if (error?.code === 'EINVAL') continue;
+        throw error;
+      }
+      if (!snapshot) continue;
+      const bytes = snapshot.data;
       assert.equal(bytes.includes(Buffer.from(legacyPassword)), false, `${name} still contains legacy admin password`);
       assert.equal(bytes.includes(Buffer.from(legacyAppSecret)), false, `${name} still contains legacy APP_SECRET`);
       assert.equal(bytes.includes(Buffer.from(legacySmtpPassword)), false, `${name} still contains legacy SMTP password`);

@@ -1,4 +1,4 @@
-import { generateSecret, generateVoucherCode, keyedHash, normalizeIp, normalizeVoucher, safeEqualHex, verifyPasswordAsync } from './lib/security.js';
+import { generateSecret, generateVoucherCode, keyedHash, normalizeIp, normalizeVoucher, verifyPasswordAsync } from './lib/security.js';
 import { HttpError, getClientIp, isTrustedProxyRequest, readBody, readJson, sendJson } from './lib/http.js';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -305,7 +305,7 @@ function preferredAuthorizationIp(row, authorization) {
   return authorization?.client_ip || '';
 }
 
-function alignGatewaySessionToAuthorization(row, authorization) {
+function mergeGatewaySessionRecord(row, authorization) {
   const clientIp = preferredAuthorizationIp(row, authorization);
   if (isIpv4(clientIp) && row.clientIp !== clientIp && row.clientIps.includes(clientIp)) {
     return { ...row, clientIp, clientMac: '', alignedFromGatewayList: true };
@@ -1195,7 +1195,7 @@ export function createAdminController({
     for (const raw of rawRows) {
       const baseRow = normalizeGatewaySession(raw);
       const authorization = db.findAuthorizationForGateway(baseRow);
-      const row = authorization ? alignGatewaySessionToAuthorization(baseRow, authorization) : baseRow;
+      const row = authorization ? mergeGatewaySessionRecord(baseRow, authorization) : baseRow;
       const resolvedClientMac = authorization
         ? usageClientMac(row, authorization, arpLookup)
         : (arpLookup.ipToMac.get(row.clientIp) || normalizedMac(row.clientMac));
@@ -1783,12 +1783,7 @@ export function createAdminController({
       const { value } = await readJson(request);
       const suppliedUser = String(value.username || '');
       const suppliedPassword = String(value.password || '');
-      const passwordValid = config.admin.passwordHash
-        ? await verifyPasswordAsync(suppliedPassword, config.admin.passwordHash)
-        : safeEqualHex(
-            keyedHash(config.appSecret, suppliedPassword),
-            keyedHash(config.appSecret, config.admin.legacyPassword || '')
-          );
+      const passwordValid = await verifyPasswordAsync(suppliedPassword, config.admin.passwordHash);
       if (suppliedUser !== config.admin.username || !passwordValid) {
         notifyAdminLoginFailed(request, suppliedUser, 'invalid_credentials', value.notificationPublicIp);
         throw new HttpError(401, 'Invalid username or password', 'invalid_credentials');

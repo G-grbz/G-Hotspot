@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { readRegularFileIfExistsSync } from '../lib/files.js';
 
 export const ANDROID_APPLICATION_ID = 'com.ghotspot.admin';
 export const GOOGLE_SERVICES_MAX_BYTES = 128 * 1024;
@@ -77,18 +78,18 @@ export function validateGoogleServicesConfig(input) {
 }
 
 function configurationStatus(paths) {
-  if (!fs.existsSync(paths.googleServicesFile)) {
+  const snapshot = readRegularFileIfExistsSync(paths.googleServicesFile);
+  if (!snapshot) {
     return { configured: false, valid: false, error: '' };
   }
   try {
-    const stat = fs.statSync(paths.googleServicesFile);
-    const { summary } = validateGoogleServicesConfig(fs.readFileSync(paths.googleServicesFile));
+    const { summary } = validateGoogleServicesConfig(snapshot.data);
     return {
       configured: true,
       valid: true,
       ...summary,
-      updatedAt: stat.mtimeMs,
-      size: stat.size
+      updatedAt: snapshot.stat.mtimeMs,
+      size: snapshot.stat.size
     };
   } catch (error) {
     return {

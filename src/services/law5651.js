@@ -1594,7 +1594,7 @@ function timestampApiHeaders(lawConfig) {
   return headers;
 }
 
-async function runApiKeyTimestamp(lawConfig, manifestPath, tokenPath, requestPath) {
+async function requestTimestampAttestation(lawConfig, manifestPath, tokenPath, requestPath) {
   if (!lawConfig.timestampApiUrl) {
     return {
       status: 'failed',
@@ -1651,7 +1651,7 @@ async function runTimestamp(lawConfig, manifestPath, tokenPath, requestPath) {
     return runKamusmTimestamp(lawConfig, manifestPath, tokenPath, requestPath);
   }
   if (mode === 'api-key') {
-    return runApiKeyTimestamp(lawConfig, manifestPath, tokenPath, requestPath);
+    return requestTimestampAttestation(lawConfig, manifestPath, tokenPath, requestPath);
   }
   if (mode === 'command' || lawConfig.timestampCommand) {
     const result = await runTimestampCommand(lawConfig, manifestPath, tokenPath);

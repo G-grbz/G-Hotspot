@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { readEnvFile, updateEnvFile } from './lib/env.js';
+import { atomicWriteFileSync, readRegularFileIfExistsSync } from './lib/files.js';
 import { availableLanguageCodes } from './lib/languages.js';
 import { automaticListenHost, automaticListenPort, automaticPublicBaseUrl } from './lib/network.js';
 import { generateSecret, hashPassword } from './lib/security.js';
@@ -921,6 +922,11 @@ export const settingsSchema = [
         defaultValue: 'false',
         warning: 'Queues alerts for registered G-Hotspot Android admin devices.'
       }),
+      field('ANDROID_FCM_PROJECT_ID', 'Firebase project ID', {
+        defaultValue: '',
+        visibleWhen: 'NOTIFICATION_ANDROID_ENABLED',
+        warning: 'Must match the project_id in the Firebase service account JSON.'
+      }),
       field('ANDROID_FCM_SERVICE_ACCOUNT_FILE', 'Firebase service account JSON file', {
         defaultValue: '',
         visibleWhen: 'NOTIFICATION_ANDROID_ENABLED',
@@ -1425,6 +1431,7 @@ const installSettingKeys = new Set([
   ...installOptionalSettingKeys
 ]);
 const TRAFFIC_LOG_RETENTION_OPTIONS_MINUTES = [15, 30, 45, 60];
+const FIREBASE_PROJECT_ID_PATTERN = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/u;
 
 function normalizeTrafficLogRetentionMinutes(value, fallback = 60) {
   const parsed = Math.trunc(Number(value));
@@ -1535,7 +1542,11 @@ function collectSettingsChanges(input) {
   for (const [key, value] of Object.entries(input || {})) {
     if (!allowedKeys.has(key)) continue;
     if (secretKeys.has(key) && String(value ?? '') === '') continue;
-    changes[key] = typeof value === 'boolean' ? String(value) : String(value ?? '');
+    const text = typeof value === 'boolean' ? String(value) : String(value ?? '');
+    if (key === 'ANDROID_FCM_PROJECT_ID' && text && !FIREBASE_PROJECT_ID_PATTERN.test(text.trim())) {
+      throw new Error('Firebase project ID is invalid');
+    }
+    changes[key] = key === 'ANDROID_FCM_PROJECT_ID' ? text.trim() : text;
   }
   return changes;
 }
@@ -1620,7 +1631,8 @@ function saveEnvSettings(input, envPath) {
   );
   const restartRequired = Object.keys(changes).some(key => restartKeys.has(key));
   const previousProcessValues = processSnapshot(Object.keys(changes));
-  const previousFile = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : null;
+  const previousSnapshot = readRegularFileIfExistsSync(envPath, 'utf8');
+  const previousFile = previousSnapshot?.data ?? null;
   try {
     updateEnvFile(changes, envPath);
     reloadConfig();
@@ -1633,7 +1645,7 @@ function saveEnvSettings(input, envPath) {
     reloadConfig();
   } catch (error) {
     if (previousFile == null) fs.rmSync(envPath, { force: true });
-    else fs.writeFileSync(envPath, previousFile, { mode: 0o600 });
+    else atomicWriteFileSync(envPath, previousFile, { mode: 0o600 });
     restoreProcessSnapshot(previousProcessValues);
     reloadConfig();
     throw error;
@@ -1733,13 +1745,14 @@ export function saveTrafficLogSettings(input, envPath = null) {
   if (typeof envPath !== 'string') return saveSystemChanges(changes);
 
   const previousProcessValues = processSnapshot(Object.keys(changes));
-  const previousFile = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : null;
+  const previousSnapshot = readRegularFileIfExistsSync(envPath, 'utf8');
+  const previousFile = previousSnapshot?.data ?? null;
   try {
     updateEnvFile(changes, envPath);
     reloadConfig();
   } catch (error) {
     if (previousFile == null) fs.rmSync(envPath, { force: true });
-    else fs.writeFileSync(envPath, previousFile, { mode: 0o600 });
+    else atomicWriteFileSync(envPath, previousFile, { mode: 0o600 });
     restoreProcessSnapshot(previousProcessValues);
     reloadConfig();
     throw error;

@@ -29,6 +29,6 @@ test('license and notice files preserve LicenseRef-G-Hotspot-NC-1.0 attribution'
   assert.match(notice, /G-Hotspot/u);
   assert.match(notice, /Gökhan GÜRBÜZ/u);
   assert.match(notice, /G-grbz/u);
-  assert.match(notice, /https:\/\/github\.com\/G-grbz/u);
+  assert.match(notice, /^- GitHub: https:\/\/github\.com\/G-grbz$/mu);
   assert.match(notice, /LicenseRef-G-Hotspot-NC-1\.0/u);
 });

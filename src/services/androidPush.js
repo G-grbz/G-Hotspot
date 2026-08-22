@@ -1,9 +1,13 @@
-import fs from 'node:fs';
 import { createSign } from 'node:crypto';
+import path from 'node:path';
+import { readRegularFileSync } from '../lib/files.js';
 
 const FCM_SCOPE = 'https://www.googleapis.com/auth/firebase.messaging';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const FCM_API_ORIGIN = 'https://fcm.googleapis.com';
 const TOKEN_MARGIN_MS = 60_000;
+const FIREBASE_PROJECT_ID_PATTERN = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/u;
+const SERVICE_ACCOUNT_EMAIL_PATTERN = /^[a-z0-9][a-z0-9._-]{2,126}@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/u;
 
 let credentialCache = null;
 let accessTokenCache = null;
@@ -21,15 +25,37 @@ function serviceAccountPath(config) {
   ).trim();
 }
 
+function configuredProjectId(config) {
+  const projectId = String(config.notifications?.androidFcmProjectId || '').trim();
+  if (!FIREBASE_PROJECT_ID_PATTERN.test(projectId)) {
+    throw new Error('Firebase project ID is missing or invalid');
+  }
+  return projectId;
+}
+
 function readServiceAccount(config) {
   const file = serviceAccountPath(config);
   if (!file) return null;
-  if (credentialCache?.file === file) return credentialCache.value;
-  const value = JSON.parse(fs.readFileSync(file, 'utf8'));
-  if (!value.project_id || !value.client_email || !value.private_key) {
-    throw new Error('Firebase service account must include project_id, client_email, and private_key');
+  const projectId = configuredProjectId(config);
+  const resolvedFile = path.resolve(file);
+  if (credentialCache?.file === resolvedFile && credentialCache?.projectId === projectId) {
+    return credentialCache.value;
   }
-  credentialCache = { file, value };
+  const parsed = JSON.parse(readRegularFileSync(resolvedFile, 'utf8').data);
+  const clientEmail = String(parsed?.client_email || '').trim().toLowerCase();
+  const privateKey = String(parsed?.private_key || '');
+  if (parsed?.type !== 'service_account' ||
+      parsed?.project_id !== projectId ||
+      !SERVICE_ACCOUNT_EMAIL_PATTERN.test(clientEmail) ||
+      !clientEmail.endsWith(`@${projectId}.iam.gserviceaccount.com`) ||
+      privateKey.length < 1024 || privateKey.length > 16 * 1024 ||
+      !privateKey.startsWith('-----BEGIN PRIVATE KEY-----\n') ||
+      !privateKey.trimEnd().endsWith('-----END PRIVATE KEY-----') ||
+      (parsed?.token_uri && parsed.token_uri !== GOOGLE_TOKEN_URL)) {
+    throw new Error('Firebase service account is invalid or does not match the configured project');
+  }
+  const value = Object.freeze({ client_email: clientEmail, private_key: privateKey });
+  credentialCache = { file: resolvedFile, projectId, value };
   accessTokenCache = null;
   return value;
 }
@@ -136,10 +162,11 @@ function fcmErrorCode(result) {
 
 export async function sendAndroidPush(config, device, notification) {
   if (!device?.fcm_token || !androidPushConfigured(config)) return { sent: false, reason: 'not_configured' };
-  const credentials = readServiceAccount(config);
+  const projectId = configuredProjectId(config);
   const token = await accessToken(config);
+  const endpoint = new URL(`/v1/projects/${encodeURIComponent(projectId)}/messages:send`, FCM_API_ORIGIN);
   const response = await fetch(
-    `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(credentials.project_id)}/messages:send`,
+    endpoint,
     {
       method: 'POST',
       headers: {

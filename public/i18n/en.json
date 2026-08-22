@@ -135,6 +135,8 @@
   "Queues alerts for registered G-Hotspot Android admin devices.": "Queues alerts for registered G-Hotspot Android admin devices.",
   "Android app poll interval (seconds)": "Android app poll interval (seconds)",
   "Used only as a fallback when Firebase push is unavailable.": "Used only as a fallback when Firebase push is unavailable.",
+  "Firebase project ID": "Firebase project ID",
+  "Must match the project_id in the Firebase service account JSON.": "Must match the project_id in the Firebase service account JSON.",
   "Firebase service account JSON file": "Firebase service account JSON file",
   "Absolute server path to the Firebase service account JSON. Keep this file outside the public directory.": "Absolute server path to the Firebase service account JSON. Keep this file outside the public directory.",
   "Lower values deliver Android notifications faster but keep the helper app active more often.": "Lower values deliver Android notifications faster but keep the helper app active more often.",

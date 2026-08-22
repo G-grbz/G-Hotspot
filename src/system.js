@@ -3,12 +3,17 @@ import path from 'node:path';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { readEnvFile } from './lib/env.js';
+import {
+  chmodRegularFilePrivateIfExistsSync,
+  readRegularFileIfExistsSync
+} from './lib/files.js';
 import { hashPassword, isPasswordHash } from './lib/security.js';
 
 const DEFAULT_SYSTEM_DATABASE_PATH = './data/system.db';
 const INSTALL_FLAG = 'installed';
 const ENCRYPTION_PREFIX = 'enc:v1:';
 const MASTER_KEY_BYTES = 32;
+const FIREBASE_PROJECT_ID_PATTERN = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/u;
 const NON_PERSISTED_ENV_KEYS = new Set([
   'SYSTEM_ENCRYPTION_KEY',
   'SYSTEM_ENCRYPTION_KEY_FILE',
@@ -48,9 +53,7 @@ function normalizeKey(value) {
 
 function chmodPrivate(filePath) {
   for (const target of [filePath, `${filePath}-wal`, `${filePath}-shm`]) {
-    try {
-      if (fs.existsSync(target)) fs.chmodSync(target, 0o600);
-    } catch {}
+    try { chmodRegularFilePrivateIfExistsSync(target); } catch {}
   }
 }
 
@@ -74,9 +77,10 @@ function readOrCreateMasterKey(filePath) {
 
   const keyFile = encryptionKeyFile(filePath);
   fs.mkdirSync(path.dirname(keyFile), { recursive: true });
-  if (fs.existsSync(keyFile)) {
+  const existing = readRegularFileIfExistsSync(keyFile, 'utf8');
+  if (existing) {
     chmodPrivate(keyFile);
-    const raw = String(fs.readFileSync(keyFile, 'utf8') || '').trim();
+    const raw = String(existing.data || '').trim();
     let decoded;
     try {
       decoded = Buffer.from(raw, 'base64url');
@@ -94,7 +98,10 @@ function readOrCreateMasterKey(filePath) {
     fs.writeFileSync(keyFile, `${key.toString('base64url')}\n`, { mode: 0o600, flag: 'wx' });
   } catch (error) {
     if (error?.code !== 'EEXIST') throw error;
-    const raw = String(fs.readFileSync(keyFile, 'utf8') || '').trim();
+    const raced = readRegularFileIfExistsSync(keyFile, 'utf8');
+    if (!raced) throw error;
+    chmodPrivate(keyFile);
+    const raw = String(raced.data || '').trim();
     const decoded = Buffer.from(raw, 'base64url');
     if (decoded.length !== MASTER_KEY_BYTES) throw new Error(`Invalid system encryption key file: ${keyFile}`);
     return decoded;
@@ -354,9 +361,7 @@ export function importEnvToSystemIfNeeded({
   if (meta[INSTALL_FLAG] === 'true' || Object.keys(settings).length) return false;
 
   const envValues = readEnvFile(envPath);
-  if (fs.existsSync(envPath)) {
-    try { fs.chmodSync(envPath, 0o600); } catch {}
-  }
+  try { chmodRegularFilePrivateIfExistsSync(envPath); } catch {}
   const appSecret = String(envValues.APP_SECRET || process.env.APP_SECRET || '');
   const adminPasswordHash = String(envValues.ADMIN_PASSWORD_HASH || process.env.ADMIN_PASSWORD_HASH || '');
   const adminPassword = String(envValues.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || '');
@@ -394,7 +399,25 @@ export function loadSystemSettingsIntoEnv({
 } = {}) {
   if (importEnv) importEnvToSystemIfNeeded({ filePath });
   const preserve = new Set(preserveKeys);
-  const settings = readSystemSettings(filePath);
+  let settings = readSystemSettings(filePath);
+  if (!settings.ANDROID_FCM_PROJECT_ID) {
+    const serviceAccountFile = String(
+      settings.ANDROID_FCM_SERVICE_ACCOUNT_FILE || process.env.ANDROID_FCM_SERVICE_ACCOUNT_FILE || ''
+    ).trim();
+    if (serviceAccountFile) {
+      try {
+        const snapshot = readRegularFileIfExistsSync(path.resolve(serviceAccountFile), 'utf8');
+        const serviceAccount = snapshot ? JSON.parse(snapshot.data) : null;
+        const projectId = String(serviceAccount?.project_id || '').trim();
+        if (FIREBASE_PROJECT_ID_PATTERN.test(projectId)) {
+          writeSystemSettings({ ANDROID_FCM_PROJECT_ID: projectId }, filePath);
+          settings = readSystemSettings(filePath);
+        }
+      } catch {
+        // An invalid optional Firebase credential disables push without blocking startup.
+      }
+    }
+  }
   for (const [key, value] of Object.entries(settings)) {
     if (preserve.has(key)) continue;
     process.env[key] = value;

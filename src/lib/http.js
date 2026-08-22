@@ -1,6 +1,6 @@
-import fs from 'node:fs';
 import path from 'node:path';
 import { BlockList, isIP } from 'node:net';
+import { readRegularFileIfExistsSync } from './files.js';
 import { normalizeIp } from './security.js';
 
 const MIME_TYPES = new Map([
@@ -133,9 +133,10 @@ export function serveStatic(response, publicDir, pathname) {
   const filePath = path.resolve(publicDir, relative);
   const root = path.resolve(publicDir) + path.sep;
   if (!filePath.startsWith(root) && filePath !== path.resolve(publicDir, 'index.html')) return false;
-  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) return false;
+  const snapshot = readRegularFileIfExistsSync(filePath);
+  if (!snapshot) return false;
   const extension = path.extname(filePath).toLowerCase();
-  const body = fs.readFileSync(filePath);
+  const body = snapshot.data;
   response.writeHead(200, {
     'content-type': MIME_TYPES.get(extension) || 'application/octet-stream',
     'content-length': body.length,

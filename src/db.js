@@ -43,7 +43,7 @@ function stableJson(value) {
   return JSON.stringify(value);
 }
 
-function sha256Hex(value) {
+function contentDigestHex(value) {
   return createHash('sha256').update(String(value)).digest('hex');
 }
 
@@ -3986,7 +3986,7 @@ export class HotspotDatabase {
           rawJson: input.rawJson || '',
           createdAt
         };
-        const recordHash = sha256Hex(law5651HashPayload(record, previousHash));
+        const recordHash = contentDigestHex(law5651HashPayload(record, previousHash));
         this.syslogDb.prepare(`
           INSERT INTO law5651_logs
             (id, dedupe_key, kind, source, network, client_ip, client_mac, subscriber_id,
@@ -4060,7 +4060,7 @@ export class HotspotDatabase {
       createdAt: Math.trunc(Number(createdAt) || Date.now())
     };
     const previousHash = this.latestLaw5651EventHash() || '0'.repeat(64);
-    const eventHash = sha256Hex(law5651EventHashPayload(event, previousHash));
+    const eventHash = contentDigestHex(law5651EventHashPayload(event, previousHash));
     const id = randomUUID();
     this.syslogDb.prepare(`
       INSERT INTO law5651_events

@@ -1,5 +1,5 @@
-import fs from 'node:fs';
 import path from 'node:path';
+import { atomicWriteFileSync, readRegularFileIfExistsSync } from './files.js';
 
 function unquote(value) {
   const trimmed = value.trim();
@@ -14,8 +14,9 @@ function unquote(value) {
 }
 
 export function loadEnv(filePath = path.resolve('.env')) {
-  if (!fs.existsSync(filePath)) return;
-  const content = fs.readFileSync(filePath, 'utf8');
+  const snapshot = readRegularFileIfExistsSync(filePath, 'utf8');
+  if (!snapshot) return;
+  const content = snapshot.data;
   for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith('#')) continue;
@@ -37,8 +38,9 @@ function quote(value) {
 
 export function readEnvFile(filePath = path.resolve('.env')) {
   const values = {};
-  if (!fs.existsSync(filePath)) return values;
-  const content = fs.readFileSync(filePath, 'utf8');
+  const snapshot = readRegularFileIfExistsSync(filePath, 'utf8');
+  if (!snapshot) return values;
+  const content = snapshot.data;
   for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith('#')) continue;
@@ -50,7 +52,8 @@ export function readEnvFile(filePath = path.resolve('.env')) {
 }
 
 export function updateEnvFile(changes, filePath = path.resolve('.env')) {
-  const lines = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8').split(/\r?\n/) : [];
+  const snapshot = readRegularFileIfExistsSync(filePath, 'utf8');
+  const lines = snapshot ? snapshot.data.split(/\r?\n/) : [];
   const pending = new Map(Object.entries(changes).map(([key, value]) => [key, String(value ?? '')]));
   const changedKeys = new Set(pending.keys());
   const written = new Set();
@@ -68,7 +71,7 @@ export function updateEnvFile(changes, filePath = path.resolve('.env')) {
     output.push('# Settings managed by the G-Hotspot admin panel');
     for (const [key, value] of pending) output.push(`${key}=${quote(value)}`);
   }
-  fs.writeFileSync(filePath, output.join('\n').replace(/\n*$/u, '\n'), { mode: 0o600 });
+  atomicWriteFileSync(filePath, output.join('\n').replace(/\n*$/u, '\n'), { mode: 0o600 });
   for (const [key, value] of Object.entries(changes)) process.env[key] = String(value ?? '');
 }
 

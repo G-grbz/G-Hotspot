@@ -1,6 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { HttpError, readBody } from './lib/http.js';
+import {
+  atomicWriteFileSync,
+  readRegularFileIfExistsSync,
+  statRegularFileIfExistsSync
+} from './lib/files.js';
 
 const ASSET_KINDS = new Set(['logo', 'card-background', 'body-background']);
 const MB = 1024 * 1024;
@@ -74,8 +79,8 @@ function findAsset(config, kind) {
   const directory = assetDirectory(config);
   for (const [contentType, extension] of EXTENSIONS) {
     const filePath = path.join(directory, `${kind}.${extension}`);
-    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) continue;
-    const stat = fs.statSync(filePath);
+    const stat = statRegularFileIfExistsSync(filePath);
+    if (!stat) continue;
     return { kind, filePath, contentType, updatedAt: Math.trunc(stat.mtimeMs), size: stat.size };
   }
   return null;
@@ -107,9 +112,12 @@ function saveAppearanceAssetBuffer(buffer, config, kind) {
     throw new HttpError(400, 'Only PNG, JPEG and WebP images are supported', 'unsupported_image');
   }
   fs.mkdirSync(assetDirectory(config), { recursive: true });
-  removeAssetFiles(config, kind);
   const filePath = path.join(assetDirectory(config), `${kind}.${EXTENSIONS.get(contentType)}`);
-  fs.writeFileSync(filePath, buffer, { mode: 0o600 });
+  atomicWriteFileSync(filePath, buffer, { mode: 0o600 });
+  for (const extension of EXTENSIONS.values()) {
+    const candidate = path.join(assetDirectory(config), `${kind}.${extension}`);
+    if (candidate !== filePath) fs.rmSync(candidate, { force: true });
+  }
   return appearanceAssets(config)[kind];
 }
 
@@ -174,23 +182,40 @@ export async function saveAppearanceAssetChunk(request, config, kind) {
   const directory = path.join(root, `${kind}-${uploadId}`);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const metaPath = path.join(directory, 'meta.json');
-  const meta = fs.existsSync(metaPath)
-    ? JSON.parse(fs.readFileSync(metaPath, 'utf8'))
-    : { kind, uploadId, total, totalSize };
+  const expectedMeta = { kind, uploadId, total, totalSize };
+  let meta;
+  try {
+    fs.writeFileSync(metaPath, JSON.stringify(expectedMeta), { mode: 0o600, flag: 'wx' });
+    meta = expectedMeta;
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+    const snapshot = readRegularFileIfExistsSync(metaPath, 'utf8');
+    if (!snapshot) throw new HttpError(409, 'Upload state changed', 'upload_state_changed');
+    meta = JSON.parse(snapshot.data);
+  }
   if (meta.kind !== kind || meta.uploadId !== uploadId || meta.total !== total || meta.totalSize !== totalSize) {
     throw new HttpError(409, 'Upload metadata changed', 'upload_metadata_changed');
   }
-  fs.writeFileSync(metaPath, JSON.stringify(meta), { mode: 0o600 });
-  fs.writeFileSync(path.join(directory, `${index}.part`), buffer, { mode: 0o600 });
+  const uploadedChunkPath = path.join(directory, `${index}.part`);
+  try {
+    fs.writeFileSync(uploadedChunkPath, buffer, { mode: 0o600, flag: 'wx' });
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+    const existingChunk = readRegularFileIfExistsSync(uploadedChunkPath);
+    if (!existingChunk || !existingChunk.data.equals(buffer)) {
+      throw new HttpError(409, 'Upload chunk changed', 'upload_chunk_changed');
+    }
+  }
 
   const chunks = [];
   let actualSize = 0;
   for (let chunkIndex = 0; chunkIndex < total; chunkIndex += 1) {
     const chunkPath = path.join(directory, `${chunkIndex}.part`);
-    if (!fs.existsSync(chunkPath)) {
+    const snapshot = readRegularFileIfExistsSync(chunkPath);
+    if (!snapshot) {
       return { complete: false, received: fs.readdirSync(directory).filter(name => name.endsWith('.part')).length };
     }
-    const chunk = fs.readFileSync(chunkPath);
+    const chunk = snapshot.data;
     chunks.push(chunk);
     actualSize += chunk.length;
     if (actualSize > maxBytes) {
@@ -219,11 +244,22 @@ export function deleteAppearanceAsset(config, kind) {
 }
 
 export function serveAppearanceAsset(response, config, kind) {
-  const asset = findAsset(config, kind);
-  if (!asset) throw new HttpError(404, 'Appearance asset not found', 'appearance_asset_not_found');
-  const body = fs.readFileSync(asset.filePath);
+  assertKind(kind);
+  let body = null;
+  let contentType = '';
+  for (const [candidateType, extension] of EXTENSIONS) {
+    const snapshot = readRegularFileIfExistsSync(path.join(assetDirectory(config), `${kind}.${extension}`));
+    if (!snapshot) continue;
+    if (detectImageType(snapshot.data) !== candidateType) {
+      throw new HttpError(500, 'Stored appearance asset is invalid', 'appearance_asset_invalid');
+    }
+    body = snapshot.data;
+    contentType = candidateType;
+    break;
+  }
+  if (!body) throw new HttpError(404, 'Appearance asset not found', 'appearance_asset_not_found');
   response.writeHead(200, {
-    'content-type': asset.contentType,
+    'content-type': contentType,
     'content-length': body.length,
     'cache-control': 'public, max-age=31536000, immutable',
     'content-security-policy': "default-src 'none'; img-src 'self'",

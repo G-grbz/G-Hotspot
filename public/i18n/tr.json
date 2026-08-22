@@ -121,6 +121,8 @@
   "Queues alerts for registered G-Hotspot Android admin devices.": "Kayıtlı G-Hotspot Android yönetici cihazları için uyarıları kuyruğa alır.",
   "Android app poll interval (seconds)": "Android uygulama yoklama aralığı (saniye)",
   "Used only as a fallback when Firebase push is unavailable.": "Yalnızca Firebase anlık bildirimleri kullanılamadığında yedek olarak kullanılır.",
+  "Firebase project ID": "Firebase proje kimliği",
+  "Must match the project_id in the Firebase service account JSON.": "Firebase servis hesabı JSON dosyasındaki project_id değeriyle eşleşmelidir.",
   "Firebase service account JSON file": "Firebase servis hesabı JSON dosyası",
   "Absolute server path to the Firebase service account JSON. Keep this file outside the public directory.": "Firebase servis hesabı JSON dosyasının sunucudaki mutlak yolu. Bu dosyayı public dizininin dışında tutun.",
   "Lower values deliver Android notifications faster but keep the helper app active more often.": "Daha düşük değerler Android bildirimlerini daha hızlı iletir, ancak yardımcı uygulamayı daha sık aktif tutar.",
