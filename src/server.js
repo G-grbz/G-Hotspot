@@ -7,7 +7,7 @@ import { HttpError, getClientIp, readJson, sendJson, sendText, serveStatic } fro
 import {
   COUNTRY_CALLING_CODES, generateOtp, generateSecret, isAllowedCountryCode, isValidEmail,
   isValidPhoneForCountry, keyedHash, normalizeCountryCode, normalizePhoneForCountry, safeEqualHex,
-  isValidTckn, normalizeEmail, normalizeMac, normalizePhone, normalizeTckn, normalizeVoucher, sanitizeRedirectUrl
+  isValidTckn, normalizeEmail, normalizeIp, normalizeMac, normalizePhone, normalizeTckn, normalizeVoucher, safeEqualText, sanitizeRedirectUrl
 } from './lib/security.js';
 import { sendMail } from './services/smtp.js';
 import { sendWhatsAppOtp } from './services/whatsapp.js';
@@ -91,6 +91,72 @@ const INSTALL_PAGE_PATHS = new Set(['/install', '/install/', '/install.html']);
 const processingIdentities = new Set();
 const deliveryGuard = createDeliveryGuard();
 const authorizationMaintenanceSyncs = new Set();
+const configuredSetupToken = String(process.env.SETUP_TOKEN || process.env.INSTALL_SETUP_TOKEN || '').trim();
+const installSetupToken = configuredSetupToken || generateSecret(32);
+const generatedInstallSetupToken = !configuredSetupToken;
+const installAccessAttempts = new Map();
+
+function isLoopbackAddress(value) {
+  const ip = normalizeIp(value);
+  return ip === '::1' || ip === '127.0.0.1' || /^127\./u.test(ip);
+}
+
+function isDirectLoopbackInstallRequest(request, url) {
+  const host = String(url.hostname || '').toLowerCase();
+  const loopbackHost = host === 'localhost' || host === '127.0.0.1' || host === '::1' || /^127\./u.test(host);
+  const forwarded = request.headers.forwarded || request.headers['x-forwarded-for'] ||
+    request.headers['x-real-ip'] || request.headers['x-forwarded-host'] || request.headers['x-forwarded-proto'];
+  return loopbackHost && !forwarded &&
+    isLoopbackAddress(request.socket.remoteAddress || '') &&
+    isLoopbackAddress(request.socket.localAddress || '');
+}
+
+function installTokenFromRequest(request) {
+  const value = request.headers['x-setup-token'];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function recordInstallAccessFailure(request) {
+  const clientIp = normalizeIp(request.socket.remoteAddress || '0.0.0.0');
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000;
+  if (installAccessAttempts.size > 4096) {
+    for (const [ip, timestamps] of installAccessAttempts) {
+      const activeTimestamps = timestamps.filter(timestamp => timestamp > now - windowMs);
+      if (activeTimestamps.length) installAccessAttempts.set(ip, activeTimestamps);
+      else installAccessAttempts.delete(ip);
+    }
+  }
+  const current = installAccessAttempts.get(clientIp) || [];
+  const active = current.filter(timestamp => timestamp > now - windowMs);
+  if (active.length >= 20) throw new HttpError(429, 'Too many setup access attempts. Try again later.', 'rate_limited');
+  active.push(now);
+  installAccessAttempts.set(clientIp, active);
+}
+
+function requireInstallAccess(request, url) {
+  if (isDirectLoopbackInstallRequest(request, url)) return;
+  const token = installTokenFromRequest(request);
+  if (token && safeEqualText(token, installSetupToken)) return;
+  recordInstallAccessFailure(request);
+  throw new HttpError(
+    401,
+    'Setup token required for remote installation. Open /install#setup_token=<token> using the token shown in the server console.',
+    'setup_token_required'
+  );
+}
+
+function applySecurityHeaders(request, response) {
+  response.setHeader('x-content-type-options', 'nosniff');
+  response.setHeader('x-frame-options', 'DENY');
+  response.setHeader('referrer-policy', 'no-referrer');
+  response.setHeader('permissions-policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+  response.setHeader('cross-origin-opener-policy', 'same-origin');
+  response.setHeader('cross-origin-resource-policy', 'same-origin');
+  if (request.socket.encrypted || String(config.publicBaseUrl || '').startsWith('https://')) {
+    response.setHeader('strict-transport-security', 'max-age=31536000; includeSubDomains');
+  }
+}
 
 function cookieValue(request, name) {
   for (const cookie of String(request.headers.cookie || '').split(';')) {
@@ -1810,18 +1876,21 @@ async function handleInstallRoute(request, response, url) {
   }
 
   if (request.method === 'POST' && url.pathname === '/api/install/secret') {
+    requireInstallAccess(request, url);
     if (!config.installRequired) throw new HttpError(409, 'System is already installed', 'already_installed');
     sendJson(response, 200, { secret: generateInstallSecret() });
     return true;
   }
 
   if (request.method === 'GET' && url.pathname === '/api/install/settings') {
+    requireInstallAccess(request, url);
     if (!config.installRequired) throw new HttpError(409, 'System is already installed', 'already_installed');
     sendJson(response, 200, getSettings());
     return true;
   }
 
   if (request.method === 'POST' && url.pathname === '/api/install/opnsense-test') {
+    requireInstallAccess(request, url);
     if (!config.installRequired) throw new HttpError(409, 'System is already installed', 'already_installed');
     const { value } = await readJson(request, 32 * 1024);
     let gateway;
@@ -1846,6 +1915,7 @@ async function handleInstallRoute(request, response, url) {
   }
 
   if (request.method === 'POST' && url.pathname === '/api/install/gateway/networks') {
+    requireInstallAccess(request, url);
     if (!config.installRequired) throw new HttpError(409, 'System is already installed', 'already_installed');
     const { value } = await readJson(request, 32 * 1024);
     let gateway;
@@ -1869,6 +1939,7 @@ async function handleInstallRoute(request, response, url) {
   }
 
   if (request.method === 'POST' && url.pathname === '/api/install') {
+    requireInstallAccess(request, url);
     if (!config.installRequired) throw new HttpError(409, 'System is already installed', 'already_installed');
     const { value } = await readJson(request, 256 * 1024);
     try {
@@ -1922,6 +1993,8 @@ async function route(request, response) {
 
   if (await admin.handle(request, response, url)) return;
   if (request.method === 'POST' && url.pathname === '/api/android/pairing/claim') {
+    const clientIp = getClientIp(request, config.trustProxy);
+    enforceRateLimit('android_pairing_claim', clientIp, '', 20, 15 * 60 * 1000);
     const { value } = await readJson(request);
     const code = normalizeAndroidPairingCode(value.code);
     if (!code) throw new HttpError(400, 'Android pairing code is required', 'android_pairing_code_required');
@@ -1938,7 +2011,7 @@ async function route(request, response) {
       appVersion: String(value.appVersion || '').slice(0, 40),
       platformVersion: String(value.platformVersion || '').slice(0, 80),
       userAgent: String(request.headers['user-agent'] || '').slice(0, 300),
-      clientIp: getClientIp(request, config.trustProxy),
+      clientIp,
       status: 'pending',
       pairingCodeHint: pairing.code_hint,
       fcmToken: String(value.fcmToken || '').trim().slice(0, 4096)
@@ -2185,6 +2258,7 @@ async function route(request, response) {
 }
 
 const server = http.createServer(async (request, response) => {
+  applySecurityHeaders(request, response);
   try {
     await route(request, response);
   } catch (error) {
@@ -2263,6 +2337,14 @@ if (config.telegram.enabled && config.telegram.mode === 'polling') {
 server.listen(config.port, config.host, () => {
   console.log(`${config.appName} listening on http://${config.host}:${config.port}`);
   console.log(`Gateway mode: ${config.gateway.mode}`);
+  if (config.installRequired) {
+    if (generatedInstallSetupToken) {
+      console.log(`Remote setup token: ${installSetupToken}`);
+      console.log(`Remote setup URL: http://${config.host}:${config.port}/install#setup_token=${installSetupToken}`);
+    } else {
+      console.log('Remote setup access is protected by SETUP_TOKEN.');
+    }
+  }
   notifySystemStartup();
   if (!config.smtp.enabled) console.log('E-mail verification: disabled');
   if (!config.whatsapp.enabled) {

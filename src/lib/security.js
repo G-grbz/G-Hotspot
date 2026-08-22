@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, randomInt, scrypt, scryptSync, timingSafeEqual } from 'node:crypto';
 
 const VOUCHER_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 const TOKEN_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -20,6 +20,97 @@ export const COUNTRY_CALLING_CODES = Object.freeze([
   '966', '967', '968', '970', '971', '972', '973', '974', '975', '976', '977', '992', '993',
   '994', '995', '996', '998'
 ]);
+
+
+const PASSWORD_HASH_PREFIX = 'scrypt';
+const PASSWORD_SCRYPT_N = 65536;
+const PASSWORD_SCRYPT_R = 8;
+const PASSWORD_SCRYPT_P = 1;
+const PASSWORD_HASH_BYTES = 64;
+const PASSWORD_SCRYPT_MAXMEM = 128 * 1024 * 1024;
+
+function base64UrlBuffer(value) {
+  return Buffer.from(String(value || ''), 'base64url');
+}
+
+export function hashPassword(password) {
+  const value = String(password ?? '');
+  if (!value) throw new Error('Password is required');
+  const salt = randomBytes(16);
+  const hash = scryptSync(value, salt, PASSWORD_HASH_BYTES, {
+    N: PASSWORD_SCRYPT_N,
+    r: PASSWORD_SCRYPT_R,
+    p: PASSWORD_SCRYPT_P,
+    maxmem: PASSWORD_SCRYPT_MAXMEM
+  });
+  return `${PASSWORD_HASH_PREFIX}$v=1$N=${PASSWORD_SCRYPT_N},r=${PASSWORD_SCRYPT_R},p=${PASSWORD_SCRYPT_P}$${salt.toString('base64url')}$${hash.toString('base64url')}`;
+}
+
+export function isPasswordHash(value) {
+  return /^scrypt\$v=1\$N=\d+,r=\d+,p=\d+\$[A-Za-z0-9_-]+\$[A-Za-z0-9_-]+$/u.test(String(value || ''));
+}
+
+export function verifyPassword(password, encodedHash) {
+  const encoded = String(encodedHash || '');
+  const match = encoded.match(/^scrypt\$v=1\$N=(\d+),r=(\d+),p=(\d+)\$([A-Za-z0-9_-]+)\$([A-Za-z0-9_-]+)$/u);
+  if (!match) return false;
+  const N = Number(match[1]);
+  const r = Number(match[2]);
+  const p = Number(match[3]);
+  if (!Number.isInteger(N) || !Number.isInteger(r) || !Number.isInteger(p) || N < 16384 || N > 262144 || r < 1 || r > 32 || p < 1 || p > 8) {
+    return false;
+  }
+  const salt = base64UrlBuffer(match[4]);
+  const expected = base64UrlBuffer(match[5]);
+  if (salt.length < 16 || expected.length < 32 || expected.length > 128) return false;
+  let actual;
+  try {
+    actual = scryptSync(String(password ?? ''), salt, expected.length, {
+      N,
+      r,
+      p,
+      maxmem: Math.max(PASSWORD_SCRYPT_MAXMEM, 128 * N * r + 8 * 1024 * 1024)
+    });
+  } catch {
+    return false;
+  }
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+export async function verifyPasswordAsync(password, encodedHash) {
+  const encoded = String(encodedHash || '');
+  const match = encoded.match(/^scrypt\$v=1\$N=(\d+),r=(\d+),p=(\d+)\$([A-Za-z0-9_-]+)\$([A-Za-z0-9_-]+)$/u);
+  if (!match) return false;
+  const N = Number(match[1]);
+  const r = Number(match[2]);
+  const p = Number(match[3]);
+  if (!Number.isInteger(N) || !Number.isInteger(r) || !Number.isInteger(p) || N < 16384 || N > 262144 || r < 1 || r > 32 || p < 1 || p > 8) {
+    return false;
+  }
+  const salt = base64UrlBuffer(match[4]);
+  const expected = base64UrlBuffer(match[5]);
+  if (salt.length < 16 || expected.length < 32 || expected.length > 128) return false;
+  let actual;
+  try {
+    actual = await new Promise((resolve, reject) => {
+      scrypt(String(password ?? ''), salt, expected.length, {
+        N,
+        r,
+        p,
+        maxmem: Math.max(PASSWORD_SCRYPT_MAXMEM, 128 * N * r + 8 * 1024 * 1024)
+      }, (error, derivedKey) => error ? reject(error) : resolve(derivedKey));
+    });
+  } catch {
+    return false;
+  }
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+export function safeEqualText(left, right) {
+  const a = Buffer.from(String(left ?? ''), 'utf8');
+  const b = Buffer.from(String(right ?? ''), 'utf8');
+  return a.length === b.length && a.length > 0 && timingSafeEqual(a, b);
+}
 
 export function keyedHash(secret, value) {
   return createHmac('sha256', secret).update(String(value), 'utf8').digest('hex');

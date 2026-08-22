@@ -95,32 +95,53 @@ curl http://SERVER_IP:8080/health
 ### English
 
 The first `npm start` prepares `data/system.db`. Open
-`http://SERVER_IP:8080/install` and choose mock or OPNsense API mode, then set
-the administrator username, administrator password and application secret.
+`http://127.0.0.1:8080/install` locally, or use the remote setup URL printed in
+the server console. Remote installation APIs require a setup token; an
+ephemeral token is generated at startup unless `SETUP_TOKEN` is supplied.
+
+Admin passwords are stored as scrypt hashes. Configured provider/application
+secrets are encrypted in `system.db` with AES-256-GCM. By default the encryption
+key is generated as `data/.system-key` with private file permissions; production
+deployments can keep the key outside the data directory with
+`SYSTEM_ENCRYPTION_KEY` or `SYSTEM_ENCRYPTION_KEY_FILE`.
 
 Existing `.env` files are imported into `system.db` for backward compatibility.
+Legacy plaintext admin passwords and database secrets are migrated automatically.
 After import, runtime configuration is read from `system.db`; `.env` is not
-loaded as a live settings source.
+loaded as a live settings source. Remove or strictly protect the legacy `.env`
+after verifying the migration because it can still contain plaintext secrets.
 
 For production setup, OPNsense API permissions, Kea DHCP, 5651/syslog, NVİ and
 WhatsApp configuration, read the [English documentation](docs/README.en.md).
 
 ### Türkçe
 
-İlk `npm start` çalıştırması `data/system.db` dosyasını hazırlar. Tarayıcıdan
-`http://SERVER_IP:8080/install` adresini açıp mock veya OPNsense API modunu,
-yönetici kullanıcı adını, yönetici şifresini ve uygulama anahtarını belirleyin.
+İlk `npm start` çalıştırması `data/system.db` dosyasını hazırlar. Yerel kurulum
+için `http://127.0.0.1:8080/install` adresini açın; uzaktan kurulumda sunucu
+konsolunda yazdırılan setup URL'sini kullanın. Uzak kurulum API'leri setup token
+ister; `SETUP_TOKEN` verilmezse her başlangıçta geçici bir token üretilir.
+
+Admin parolaları scrypt hash olarak saklanır. Uygulama/provider secret değerleri
+`system.db` içinde AES-256-GCM ile şifrelenir. Varsayılan encryption key özel
+dosya izinleriyle `data/.system-key` olarak üretilir; üretimde anahtarı data
+dizininin dışında tutmak için `SYSTEM_ENCRYPTION_KEY` veya
+`SYSTEM_ENCRYPTION_KEY_FILE` kullanılabilir.
 
 Mevcut `.env` dosyaları geriye uyumluluk için ilk açılışta `system.db` içine
-aktarılır. Importtan sonra çalışma zamanı ayarları `system.db` üzerinden
-okunur; `.env` canlı ayar kaynağı olarak yüklenmez.
+aktarılır. Eski plaintext admin parolası ve DB secret değerleri otomatik migrate
+edilir. Importtan sonra çalışma zamanı ayarları `system.db` üzerinden okunur;
+`.env` canlı ayar kaynağı olarak yüklenmez. Migration doğrulandıktan sonra eski
+`.env` dosyasını silin veya çok sıkı koruyun; dosyanın kendisi plaintext secret
+içerebilir.
 
 Ayrıntılı üretim kurulumu, OPNsense API izinleri, Kea DHCP, 5651/syslog, NVİ ve
 WhatsApp ayarları için [Türkçe dokümantasyona](docs/README.tr.md) bakın.
 
 ## Production Notes
 
-* Keep `data/system.db` private. It contains `APP_SECRET`, admin password, OPNsense API credentials and provider secrets.
+* Keep `data/system.db` private. Admin passwords are scrypt-hashed and configured secrets are AES-256-GCM encrypted, but the database still contains operational and personal data.
+* Keep the encryption key private and backed up. For stronger separation, provide `SYSTEM_ENCRYPTION_KEY` from outside the data directory; losing the key makes encrypted settings unrecoverable.
+* Remote `/api/install/*` setup operations require localhost access or the setup token. Prefer `SETUP_TOKEN` supplied by the service environment for managed deployments.
 * Use `GATEWAY_MODE=mock` only for development. It does not open real internet access.
 * Use `GATEWAY_MODE=opnsense-api` with an OPNsense API user that has only the required effective privileges.
 * Kea DHCP is required for the managed DHCP lease/reservation synchronization feature. Disable `OPNSENSE_KEA_LEASE_SYNC_ENABLED` if your OPNsense DHCP setup is not Kea-compatible.

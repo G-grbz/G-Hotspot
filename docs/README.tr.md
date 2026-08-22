@@ -125,10 +125,25 @@ curl http://127.0.0.1:8080/health
 
 `npm start` ilk çalıştırmada `data/system.db` dosyasını oluşturur ve yönetici
 hesabı, uygulama anahtarı ve ağ geçidi modu ayarlanana kadar `/install`
-sayfasını sunar. `.env` zaten varsa üzerine yazılmaz ve değerleri geriye
-uyumluluk için `system.db` içine aktarılır. Importtan sonra çalışma zamanı
-ayarları `system.db` üzerinden okunur; `.env` canlı ayar kaynağı olarak
-yüklenmez.
+sayfasını sunar. Doğrudan loopback kurulumunda (`127.0.0.1`/`localhost`) token
+gerekmez. Uzak kurulum API'leri `X-Setup-Token` ister; `SETUP_TOKEN`
+ayarlanmamışsa süreç başlangıcında geçici bir setup token ve
+`#setup_token=...` URL'si konsola yazılır. Fragment installer tarafından alınır
+ve HTTP istek URL'sinin parçası olarak sunucuya gönderilmez.
+
+Admin parolaları yalnızca scrypt hash olarak saklanır. Secret ayarlar AES-256-GCM
+authenticated encryption ile korunur. Varsayılan master key `0600` izinle
+`data/.system-key` dosyasında üretilir. Üretimde daha güçlü ayrıştırma için
+rastgele `SYSTEM_ENCRYPTION_KEY` değerini servis ortamından verin veya
+`SYSTEM_ENCRYPTION_KEY_FILE` ile data dizini dışındaki korumalı bir key dosyasını
+gösterin. Anahtarı ayrı yedekleyin; anahtar olmadan şifreli ayarlar kurtarılamaz.
+
+`.env` zaten varsa üzerine yazılmaz ve değerleri geriye uyumluluk için
+`system.db` içine aktarılır. Eski plaintext admin parolaları ve secret satırları
+otomatik migrate edilir. Importtan sonra çalışma zamanı ayarları `system.db`
+üzerinden okunur; `.env` canlı ayar kaynağı olarak yüklenmez. Migration'ı
+doğruladıktan sonra eski `.env` dosyasını silin veya sıkı koruyun; dosyanın
+kendisi plaintext secret içerebilir.
 
 ## Temel yapılandırma
 
@@ -159,6 +174,18 @@ ADMIN_USERNAME=admin
 ADMIN_PASSWORD=uzun-ve-benzersiz-bir-parola
 ADMIN_SESSION_HOURS=12
 ```
+
+Bootstrap/güvenlik environment değişkenleri yalnızca process seviyesindedir ve
+`system.db` içine kaydedilmez:
+
+```dotenv
+SETUP_TOKEN=uzun-rastgele-setup-token
+SYSTEM_ENCRYPTION_KEY=uzun-rastgele-master-key
+# Alternatif: SYSTEM_ENCRYPTION_KEY_FILE=/run/credentials/g-hotspot/system-key
+```
+
+`ADMIN_PASSWORD` installer/eski kurulum girdisi olarak kabul edilir ve DB'ye
+yazılmadan önce `ADMIN_PASSWORD_HASH` değerine dönüştürülür.
 
 Gateway:
 
@@ -820,6 +847,7 @@ WorkingDirectory=/home/USER/g-hotspot
 ExecStart=/usr/bin/node src/server.js
 Restart=on-failure
 RestartSec=3
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -844,9 +872,12 @@ Sistem servisi olarak çalıştıracaksanız kullanıcı, dizin izinleri ve `Rea
 
 ## Güvenlik ve gizlilik
 
-- `data/system.db` veya eski `.env` dosyalarını repoya koymayın.
+- `data/system.db`, `data/.system-key` veya eski `.env` dosyalarını repoya koymayın. Kök `.gitignore` bunları varsayılan olarak dışlar.
+- Admin parolaları scrypt hash olarak saklanır; uzun ve benzersiz parola kullanın.
+- `system.db` içindeki secret ayarlar AES-256-GCM ile korunur. Üretimde tercihen dışarıdan `SYSTEM_ENCRYPTION_KEY` verin ve anahtarı ayrı yedekleyin.
+- Encryption key kaybolursa şifreli ayarlar kurtarılamaz; key'i DB yedeğinin yanında saklamak ayrıştırma faydasının büyük bölümünü ortadan kaldırır.
+- Uzak kurulum API'leri localhost veya setup token ister. Yönetilen kurulumlarda `SETUP_TOKEN` belirleyin; token'ı query string veya access loglarına koymayın.
 - `APP_SECRET` en az 32 karakter, rastgele ve benzersiz olmalıdır.
-- Admin parolası uzun ve benzersiz olmalıdır.
 - OPNsense API kullanıcısına tam admin yetkisi vermeyin.
 - Üretimde HTTPS kullanın.
 - `TRUST_PROXY=true` sadece güvenilir reverse proxy arkasında kullanılmalıdır.

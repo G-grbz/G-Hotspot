@@ -3,7 +3,7 @@ import path from 'node:path';
 import { readEnvFile, updateEnvFile } from './lib/env.js';
 import { availableLanguageCodes } from './lib/languages.js';
 import { automaticListenHost, automaticListenPort, automaticPublicBaseUrl } from './lib/network.js';
-import { generateSecret } from './lib/security.js';
+import { generateSecret, hashPassword } from './lib/security.js';
 import {
   DEFAULT_ADMIN_APPROVAL_NOTIFICATION_EMAIL_MARKDOWN,
   DEFAULT_ADMIN_APPROVAL_NOTIFICATION_SMS_TEMPLATE,
@@ -1405,6 +1405,7 @@ const installSettingKeys = new Set([
   'DEFAULT_LANGUAGE',
   'ADMIN_USERNAME',
   'ADMIN_PASSWORD',
+  'ADMIN_PASSWORD_HASH',
   'ADMIN_SESSION_HOURS',
   'GATEWAY_MODE',
   'OPNSENSE_BASE_URL',
@@ -1558,13 +1559,31 @@ function changedRestartKeys(changes) {
   return Object.keys(changes).filter(key => restartKeys.has(key));
 }
 
+function validatedAdminPassword(value) {
+  const password = String(value ?? '');
+  if (password.length < 12) throw new Error('Admin password must contain at least 12 characters');
+  if (password.length > 1024) throw new Error('Admin password is too long');
+  return password;
+}
+
+function systemStorageChanges(changes) {
+  const storage = { ...changes };
+  if (Object.hasOwn(storage, 'ADMIN_PASSWORD')) {
+    storage.ADMIN_PASSWORD_HASH = hashPassword(validatedAdminPassword(storage.ADMIN_PASSWORD));
+    delete storage.ADMIN_PASSWORD;
+  }
+  return storage;
+}
+
 function saveSystemChanges(changes, { restartAware = false } = {}) {
   const keys = Object.keys(changes);
+  const storageChanges = systemStorageChanges(changes);
   const restartChanged = restartAware ? changedRestartKeys(changes) : [];
   const previousSettings = readSystemSettings();
-  const previousProcessValues = processSnapshot(keys);
+  const processKeys = [...new Set([...keys, ...Object.keys(storageChanges), 'ADMIN_PASSWORD'])];
+  const previousProcessValues = processSnapshot(processKeys);
   try {
-    writeSystemSettings(changes);
+    writeSystemSettings(storageChanges);
     loadSystemSettingsIntoEnv({ importEnv: false });
     reloadConfig();
     if (restartChanged.length) {
@@ -1621,7 +1640,10 @@ export function getSettings(envPath = null) {
     const legacyKey = legacySettingKeys.get(key);
     if (secretKeys.has(key)) {
       publicValues[key] = '';
-      configured[key] = Boolean(
+      const passwordHashConfigured = key === 'ADMIN_PASSWORD' && Boolean(
+        values.ADMIN_PASSWORD_HASH || (includeProcessEnv && process.env.ADMIN_PASSWORD_HASH)
+      );
+      configured[key] = passwordHashConfigured || Boolean(
         values[key] ||
         (legacyKey ? values[legacyKey] : '') ||
         (includeProcessEnv && process.env[key]) ||
@@ -1804,13 +1826,14 @@ export function completeInstallation(input = {}) {
   const appSecret = requiredInstallText(source.APP_SECRET, 'Application secret');
   if (appSecret.length < 32) throw new Error('Application secret must contain at least 32 characters');
 
+  const adminPassword = validatedAdminPassword(requiredInstallText(source.ADMIN_PASSWORD, 'Admin password'));
   const changes = {
     APP_NAME: String(source.APP_NAME || 'G-Hotspot').trim() || 'G-Hotspot',
     DATABASE_PATH: String(source.DATABASE_PATH || './data/hotspot.db').trim() || './data/hotspot.db',
     APP_SECRET: appSecret,
     DEFAULT_LANGUAGE: normalizedInstallLanguage(source.DEFAULT_LANGUAGE),
     ADMIN_USERNAME: requiredInstallText(source.ADMIN_USERNAME || 'admin', 'Admin username'),
-    ADMIN_PASSWORD: requiredInstallText(source.ADMIN_PASSWORD, 'Admin password'),
+    ADMIN_PASSWORD_HASH: hashPassword(adminPassword),
     ADMIN_SESSION_HOURS: installInteger(source.ADMIN_SESSION_HOURS, 12, {
       min: 1,
       max: 168,

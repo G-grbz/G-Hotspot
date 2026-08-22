@@ -466,9 +466,10 @@ function buildConfig() {
       timeoutSeconds: envInteger('NVI_TIMEOUT_SECONDS', 30, { min: 3, max: 60 })
     },
     admin: {
-      enabled: installed && Boolean(process.env.ADMIN_PASSWORD),
+      enabled: installed && Boolean(process.env.ADMIN_PASSWORD_HASH || process.env.ADMIN_PASSWORD),
       username: process.env.ADMIN_USERNAME || 'admin',
-      password: process.env.ADMIN_PASSWORD || '',
+      passwordHash: process.env.ADMIN_PASSWORD_HASH || '',
+      legacyPassword: process.env.ADMIN_PASSWORD || '',
       sessionHours: envInteger('ADMIN_SESSION_HOURS', 12, { min: 1, max: 168 })
     },
     gateway: {

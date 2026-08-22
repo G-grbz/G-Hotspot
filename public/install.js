@@ -48,7 +48,8 @@ const state = {
   gatewayNetworks: null,
   opnsenseTestOk: false,
   opnsenseTestedSignature: '',
-  submitting: false
+  submitting: false,
+  setupToken: ''
 };
 
 async function api(path, options = {}) {
@@ -56,6 +57,7 @@ async function api(path, options = {}) {
     cache: 'no-store',
     headers: {
       'content-type': 'application/json',
+      ...(state.setupToken ? { 'x-setup-token': state.setupToken } : {}),
       ...(options.headers || {})
     },
     ...options
@@ -732,6 +734,19 @@ async function preloadInstallFont() {
 }
 
 async function init() {
+  const currentUrl = new URL(window.location.href);
+  const hashParams = new URLSearchParams(currentUrl.hash.replace(/^#/, ''));
+  const fragmentSetupToken = hashParams.get('setup_token') || '';
+  const querySetupToken = currentUrl.searchParams.get('setup_token') || '';
+  const suppliedSetupToken = fragmentSetupToken || querySetupToken;
+  state.setupToken = suppliedSetupToken || sessionStorage.getItem('gh_setup_token') || '';
+  if (suppliedSetupToken) {
+    sessionStorage.setItem('gh_setup_token', suppliedSetupToken);
+    currentUrl.searchParams.delete('setup_token');
+    currentUrl.hash = '';
+    history.replaceState(null, '', `${currentUrl.pathname}${currentUrl.search}`);
+  }
+
   await i18n.ready;
   await preloadInstallFont();
   await i18n.setAutomaticLanguage('en', 'gh_install_language');

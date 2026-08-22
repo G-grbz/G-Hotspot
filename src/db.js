@@ -20,6 +20,14 @@ const SYSLOG_TABLES = [
   'law5651_backups',
   'law5651_state'
 ];
+function chmodDatabasePrivate(filePath) {
+  for (const target of [filePath, `${filePath}-wal`, `${filePath}-shm`]) {
+    try {
+      if (fs.existsSync(target)) fs.chmodSync(target, 0o600);
+    } catch {}
+  }
+}
+
 
 function sqlString(value) {
   return `'${String(value).replace(/'/gu, "''")}'`;
@@ -240,9 +248,11 @@ export class HotspotDatabase {
     this.syslogFilePath = path.join(path.dirname(filePath), SYSLOG_DATABASE_NAME);
     this.db = new DatabaseSync(filePath, { timeout: 5000 });
     this.syslogDb = new DatabaseSync(this.syslogFilePath, { timeout: 5000 });
-    this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
-    this.syslogDb.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
+    this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON;');
+    this.syslogDb.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON;');
     this.migrate();
+    chmodDatabasePrivate(this.filePath);
+    chmodDatabasePrivate(this.syslogFilePath);
   }
 
   migrate() {
@@ -621,6 +631,9 @@ export class HotspotDatabase {
     if (!challengeColumns.has('device_os')) {
       this.db.exec("ALTER TABLE challenges ADD COLUMN device_os TEXT");
     }
+    if (!challengeColumns.has('verified_at')) {
+      this.db.exec("ALTER TABLE challenges ADD COLUMN verified_at INTEGER");
+    }
     const adminApprovalColumns = new Set(
       this.db.prepare('PRAGMA table_info(admin_approval_requests)').all().map(row => row.name)
     );
@@ -660,14 +673,18 @@ export class HotspotDatabase {
     this.db.exec(`
       UPDATE challenges AS challenge
       SET client_mac = (
-        SELECT authorization.client_mac
-        FROM authorizations AS authorization
-        WHERE authorization.method = challenge.kind
-          AND authorization.identity = challenge.target
-          AND authorization.client_ip = challenge.client_ip
-          AND authorization.client_mac IS NOT NULL
-          AND authorization.client_mac != ''
-        ORDER BY ABS(authorization.created_at - COALESCE(challenge.verified_at, challenge.created_at))
+        SELECT candidate.client_mac
+        FROM (
+          SELECT authorization.client_mac AS client_mac,
+            ABS(authorization.created_at - COALESCE(challenge.verified_at, challenge.created_at)) AS distance
+          FROM authorizations AS authorization
+          WHERE authorization.method = challenge.kind
+            AND authorization.identity = challenge.target
+            AND authorization.client_ip = challenge.client_ip
+            AND authorization.client_mac IS NOT NULL
+            AND authorization.client_mac != ''
+        ) AS candidate
+        ORDER BY candidate.distance
         LIMIT 1
       )
       WHERE (challenge.client_mac IS NULL OR challenge.client_mac = '')
@@ -1155,6 +1172,8 @@ export class HotspotDatabase {
   close() {
     this.syslogDb.close();
     this.db.close();
+    chmodDatabasePrivate(this.filePath);
+    chmodDatabasePrivate(this.syslogFilePath);
   }
 
   databaseMaintenanceStatsFor(database, filePath) {

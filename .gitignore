@@ -1,0 +1,21 @@
+# Dependencies and logs
+node_modules/
+npm-debug.log*
+
+# Runtime databases and encryption material
+data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+.system-key
+
+# Environment / local secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor files
+.DS_Store
+*.swp
+*.swo

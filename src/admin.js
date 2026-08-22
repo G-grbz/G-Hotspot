@@ -1,4 +1,4 @@
-import { generateSecret, generateVoucherCode, keyedHash, normalizeIp, normalizeVoucher, safeEqualHex } from './lib/security.js';
+import { generateSecret, generateVoucherCode, keyedHash, normalizeIp, normalizeVoucher, safeEqualHex, verifyPasswordAsync } from './lib/security.js';
 import { HttpError, getClientIp, readBody, readJson, sendJson } from './lib/http.js';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -1773,7 +1773,7 @@ export function createAdminController({
     }
 
     if (request.method === 'POST' && path === '/api/admin/login') {
-      if (!config.admin.enabled) throw new HttpError(503, 'Set ADMIN_PASSWORD to enable the admin panel', 'admin_disabled');
+      if (!config.admin.enabled) throw new HttpError(503, 'Configure an admin password to enable the admin panel', 'admin_disabled');
       const clientIp = getClientIp(request, config.trustProxy);
       if (db.countEvents('admin_login', clientIp, '', Date.now() - 15 * 60 * 1000) >= 10) {
         throw new HttpError(429, 'Too many login attempts. Try again later.', 'rate_limited');
@@ -1781,9 +1781,14 @@ export function createAdminController({
       db.recordEvent('admin_login', clientIp, '');
       const { value } = await readJson(request);
       const suppliedUser = String(value.username || '');
-      const suppliedHash = keyedHash(config.appSecret, String(value.password || ''));
-      const expectedHash = keyedHash(config.appSecret, config.admin.password);
-      if (suppliedUser !== config.admin.username || !safeEqualHex(suppliedHash, expectedHash)) {
+      const suppliedPassword = String(value.password || '');
+      const passwordValid = config.admin.passwordHash
+        ? await verifyPasswordAsync(suppliedPassword, config.admin.passwordHash)
+        : safeEqualHex(
+            keyedHash(config.appSecret, suppliedPassword),
+            keyedHash(config.appSecret, config.admin.legacyPassword || '')
+          );
+      if (suppliedUser !== config.admin.username || !passwordValid) {
         notifyAdminLoginFailed(request, suppliedUser, 'invalid_credentials', value.notificationPublicIp);
         throw new HttpError(401, 'Invalid username or password', 'invalid_credentials');
       }
@@ -2078,6 +2083,11 @@ export function createAdminController({
           bandwidthWarning = error.message;
           bandwidthWarningCode = error.code || '';
         }
+      }
+      if (result.saved.includes('ADMIN_PASSWORD')) {
+        const currentToken = cookieValue(request, COOKIE_NAME);
+        sessions.clear();
+        if (currentToken) sessions.set(keyedHash(config.appSecret, currentToken), session);
       }
       audit(request, session, 'settings_updated', 'settings', '', {
         keys: result.saved,

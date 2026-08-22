@@ -125,9 +125,24 @@ curl http://127.0.0.1:8080/health
 
 `npm start` creates `data/system.db` on first run and serves `/install` until
 the administrator account, application secret and gateway mode are configured.
+Direct loopback setup (`127.0.0.1`/`localhost`) does not require a token. Remote
+setup APIs require `X-Setup-Token`; when `SETUP_TOKEN` is not configured, a
+one-process setup token and a `#setup_token=...` URL are printed at startup. The
+URL fragment is consumed by the installer and is not sent in the HTTP request URL.
+
+Admin passwords are persisted only as scrypt hashes. Secret settings are stored
+with AES-256-GCM authenticated encryption. The default master key is generated at
+`data/.system-key` with mode `0600`. For stronger production separation, provide
+a random `SYSTEM_ENCRYPTION_KEY` through the service environment or point
+`SYSTEM_ENCRYPTION_KEY_FILE` to a protected key file outside the data directory.
+Back up that key separately: encrypted settings cannot be recovered without it.
+
 If `.env` already exists, it is not overwritten and its values are imported into
-`system.db` for backward compatibility. After import, runtime configuration is
-read from `system.db`; `.env` is not loaded as a live settings source.
+`system.db` for backward compatibility. Legacy plaintext admin passwords and
+secret rows are migrated automatically. After import, runtime configuration is
+read from `system.db`; `.env` is not loaded as a live settings source. Delete or
+strictly protect the legacy `.env` after validating the migration because the file
+itself can still contain plaintext secrets.
 
 ## Base configuration
 
@@ -158,6 +173,18 @@ ADMIN_USERNAME=admin
 ADMIN_PASSWORD=long-unique-password
 ADMIN_SESSION_HOURS=12
 ```
+
+Bootstrap/security environment variables are process-only and are not persisted
+into `system.db`:
+
+```dotenv
+SETUP_TOKEN=replace-with-a-long-random-setup-token
+SYSTEM_ENCRYPTION_KEY=replace-with-a-long-random-master-key
+# Or use SYSTEM_ENCRYPTION_KEY_FILE=/run/credentials/g-hotspot/system-key
+```
+
+`ADMIN_PASSWORD` is accepted as installer/legacy input and is converted to
+`ADMIN_PASSWORD_HASH` before it is stored.
 
 Gateway:
 
@@ -819,6 +846,7 @@ WorkingDirectory=/home/USER/g-hotspot
 ExecStart=/usr/bin/node src/server.js
 Restart=on-failure
 RestartSec=3
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -843,9 +871,12 @@ If you run it as a system service, adjust the user, directory permissions and `R
 
 ## Security and privacy
 
-- Do not commit `data/system.db` or legacy `.env` files.
+- Do not commit `data/system.db`, `data/.system-key` or legacy `.env` files. The repository root `.gitignore` excludes them by default.
+- Admin passwords are stored as scrypt hashes; use a long, unique password.
+- Secret settings in `system.db` use AES-256-GCM. Prefer an externally supplied `SYSTEM_ENCRYPTION_KEY` in production and back it up separately.
+- Losing the encryption key makes encrypted settings unrecoverable; storing the key beside a database backup removes most of the separation benefit.
+- Remote installation APIs require localhost access or a setup token. Configure `SETUP_TOKEN` for managed deployments and do not place it in query strings or access logs.
 - `APP_SECRET` must be at least 32 random, unique characters.
-- Use a long, unique admin password.
 - Do not give the OPNsense API user full admin privileges.
 - Use HTTPS in production.
 - Use `TRUST_PROXY=true` only behind a trusted reverse proxy.

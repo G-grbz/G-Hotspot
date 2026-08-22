@@ -9,6 +9,7 @@ WorkingDirectory=/home/USER/g-hotspot
 ExecStart=/usr/bin/node src/server.js
 Restart=on-failure
 RestartSec=3
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
