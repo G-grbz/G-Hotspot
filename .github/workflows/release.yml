@@ -212,7 +212,7 @@ jobs:
           )
 
       - name: Attest release provenance
-        uses: actions/attest@v4.2.1
+        uses: actions/attest@v4.2.2
         with:
           subject-path: |
             dist/${{ env.ARCHIVE }}
@@ -223,7 +223,7 @@ jobs:
           create-storage-record: false
 
       - name: Attest source SBOM
-        uses: actions/attest@v4.2.1
+        uses: actions/attest@v4.2.2
         with:
           subject-path: dist/${{ env.ARCHIVE }}
           sbom-path: dist/${{ env.SBOM }}
