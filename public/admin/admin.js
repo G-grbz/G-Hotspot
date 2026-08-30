@@ -46,7 +46,7 @@ const t = (text, variables) => i18n.t(text, variables);
 const DEFAULT_TERMS_TEXT = 'By continuing, you accept the terms of use for this guest network.';
 const DEFAULT_NETWORK_LABEL_TEXT = 'GUEST NETWORK';
 const DEFAULT_VERIFICATION_PROMPT_TEXT = 'Choose a verification method to open internet access.';
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const ADMIN_PUBLIC_IP_LOOKUP_URL = 'https://api.ipify.org?format=json';
 const SESSION_COLUMNS_STORAGE_KEY = 'gh_admin_session_columns';
 const SIDEBAR_MINI_STORAGE_KEY = 'gh_admin_sidebar_mini';
@@ -3848,7 +3848,8 @@ function renderSyslogStatus(data) {
     [t('Last timestamp token'), lastExport?.timestampTokenPath ? lastExport.timestampTokenPath.split(/[\\/]/u).pop() : '—'],
     [t('Timestamp error'), lastExport?.timestampError || '—'],
     [t('Traffic'), `↓ ${formatBytes(summary.downloadBytes)} · ↑ ${formatBytes(summary.uploadBytes)}`],
-    [t('Retention'), `${data.retentionDays} ${t('days')}`],
+    [t('Database retention'), `${data.databaseRetentionDays ?? data.retentionDays} ${t('days')}`],
+    [t('Physical log file retention'), `${data.exportRetentionDays ?? data.retentionDays} ${t('days')}`],
     [t('Storage usage'), storage.available
       ? `${storage.usagePercent}% (${t('warn at {percent}%', { percent: storage.alertPercent || data.storageAlertPercent || 85 })})`
       : (storage.error || '—')],

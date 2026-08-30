@@ -48,7 +48,8 @@ const legacySettingKeys = new Map([
   ['SYSLOG_ENABLED', 'LOG5651_ENABLED'],
   ['SYSLOG_NETWORKS', 'LOG5651_NETWORKS'],
   ['SYSLOG_TIME_ZONE', 'LOG5651_TIME_ZONE'],
-  ['SYSLOG_RETENTION_DAYS', 'LOG5651_RETENTION_DAYS'],
+  ['SYSLOG_DATABASE_RETENTION_DAYS', 'SYSLOG_RETENTION_DAYS'],
+  ['SYSLOG_EXPORT_RETENTION_DAYS', 'SYSLOG_RETENTION_DAYS'],
   ['SYSLOG_EXPORT_DIR', 'LOG5651_EXPORT_DIR'],
   ['SYSLOG_EXPORT_ZIP_ENABLED', 'LOG5651_EXPORT_ZIP_ENABLED'],
   ['SYSLOG_EXPORT_DELETE_SOURCE_AFTER_ZIP', 'LOG5651_EXPORT_DELETE_SOURCE_AFTER_ZIP'],
@@ -445,12 +446,20 @@ export const settingsSchema = [
         defaultValue: systemTimeZone(),
         warning: 'Daily log file names and displayed export times use this time zone; hash-chain storage remains timezone-independent.'
       }),
-      field('SYSLOG_RETENTION_DAYS', 'Retention period (days)', {
+      field('SYSLOG_DATABASE_RETENTION_DAYS', 'Database retention period (days)', {
         type: 'number',
         min: 1,
         max: 1000,
         defaultValue: '730',
-        warning: 'Syslog traffic retention must stay within the applicable legal retention window. Records older than the entered day count are automatically deleted from the database and the configured syslog export directory on disk.'
+        section: 'Retention',
+        warning: 'Archived syslog records older than this value are deleted from syslog.db only after a verified automatic export exists.'
+      }),
+      field('SYSLOG_EXPORT_RETENTION_DAYS', 'Physical log file retention period (days)', {
+        type: 'number',
+        min: 1,
+        max: 1000,
+        defaultValue: '730',
+        warning: 'Expired .log, .zip and timestamp sidecar files are deleted from the configured syslog export directory independently of syslog.db retention.'
       }),
       field('SYSLOG_EXPORT_DIR', 'Log directory', {
         defaultValue: './data/syslog',
@@ -1510,6 +1519,14 @@ function runtimeSettingValue(key, values, includeProcessEnv) {
       host: values.HOST ?? (includeProcessEnv ? process.env.HOST : undefined),
       port: values.PORT ?? (includeProcessEnv ? process.env.PORT : undefined)
     });
+  }
+  if (key === 'SYSLOG_DATABASE_RETENTION_DAYS' || key === 'SYSLOG_EXPORT_RETENTION_DAYS') {
+    return source ??
+      values.SYSLOG_RETENTION_DAYS ??
+      values.LOG5651_RETENTION_DAYS ??
+      (includeProcessEnv ? process.env.SYSLOG_RETENTION_DAYS : undefined) ??
+      (includeProcessEnv ? process.env.LOG5651_RETENTION_DAYS : undefined) ??
+      null;
   }
   if (key === 'SYSLOG_TIMESTAMP_MODE') {
     const configured = String(source || '').trim().toLowerCase();

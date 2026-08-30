@@ -22,6 +22,8 @@ import { createZipArchive } from './opnsenseTemplate.js';
 const execFileAsync = promisify(execFile);
 const AUTO_EXPORT_CHECK_MS = 60 * 1000;
 const AUTO_EXPORT_GRACE_MS = 5 * 1000;
+const AUTO_RETENTION_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const AUTO_RETENTION_CLEANUP_STATE = 'auto_retention_cleanup_at';
 const MAX_AUTO_EXPORT_CATCHUP_WINDOWS = 100;
 const TRAFFIC_LOG_FILE_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 const AUTO_EXPORT_REASONS = ['auto', 'kamusm', 'timestamp'];
@@ -76,6 +78,14 @@ function exportZipPath(logPath) {
 
 function retentionDaysValue(value) {
   return Math.max(1, Math.min(1000, Math.trunc(Number(value) || 730)));
+}
+
+function databaseRetentionDays(lawConfig = {}) {
+  return retentionDaysValue(lawConfig.databaseRetentionDays ?? lawConfig.retentionDays);
+}
+
+function exportFileRetentionDays(lawConfig = {}) {
+  return retentionDaysValue(lawConfig.exportRetentionDays ?? lawConfig.retentionDays);
 }
 
 function exportRetentionCutoff(retentionDays, now = Date.now()) {
@@ -920,7 +930,7 @@ function cleanupExpiredLaw5651DatabaseRecords({ db, config, logger = console, no
   const lawConfig = config.law5651 || config.syslog || {};
   if (typeof db.cleanupLaw5651Logs !== 'function') return 0;
   try {
-    return db.cleanupLaw5651Logs(retentionDaysValue(lawConfig.retentionDays), now, {
+    return db.cleanupLaw5651Logs(databaseRetentionDays(lawConfig), now, {
       reasons: AUTO_EXPORT_REASONS,
       requireTimestamp: timestampEnabled(lawConfig),
       requireBackup: Boolean(lawConfig.backupEnabled && lawConfig.backupWormRequired)
@@ -969,7 +979,7 @@ function cleanupExpiredLaw5651ExportDirectoryFiles({ lawConfig, cutoff, totals, 
 export function cleanupExpiredLaw5651ExportFiles({ db, config, logger = console, now = Date.now() } = {}) {
   const lawConfig = config.law5651 || config.syslog || {};
   const exportDirectory = lawConfig.exportDirectory;
-  const retentionDays = retentionDaysValue(lawConfig.retentionDays);
+  const retentionDays = exportFileRetentionDays(lawConfig);
   const cutoff = exportRetentionCutoff(retentionDays, now);
   const totals = {
     retentionDays,
@@ -2076,6 +2086,10 @@ function firstDailyExportStart(db, closedEnd, timeZone) {
 
 export function createLaw5651AutoExporter({ db, config, logger = console, notificationSender = null }) {
   let timer = null;
+  const persistedRetentionCleanupAt = Math.max(
+    0,
+    Math.trunc(Number(law5651StateValue(db, AUTO_RETENTION_CLEANUP_STATE)) || 0)
+  );
   const state = {
     enabled: false,
     running: false,
@@ -2092,7 +2106,7 @@ export function createLaw5651AutoExporter({ db, config, logger = console, notifi
     lastError: '',
     waitingForGateway: false,
     exportedWindows: 0,
-    lastRetentionCleanupAt: null,
+    lastRetentionCleanupAt: persistedRetentionCleanupAt || null,
     lastRetentionDeleted: 0,
     totalRetentionDeleted: 0,
     lastRetentionDeletedFiles: 0,
@@ -2213,27 +2227,35 @@ export function createLaw5651AutoExporter({ db, config, logger = console, notifi
         ? 'Syslog automatic export catch-up limit reached; remaining windows will continue on the next check.'
         : '';
       if (state.lastError) logger.warn?.(state.lastError);
-      const deletedExpired = cleanupExpiredLaw5651DatabaseRecords({ db, config, logger, now: current });
-      const deletedFiles = cleanupExpiredLaw5651ExportFiles({ db, config, logger, now: current });
-      state.lastRetentionCleanupAt = current;
-      state.lastRetentionDeleted = deletedExpired;
-      state.totalRetentionDeleted += deletedExpired;
-      state.lastRetentionDeletedFiles = deletedFiles.deletedFiles;
-      state.totalRetentionDeletedFiles += deletedFiles.deletedFiles;
-      state.lastRetentionDeletedBytes = deletedFiles.deletedBytes;
-      state.totalRetentionDeletedBytes += deletedFiles.deletedBytes;
-      if (deletedExpired > 0 || deletedFiles.deletedFiles > 0) {
-        safeRecordEvent(db, {
-          eventType: 'syslog_retention_cleanup',
-          severity: 'info',
-          message: `Syslog retention cleanup removed ${deletedExpired} archived records from the database and ${deletedFiles.deletedFiles} expired export files.`,
-          detail: {
-            deletedExpired,
-            deletedFiles: deletedFiles.deletedFiles,
-            deletedBytes: deletedFiles.deletedBytes,
-            retentionDays: retentionDaysValue(lawConfig.retentionDays)
-          }
-        }, logger);
+      const previousRetentionCleanupAt = Number(state.lastRetentionCleanupAt || 0);
+      const retentionCleanupDue = !previousRetentionCleanupAt ||
+        current < previousRetentionCleanupAt ||
+        current - previousRetentionCleanupAt >= AUTO_RETENTION_CLEANUP_INTERVAL_MS;
+      if (retentionCleanupDue) {
+        const deletedExpired = cleanupExpiredLaw5651DatabaseRecords({ db, config, logger, now: current });
+        const deletedFiles = cleanupExpiredLaw5651ExportFiles({ db, config, logger, now: current });
+        state.lastRetentionCleanupAt = current;
+        state.lastRetentionDeleted = deletedExpired;
+        state.totalRetentionDeleted += deletedExpired;
+        state.lastRetentionDeletedFiles = deletedFiles.deletedFiles;
+        state.totalRetentionDeletedFiles += deletedFiles.deletedFiles;
+        state.lastRetentionDeletedBytes = deletedFiles.deletedBytes;
+        state.totalRetentionDeletedBytes += deletedFiles.deletedBytes;
+        setLaw5651StateValue(db, AUTO_RETENTION_CLEANUP_STATE, String(current), current);
+        if (deletedExpired > 0 || deletedFiles.deletedFiles > 0) {
+          safeRecordEvent(db, {
+            eventType: 'syslog_retention_cleanup',
+            severity: 'info',
+            message: `Syslog retention cleanup removed ${deletedExpired} archived records from the database and ${deletedFiles.deletedFiles} expired export files.`,
+            detail: {
+              deletedExpired,
+              deletedFiles: deletedFiles.deletedFiles,
+              deletedBytes: deletedFiles.deletedBytes,
+              databaseRetentionDays: databaseRetentionDays(lawConfig),
+              exportRetentionDays: exportFileRetentionDays(lawConfig)
+            }
+          }, logger);
+        }
       }
       refreshState(current);
       return exports;
@@ -2783,7 +2805,11 @@ export function createLaw5651SyslogServer({
             : { ...config, databasePath: db.filePath };
           db.appendTrafficLogs(enriched);
           appendTrafficLogFileRecords(trafficFileConfig, enriched);
-          db.cleanupTrafficLogs?.(settings.retentionMinutes);
+          if (typeof db.cleanupTrafficLogsIfDue === 'function') {
+            db.cleanupTrafficLogsIfDue(settings.retentionMinutes, receivedAt);
+          } else {
+            db.cleanupTrafficLogs?.(settings.retentionMinutes, receivedAt);
+          }
           if (receivedAt - trafficLogFileCleanupAt >= TRAFFIC_LOG_FILE_CLEANUP_INTERVAL_MS) {
             trafficLogFileCleanupAt = receivedAt;
             cleanupTrafficLogFile(trafficFileConfig, settings.retentionMinutes, receivedAt);

@@ -1305,7 +1305,9 @@ export function createAdminController({
         enabled: true,
         eligible: trafficRecords.length,
         ...databaseResult,
-        deletedExpired: db.cleanupTrafficLogs(trafficSettings.retentionMinutes),
+        deletedExpired: db.cleanupTrafficLogsIfDue
+          ? db.cleanupTrafficLogsIfDue(trafficSettings.retentionMinutes)
+          : db.cleanupTrafficLogs(trafficSettings.retentionMinutes),
         file: {
           inserted: fileResult.inserted,
           skipped: fileResult.skipped,
@@ -2435,7 +2437,9 @@ export function createAdminController({
         enabled: config.syslog.enabled,
         networks: config.syslog.networks,
         timeZone: config.syslog.timeZone,
-        retentionDays: config.syslog.retentionDays,
+        databaseRetentionDays: config.syslog.databaseRetentionDays ?? config.syslog.retentionDays,
+        exportRetentionDays: config.syslog.exportRetentionDays ?? config.syslog.retentionDays,
+        retentionDays: config.syslog.databaseRetentionDays ?? config.syslog.retentionDays,
         exportDirectory: config.syslog.exportDirectory,
         exportZipEnabled: Boolean(config.syslog.exportZipEnabled),
         exportDeleteSourceAfterZip: Boolean(config.syslog.exportDeleteSourceAfterZip),

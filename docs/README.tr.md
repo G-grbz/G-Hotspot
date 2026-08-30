@@ -26,7 +26,7 @@ Bu doküman GitHub için teknik kurulum, üretim notları, OPNsense API yetkiler
 
 Bu repodaki mevcut durum için net sınırlar:
 
-- Uygulama sürümü: `1.2.0`
+- Uygulama sürümü: `1.3.0`
 - Node.js gereksinimi: `>=24.0.0`
 - Veritabanı: Node.js yerleşik `node:sqlite`
 - Varsayılan gateway modu: `mock`
@@ -659,7 +659,8 @@ Temel ayarlar:
 SYSLOG_ENABLED=true
 SYSLOG_NETWORKS=172.16.2.0/24,172.16.3.0/24
 SYSLOG_TIME_ZONE=Europe/Istanbul
-SYSLOG_RETENTION_DAYS=730
+SYSLOG_DATABASE_RETENTION_DAYS=730
+SYSLOG_EXPORT_RETENTION_DAYS=730
 SYSLOG_EXPORT_DIR=./data/syslog
 SYSLOG_RECEIVER_ENABLED=true
 SYSLOG_RECEIVER_HOST=0.0.0.0
@@ -705,7 +706,7 @@ SYSLOG_STORAGE_BLOCK_PERCENT=99
 - Block eşiği aşılırsa yeni portal oturumları reddedilir.
 - Mevcut oturumlar doğrudan kesilmez.
 
-`SYSLOG_RETENTION_DAYS` politika bilgisidir. Eski kayıtların otomatik silinmesine güvenmeyin; arşiv/temizlik sürecinizi ayrıca planlayın.
+`SYSLOG_DATABASE_RETENTION_DAYS`, `syslog.db` içindeki arşivlenmiş kayıtların temizliğini yönetir. Bir veritabanı kaydı yalnızca eşleşen ve doğrulanmış otomatik dışa aktarma mevcutsa silinir. `SYSLOG_EXPORT_RETENTION_DAYS` ise `SYSLOG_EXPORT_DIR` altındaki `.log`, `.zip`, `.tsq` ve `.tsr` dosyalarının temizliğini bağımsız olarak yönetir. Yalnızca eski `SYSLOG_RETENTION_DAYS` ayarını içeren mevcut kurulumlar, iki yeni değer kaydedilene kadar bu değeri her iki saklama süresi için kullanmaya devam eder.
 
 ### Syslog zaman damgası
 

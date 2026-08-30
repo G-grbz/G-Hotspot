@@ -248,6 +248,7 @@ export class HotspotDatabase {
     this.syslogFilePath = path.join(path.dirname(filePath), SYSLOG_DATABASE_NAME);
     this.db = new DatabaseSync(filePath, { timeout: 5000 });
     this.syslogDb = new DatabaseSync(this.syslogFilePath, { timeout: 5000 });
+    this.lastTrafficLogCleanupAt = 0;
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON;');
     this.syslogDb.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON;');
     this.migrate();
@@ -760,6 +761,10 @@ export class HotspotDatabase {
         ON law5651_logs(created_at);
       CREATE INDEX IF NOT EXISTS law5651_logs_client_idx
         ON law5651_logs(client_ip, created_at);
+      CREATE INDEX IF NOT EXISTS law5651_logs_usage_started_idx
+        ON law5651_logs(client_ip, kind, started_at);
+      CREATE INDEX IF NOT EXISTS law5651_logs_usage_created_idx
+        ON law5651_logs(client_ip, kind, created_at);
 
       CREATE TABLE IF NOT EXISTS law5651_exports (
         id TEXT PRIMARY KEY,
@@ -864,6 +869,75 @@ export class HotspotDatabase {
         ON law5651_exports(export_reason, period_start_at, period_end_at);
     `);
     this.migrateLegacySyslogTables();
+    this.ensureLaw5651Summary();
+  }
+
+  ensureLaw5651Summary() {
+    this.syslogDb.exec(`
+      CREATE TABLE IF NOT EXISTS law5651_summary (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        record_count INTEGER NOT NULL DEFAULT 0,
+        first_created_at INTEGER,
+        last_created_at INTEGER,
+        download_bytes INTEGER NOT NULL DEFAULT 0,
+        upload_bytes INTEGER NOT NULL DEFAULT 0
+      ) STRICT;
+
+      CREATE TRIGGER IF NOT EXISTS law5651_logs_summary_insert
+      AFTER INSERT ON law5651_logs
+      BEGIN
+        UPDATE law5651_summary
+        SET record_count = record_count + 1,
+          first_created_at = CASE
+            WHEN first_created_at IS NULL OR NEW.created_at < first_created_at THEN NEW.created_at
+            ELSE first_created_at
+          END,
+          last_created_at = CASE
+            WHEN last_created_at IS NULL OR NEW.created_at > last_created_at THEN NEW.created_at
+            ELSE last_created_at
+          END,
+          download_bytes = download_bytes + NEW.download_bytes,
+          upload_bytes = upload_bytes + NEW.upload_bytes
+        WHERE id = 1;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS law5651_logs_summary_delete
+      AFTER DELETE ON law5651_logs
+      BEGIN
+        UPDATE law5651_summary
+        SET record_count = MAX(0, record_count - 1),
+          first_created_at = CASE
+            WHEN record_count <= 1 THEN NULL
+            WHEN OLD.created_at = first_created_at THEN (
+              SELECT created_at FROM law5651_logs ORDER BY created_at ASC LIMIT 1
+            )
+            ELSE first_created_at
+          END,
+          last_created_at = CASE
+            WHEN record_count <= 1 THEN NULL
+            WHEN OLD.created_at = last_created_at THEN (
+              SELECT created_at FROM law5651_logs ORDER BY created_at DESC LIMIT 1
+            )
+            ELSE last_created_at
+          END,
+          download_bytes = MAX(0, download_bytes - OLD.download_bytes),
+          upload_bytes = MAX(0, upload_bytes - OLD.upload_bytes)
+        WHERE id = 1;
+      END;
+    `);
+
+    const initialized = this.syslogDb.prepare(
+      'SELECT 1 FROM law5651_summary WHERE id=1'
+    ).get();
+    if (!initialized) {
+      this.syslogDb.exec(`
+        INSERT INTO law5651_summary
+          (id, record_count, first_created_at, last_created_at, download_bytes, upload_bytes)
+        SELECT 1, COUNT(*), MIN(created_at), MAX(created_at),
+          COALESCE(SUM(download_bytes), 0), COALESCE(SUM(upload_bytes), 0)
+        FROM law5651_logs;
+      `);
+    }
   }
 
   migrateLegacySyslogTables() {
@@ -3412,6 +3486,19 @@ export class HotspotDatabase {
     return this.cleanupTrafficLogsDetailed(retentionMinutes, now).deleted;
   }
 
+  cleanupTrafficLogsIfDue(retentionMinutes, now = Date.now(), intervalMs = 60 * 1000) {
+    const current = Math.trunc(Number(now) || Date.now());
+    const interval = Math.max(1000, Math.trunc(Number(intervalMs) || 60 * 1000));
+    if (this.lastTrafficLogCleanupAt &&
+        current >= this.lastTrafficLogCleanupAt &&
+        current - this.lastTrafficLogCleanupAt < interval) {
+      return 0;
+    }
+    const deleted = this.cleanupTrafficLogs(retentionMinutes, current);
+    this.lastTrafficLogCleanupAt = current;
+    return deleted;
+  }
+
   cleanupTrafficLogsDetailed(retentionMinutes, now = Date.now()) {
     const minutes = trafficLogRetentionMinutes(retentionMinutes);
     const cutoff = Math.trunc(Number(now) || Date.now()) - minutes * 60 * 1000;
@@ -3611,6 +3698,18 @@ export class HotspotDatabase {
     );
     const effectiveResetAt = Math.max(0, Number(resetAt || 0));
     const flowStartedAt = effectiveResetAt ? Math.max(startedAt, effectiveResetAt) : startedAt;
+    if (endedBefore <= flowStartedAt) {
+      return {
+        downloadBytes: 0,
+        uploadBytes: 0,
+        flowDownloadBytes: 0,
+        flowUploadBytes: 0,
+        sessionDownloadBytes: 0,
+        sessionUploadBytes: 0,
+        flowRecords: 0,
+        sessionRecords: 0
+      };
+    }
     const flowRow = this.syslogDb.prepare(`
       SELECT
         COALESCE(SUM(download_bytes), 0) download_bytes,
@@ -4194,10 +4293,10 @@ export class HotspotDatabase {
 
   law5651Summary() {
     const summary = this.syslogDb.prepare(`
-      SELECT COUNT(*) count, MIN(created_at) first_created_at, MAX(created_at) last_created_at,
-        COALESCE(SUM(download_bytes), 0) download_bytes,
-        COALESCE(SUM(upload_bytes), 0) upload_bytes
-      FROM law5651_logs
+      SELECT record_count count, first_created_at, last_created_at,
+        download_bytes, upload_bytes
+      FROM law5651_summary
+      WHERE id=1
     `).get();
     const last = this.syslogDb.prepare(`
       SELECT sequence, record_hash, created_at FROM law5651_logs ORDER BY sequence DESC LIMIT 1
@@ -4348,7 +4447,6 @@ export class HotspotDatabase {
     }
     if (requireTimestamp && row.timestamp_status !== 'created') return false;
     if (requireBackup && row.backup_status !== 'succeeded') return false;
-    if (!this.law5651ExportFileVerified(row)) return false;
     if (Number.isFinite(firstSequence) &&
         Number.isFinite(lastSequence) &&
         firstSequence > 0 &&
@@ -4360,7 +4458,9 @@ export class HotspotDatabase {
           AND created_at >= ?
           AND created_at <= ?
       `).get(firstSequence, lastSequence, firstCreatedAt, lastCreatedAt);
-      if (Number(current?.count || 0) > recordCount) return null;
+      const currentCount = Number(current?.count || 0);
+      if (!currentCount || currentCount > recordCount) return null;
+      if (!this.law5651ExportFileVerified(row)) return false;
       return { firstSequence, lastSequence, firstCreatedAt, lastCreatedAt };
     }
     const current = this.syslogDb.prepare(`
@@ -4379,6 +4479,7 @@ export class HotspotDatabase {
         derivedLastSequence < derivedFirstSequence) {
       return null;
     }
+    if (!this.law5651ExportFileVerified(row)) return false;
     return {
       firstSequence: derivedFirstSequence,
       lastSequence: derivedLastSequence,

@@ -26,7 +26,7 @@ This document covers installation, production setup, OPNsense API privileges, Ke
 
 Current repository state:
 
-- Application version: `1.2.0`
+- Application version: `1.3.0`
 - Required Node.js version: `>=24.0.0`
 - Database: built-in Node.js `node:sqlite`
 - Default gateway mode: `mock`
@@ -658,7 +658,8 @@ Base settings:
 SYSLOG_ENABLED=true
 SYSLOG_NETWORKS=172.16.2.0/24,172.16.3.0/24
 SYSLOG_TIME_ZONE=Europe/Istanbul
-SYSLOG_RETENTION_DAYS=730
+SYSLOG_DATABASE_RETENTION_DAYS=730
+SYSLOG_EXPORT_RETENTION_DAYS=730
 SYSLOG_EXPORT_DIR=./data/syslog
 SYSLOG_RECEIVER_ENABLED=true
 SYSLOG_RECEIVER_HOST=0.0.0.0
@@ -704,7 +705,7 @@ SYSLOG_STORAGE_BLOCK_PERCENT=99
 - At the block threshold, new portal sessions are rejected.
 - Existing sessions are not directly disconnected.
 
-`SYSLOG_RETENTION_DAYS` is policy metadata. Do not rely on automatic deletion; plan your archive and cleanup process separately.
+`SYSLOG_DATABASE_RETENTION_DAYS` controls archived-record cleanup in `syslog.db`. A database record is deleted only after a matching verified automatic export exists. `SYSLOG_EXPORT_RETENTION_DAYS` independently controls `.log`, `.zip`, `.tsq` and `.tsr` cleanup under `SYSLOG_EXPORT_DIR`. Existing installations that only define `SYSLOG_RETENTION_DAYS` continue to use that value for both settings until the two new values are saved.
 
 ### Syslog timestamping
 

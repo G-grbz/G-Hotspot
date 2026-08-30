@@ -96,8 +96,72 @@ test('syslog records are scoped by network and chained with hashes', () => {
     assert.equal(rows.length, 2);
     assert.equal(rows[0].previous_hash, '0'.repeat(64));
     assert.equal(rows[1].previous_hash, rows[0].record_hash);
+    assert.deepEqual(
+      {
+        count: db.syslogSummary().count,
+        firstCreatedAt: db.syslogSummary().firstCreatedAt,
+        lastCreatedAt: db.syslogSummary().lastCreatedAt,
+        downloadBytes: db.syslogSummary().downloadBytes,
+        uploadBytes: db.syslogSummary().uploadBytes
+      },
+      {
+        count: 2,
+        firstCreatedAt: rows[0].created_at,
+        lastCreatedAt: rows[1].created_at,
+        downloadBytes: 2200,
+        uploadBytes: 400
+      }
+    );
+    db.syslogDb.prepare('DELETE FROM law5651_logs WHERE sequence=?').run(rows[0].sequence);
+    const afterDelete = db.syslogSummary();
+    assert.equal(afterDelete.count, 1);
+    assert.equal(afterDelete.firstCreatedAt, rows[1].created_at);
+    assert.equal(afterDelete.lastCreatedAt, rows[1].created_at);
+    assert.equal(afterDelete.downloadBytes, 1200);
+    assert.equal(afterDelete.uploadBytes, 200);
   } finally {
     db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('syslog summary migration backfills existing records and resumes incremental updates', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-summary-migration-'));
+  const databasePath = path.join(directory, 'hotspot.db');
+  let db = new HotspotDatabase(databasePath);
+  try {
+    db.syslogDb.exec(`
+      DROP TRIGGER law5651_logs_summary_insert;
+      DROP TRIGGER law5651_logs_summary_delete;
+      DROP TABLE law5651_summary;
+    `);
+    const record = syslogRecordFromSession({
+      sessionId: 'summary-migration-1',
+      clientIp: '172.16.2.10',
+      downloadBytes: 400,
+      uploadBytes: 50,
+      lastSeenAt: Date.UTC(2026, 7, 30, 10, 0, 0)
+    }, null, { enabled: true, networks: 'any' });
+    db.appendSyslogLogs([record]);
+    db.close();
+
+    db = new HotspotDatabase(databasePath);
+    assert.equal(db.syslogSummary().count, 1);
+    assert.equal(db.syslogSummary().downloadBytes, 400);
+    assert.equal(db.syslogSummary().uploadBytes, 50);
+
+    db.appendSyslogLogs([syslogRecordFromSession({
+      sessionId: 'summary-migration-2',
+      clientIp: '172.16.2.11',
+      downloadBytes: 600,
+      uploadBytes: 75,
+      lastSeenAt: Date.UTC(2026, 7, 30, 10, 1, 0)
+    }, null, { enabled: true, networks: 'any' })]);
+    assert.equal(db.syslogSummary().count, 2);
+    assert.equal(db.syslogSummary().downloadBytes, 1000);
+    assert.equal(db.syslogSummary().uploadBytes, 125);
+  } finally {
+    try { db.close(); } catch {}
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -237,6 +301,36 @@ test('authorization syslog quota usage does not sum cumulative session snapshots
     });
     assert.equal(afterResetUsage.downloadBytes, 30 * mebibyte);
     assert.equal(afterResetUsage.uploadBytes, 5 * mebibyte);
+  } finally {
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('authorization syslog quota usage skips an empty authorization period', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-quota-empty-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  try {
+    db.syslogDb.exec('DROP TABLE law5651_logs');
+    assert.deepEqual(db.authorizationSyslogUsage({
+      method: 'sms',
+      identity: '905551112233',
+      client_ip: '172.16.2.42',
+      created_at: Date.UTC(2026, 7, 29, 10, 0, 0),
+      expires_at: Date.UTC(2026, 7, 29, 11, 0, 0)
+    }, {
+      periodStartAt: Date.UTC(2026, 7, 30, 0, 0, 0),
+      periodEndAt: Date.UTC(2026, 7, 31, 0, 0, 0)
+    }), {
+      downloadBytes: 0,
+      uploadBytes: 0,
+      flowDownloadBytes: 0,
+      flowUploadBytes: 0,
+      sessionDownloadBytes: 0,
+      sessionUploadBytes: 0,
+      flowRecords: 0,
+      sessionRecords: 0
+    });
   } finally {
     db.close();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -1377,6 +1471,7 @@ test('syslog retention cleanup deletes only archived old records', async () => {
     assert.equal(exported.firstSequence, 1);
     assert.equal(exported.lastSequence, 1);
     assert.equal(db.cleanupSyslogLogs(180, Date.UTC(2026, 0, 1, 0, 0, 0)), 1);
+    assert.equal(db.law5651ExportCleanupRange(db.latestLaw5651Export({ reason: 'auto' })), null);
     const remaining = db.listSyslogLogs({ order: 'asc' }).rows;
     assert.equal(remaining.length, 1);
     assert.equal(remaining[0].client_ip, '192.168.10.54');
@@ -1515,7 +1610,8 @@ test('syslog export retention removes expired ZIP artifacts from the configured 
         syslog: {
           exportDirectory,
           exportZipEnabled: true,
-          retentionDays: 730
+          databaseRetentionDays: 1000,
+          exportRetentionDays: 30
         }
       },
       now: Date.UTC(2026, 6, 13, 0, 0, 0),
@@ -1553,7 +1649,8 @@ test('syslog export retention removes expired log timestamp sidecars when ZIP is
         syslog: {
           exportDirectory,
           exportZipEnabled: false,
-          retentionDays: 730
+          databaseRetentionDays: 1000,
+          exportRetentionDays: 30
         }
       },
       now: Date.UTC(2026, 6, 13, 0, 0, 0),
@@ -2120,6 +2217,47 @@ test('syslog daily auto exporter stamps a newly closed day after delayed catch-u
   } finally {
     Date.now = originalNow;
     await new Promise(resolve => tsa.close(resolve));
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('syslog automatic exporter persists a once-per-day retention cleanup cadence', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-retention-cadence-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  const firstRunAt = Date.UTC(2026, 7, 30, 12, 0, 0);
+  const config = {
+    appName: 'G-Hotspot',
+    syslog: {
+      enabled: true,
+      timeZone: 'UTC',
+      exportDirectory: path.join(directory, 'exports'),
+      timestampMode: 'disabled',
+      autoExportEnabled: true,
+      autoExportInterval: 'daily',
+      databaseRetentionDays: 30,
+      exportRetentionDays: 2
+    }
+  };
+  const cleanupLaw5651Logs = db.cleanupLaw5651Logs.bind(db);
+  let databaseCleanupCount = 0;
+  db.cleanupLaw5651Logs = (...args) => {
+    databaseCleanupCount += 1;
+    return cleanupLaw5651Logs(...args);
+  };
+  try {
+    const exporter = createSyslogAutoExporter({ db, config, logger: { warn() {} } });
+    await exporter.runDueExports(firstRunAt);
+    await exporter.runDueExports(firstRunAt + 60 * 1000);
+    assert.equal(databaseCleanupCount, 1);
+    assert.equal(Number(db.getLaw5651State('auto_retention_cleanup_at').value), firstRunAt);
+
+    const restartedExporter = createSyslogAutoExporter({ db, config, logger: { warn() {} } });
+    await restartedExporter.runDueExports(firstRunAt + 60 * 60 * 1000);
+    assert.equal(databaseCleanupCount, 1);
+    await restartedExporter.runDueExports(firstRunAt + 24 * 60 * 60 * 1000);
+    assert.equal(databaseCleanupCount, 2);
+  } finally {
     db.close();
     fs.rmSync(directory, { recursive: true, force: true });
   }

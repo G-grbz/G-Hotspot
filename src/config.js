@@ -378,6 +378,22 @@ function buildConfig() {
   const smtpConfigured = Boolean(process.env.SMTP_HOST && smtpUser);
   const legacyDownloadSpeedMbps = envInteger('DOWNLOAD_SPEED_LIMIT_MBPS', 0, { min: 0, max: 100000 });
   const legacyUploadSpeedMbps = envInteger('UPLOAD_SPEED_LIMIT_MBPS', 0, { min: 0, max: 100000 });
+  const legacySyslogRetentionDays = envIntegerAlias(
+    'SYSLOG_RETENTION_DAYS',
+    'LOG5651_RETENTION_DAYS',
+    730,
+    { min: 1, max: 1000 }
+  );
+  const syslogDatabaseRetentionDays = envInteger(
+    'SYSLOG_DATABASE_RETENTION_DAYS',
+    legacySyslogRetentionDays,
+    { min: 1, max: 1000 }
+  );
+  const syslogExportRetentionDays = envInteger(
+    'SYSLOG_EXPORT_RETENTION_DAYS',
+    legacySyslogRetentionDays,
+    { min: 1, max: 1000 }
+  );
   const gatewayNetworkFallback = process.env.OPNSENSE_SHAPER_NETWORK || 'any';
   const gatewayShaperInterface = process.env.OPNSENSE_SHAPER_INTERFACE || 'wan';
   const gatewayBaseUrl = (process.env.OPNSENSE_BASE_URL || '').replace(/\/$/, '');
@@ -513,7 +529,9 @@ function buildConfig() {
         envAlias('SYSLOG_NETWORKS', 'LOG5651_NETWORKS', gatewayNetworkFallback)
       ),
       timeZone: normalizeTimeZone(envAlias('SYSLOG_TIME_ZONE', 'LOG5651_TIME_ZONE', '')),
-      retentionDays: envIntegerAlias('SYSLOG_RETENTION_DAYS', 'LOG5651_RETENTION_DAYS', 730, { min: 1, max: 1000 }),
+      databaseRetentionDays: syslogDatabaseRetentionDays,
+      exportRetentionDays: syslogExportRetentionDays,
+      retentionDays: syslogDatabaseRetentionDays,
       exportDirectory: path.resolve(
         envAlias('SYSLOG_EXPORT_DIR', 'LOG5651_EXPORT_DIR', path.join(path.dirname(databasePath), 'syslog'))
       ),

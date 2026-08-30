@@ -37,6 +37,13 @@ test('syslog records are stored in a separate syslog database', () => {
   try {
     assert.equal(db.syslogFilePath, syslogPath);
     assert.equal(fs.existsSync(syslogPath), true);
+    const syslogIndexes = new Set(
+      db.syslogDb.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='law5651_logs'")
+        .all()
+        .map(row => row.name)
+    );
+    assert.equal(syslogIndexes.has('law5651_logs_usage_started_idx'), true);
+    assert.equal(syslogIndexes.has('law5651_logs_usage_created_idx'), true);
     assert.equal(
       db.db.prepare("SELECT COUNT(*) count FROM sqlite_master WHERE type='table' AND name='law5651_logs'").get().count,
       0
@@ -845,6 +852,31 @@ test('operational traffic logs can be listed, aggregated and expired', () => {
     assert.equal(cleanup.deletedRollups, Object.values(cleanup.rollups).reduce((sum, value) => sum + value, 0));
     assert.equal(db.cleanupTrafficLogs(60, now), 0);
     assert.equal(db.listTrafficLogs({ period: '60m', now }).total, 3);
+
+    assert.equal(db.cleanupTrafficLogsIfDue(60, now), 0);
+    db.appendTrafficLogs([{
+      dedupeKey: 'flow-old-throttled-cleanup',
+      kind: 'flow',
+      source: 'opnsense-filterlog',
+      clientIp: '172.16.2.45',
+      sourceIp: '172.16.2.45',
+      destinationIp: '1.0.0.1',
+      protocol: 'udp',
+      serviceType: 'firewall-pass-out',
+      direction: 'outgoing',
+      startedAt: now - 2 * 60 * 60 * 1000,
+      downloadBytes: 1,
+      uploadBytes: 1,
+      createdAt: now - 2 * 60 * 60 * 1000
+    }]);
+    assert.equal(db.cleanupTrafficLogsIfDue(60, now + 1000), 0);
+    assert.equal(Number(db.db.prepare(
+      "SELECT COUNT(*) count FROM traffic_logs WHERE dedupe_key='flow-old-throttled-cleanup'"
+    ).get().count), 1);
+    assert.equal(db.cleanupTrafficLogsIfDue(60, now + 60 * 1000), 1);
+    assert.equal(Number(db.db.prepare(
+      "SELECT COUNT(*) count FROM traffic_logs WHERE dedupe_key='flow-old-throttled-cleanup'"
+    ).get().count), 0);
   } finally {
     db.close();
     fs.rmSync(directory, { recursive: true, force: true });

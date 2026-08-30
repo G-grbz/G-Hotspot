@@ -111,6 +111,9 @@ test('settings mask secrets and persist runtime-safe changes', () => {
     assert.equal(before.values.SYSLOG_TIMESTAMP_API_TIMEOUT_SECONDS, '60');
     assert.equal(before.values.SYSLOG_EXPORT_ZIP_ENABLED, 'false');
     assert.equal(before.values.SYSLOG_EXPORT_DELETE_SOURCE_AFTER_ZIP, 'false');
+    assert.equal(before.values.SYSLOG_DATABASE_RETENTION_DAYS, '730');
+    assert.equal(before.values.SYSLOG_EXPORT_RETENTION_DAYS, '730');
+    assert.equal(Object.hasOwn(before.values, 'SYSLOG_RETENTION_DAYS'), false);
     assert.equal(Object.hasOwn(before.values, 'SYSLOG_KAMUSM_TIMESTAMP_ENABLED'), false);
     assert.equal(Object.hasOwn(before.values, 'SYSLOG_SIGNATURE_TIMEOUT_SECONDS'), false);
     assert.equal(Object.hasOwn(before.values, 'SYSLOG_BACKUP_READONLY'), false);
@@ -191,6 +194,9 @@ test('settings mask secrets and persist runtime-safe changes', () => {
     assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_STORAGE_BLOCK_PERCENT'), true);
     assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_EXPORT_ZIP_ENABLED'), true);
     assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_EXPORT_DELETE_SOURCE_AFTER_ZIP'), true);
+    assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_DATABASE_RETENTION_DAYS'), true);
+    assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_EXPORT_RETENTION_DAYS'), true);
+    assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_RETENTION_DAYS'), false);
     assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_TIMESTAMP_MODE'), true);
     assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_TIMESTAMP_API_KEY'), true);
     assert.equal(syslogGroup.fields.some(field => field.key === 'SYSLOG_KAMUSM_TIMESTAMP_ENABLED'), false);
@@ -310,6 +316,58 @@ test('settings mask secrets and persist runtime-safe changes', () => {
     if (originalAppName == null) delete process.env.APP_NAME;
     else process.env.APP_NAME = originalAppName;
     fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('syslog database and physical export retention settings are independent', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-settings-retention-'));
+  const envPath = path.join(directory, '.env');
+  fs.writeFileSync(envPath, 'SYSLOG_RETENTION_DAYS=5\n');
+  try {
+    const legacy = getSettings(envPath);
+    assert.equal(legacy.values.SYSLOG_DATABASE_RETENTION_DAYS, '5');
+    assert.equal(legacy.values.SYSLOG_EXPORT_RETENTION_DAYS, '5');
+
+    saveSettings({
+      SYSLOG_DATABASE_RETENTION_DAYS: 30,
+      SYSLOG_EXPORT_RETENTION_DAYS: 2
+    }, envPath);
+    const saved = getSettings(envPath);
+    assert.equal(saved.values.SYSLOG_DATABASE_RETENTION_DAYS, '30');
+    assert.equal(saved.values.SYSLOG_EXPORT_RETENTION_DAYS, '2');
+    const content = fs.readFileSync(envPath, 'utf8');
+    assert.match(content, /^SYSLOG_DATABASE_RETENTION_DAYS=30$/mu);
+    assert.match(content, /^SYSLOG_EXPORT_RETENTION_DAYS=2$/mu);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('runtime syslog retention keeps the legacy value as a fallback', () => {
+  const originalValues = {
+    SYSLOG_RETENTION_DAYS: process.env.SYSLOG_RETENTION_DAYS,
+    SYSLOG_DATABASE_RETENTION_DAYS: process.env.SYSLOG_DATABASE_RETENTION_DAYS,
+    SYSLOG_EXPORT_RETENTION_DAYS: process.env.SYSLOG_EXPORT_RETENTION_DAYS
+  };
+  try {
+    process.env.SYSLOG_RETENTION_DAYS = '5';
+    delete process.env.SYSLOG_DATABASE_RETENTION_DAYS;
+    delete process.env.SYSLOG_EXPORT_RETENTION_DAYS;
+    reloadConfig();
+    assert.equal(config.syslog.databaseRetentionDays, 5);
+    assert.equal(config.syslog.exportRetentionDays, 5);
+
+    process.env.SYSLOG_DATABASE_RETENTION_DAYS = '30';
+    process.env.SYSLOG_EXPORT_RETENTION_DAYS = '2';
+    reloadConfig();
+    assert.equal(config.syslog.databaseRetentionDays, 30);
+    assert.equal(config.syslog.exportRetentionDays, 2);
+  } finally {
+    for (const [key, value] of Object.entries(originalValues)) {
+      if (value == null) delete process.env[key];
+      else process.env[key] = value;
+    }
+    reloadConfig();
   }
 });
 
