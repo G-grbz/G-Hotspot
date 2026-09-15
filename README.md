@@ -29,7 +29,7 @@ Türkçe: G-Hotspot, OPNsense captive portal için hazırlanmış hafif bir Node
 
 ## Current Status
 
-* Version: `1.3.0`
+* Version: `1.3.1`
 * Runtime: Node.js `>=24.0.0`
 * Database: built-in `node:sqlite`
 * License: G-Hotspot Noncommercial Source-Available License 1.0
@@ -160,7 +160,7 @@ See [SECURITY.md](SECURITY.md) for the supported-version and reporting policy.
 
 ### Release integrity
 
-Version tags such as `v1.3.0` are built by the GitHub Actions release workflow. The
+Version tags such as `v1.3.1` are built by the GitHub Actions release workflow. The
 workflow refuses tags that do not match `package.json`, re-runs checks/tests/audit,
 builds and verifies the Android app, packages only files committed in the tagged
 revision with `git archive`, generates a CycloneDX SBOM and `SHA256SUMS`, and creates
@@ -178,8 +178,8 @@ With GitHub CLI, the release archive provenance can also be verified against thi
 repository:
 
 ```bash
-gh attestation verify G-Hotspot-v1.3.0.zip --repo G-grbz/G-Hotspot
-gh attestation verify G-Hotspot-v1.3.0-android.apk --repo G-grbz/G-Hotspot
+gh attestation verify G-Hotspot-v1.3.1.zip --repo G-grbz/G-Hotspot
+gh attestation verify G-Hotspot-v1.3.1-android.apk --repo G-grbz/G-Hotspot
 ```
 
 The release workflow requires the repository secrets

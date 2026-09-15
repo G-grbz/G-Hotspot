@@ -250,7 +250,14 @@ export class HotspotDatabase {
     this.syslogDb = new DatabaseSync(this.syslogFilePath, { timeout: 5000 });
     this.lastTrafficLogCleanupAt = 0;
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON;');
-    this.syslogDb.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON;');
+    this.syslogDb.exec(`
+      PRAGMA auto_vacuum=INCREMENTAL;
+      PRAGMA journal_mode=WAL;
+      PRAGMA foreign_keys=ON;
+      PRAGMA busy_timeout=5000;
+      PRAGMA secure_delete=ON;
+      PRAGMA journal_size_limit=8388608;
+    `);
     this.migrate();
     chmodDatabasePrivate(this.filePath);
     chmodDatabasePrivate(this.syslogFilePath);
@@ -1254,6 +1261,7 @@ export class HotspotDatabase {
     const pageSize = Number(database.prepare('PRAGMA page_size').get().page_size || 0);
     const pageCount = Number(database.prepare('PRAGMA page_count').get().page_count || 0);
     const freelistCount = Number(database.prepare('PRAGMA freelist_count').get().freelist_count || 0);
+    const autoVacuum = Number(database.prepare('PRAGMA auto_vacuum').get().auto_vacuum || 0);
     const fileBytes = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
     const walPath = `${filePath}-wal`;
     const shmPath = `${filePath}-shm`;
@@ -1264,6 +1272,8 @@ export class HotspotDatabase {
       pageSize,
       pageCount,
       freelistCount,
+      autoVacuum,
+      incrementalVacuumEnabled: autoVacuum === 2,
       databaseBytes: pageSize * pageCount,
       freeBytes: pageSize * freelistCount,
       usedBytes: pageSize * Math.max(0, pageCount - freelistCount),
@@ -1310,13 +1320,45 @@ export class HotspotDatabase {
     return this.checkpointDatabaseFor(this.syslogDb, this.syslogFilePath, mode);
   }
 
-  vacuumDatabaseFor(database, filePath) {
+  incrementalVacuumDatabaseFor(database, filePath, maxPages = 16384) {
+    const startedAt = Date.now();
+    const before = this.databaseMaintenanceStatsFor(database, filePath);
+    const pages = Math.max(1, Math.min(
+      before.freelistCount,
+      Math.trunc(Number(maxPages) || 16384)
+    ));
+    if (before.autoVacuum === 2 && before.freelistCount > 0) {
+      database.exec(`PRAGMA incremental_vacuum(${pages});`);
+    }
+    database.exec('PRAGMA wal_checkpoint(PASSIVE); PRAGMA optimize;');
+    const after = this.databaseMaintenanceStatsFor(database, filePath);
+    const completedAt = Date.now();
+    return {
+      ok: true,
+      supported: before.autoVacuum === 2,
+      requestedPages: before.autoVacuum === 2 ? pages : 0,
+      startedAt,
+      completedAt,
+      durationMs: completedAt - startedAt,
+      before,
+      after,
+      reclaimedBytes: Math.max(0, before.totalFileBytes - after.totalFileBytes),
+      requiresFullVacuum: before.autoVacuum !== 2
+    };
+  }
+
+  incrementalVacuumSyslogDatabase(maxPages = 16384) {
+    return this.incrementalVacuumDatabaseFor(this.syslogDb, this.syslogFilePath, maxPages);
+  }
+
+  vacuumDatabaseFor(database, filePath, { enableIncrementalVacuum = false } = {}) {
     const startedAt = Date.now();
     database.exec('PRAGMA wal_checkpoint(TRUNCATE);');
     const before = this.databaseMaintenanceStatsFor(database, filePath);
     const backupPath = `${filePath}.backup-${new Date(startedAt).toISOString().replace(/[:.]/gu, '-')}`;
     fs.copyFileSync(filePath, backupPath, fs.constants.COPYFILE_EXCL);
     const backupBytes = fs.statSync(backupPath).size;
+    if (enableIncrementalVacuum) database.exec('PRAGMA auto_vacuum=INCREMENTAL;');
     database.exec('VACUUM; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;');
     const after = this.databaseMaintenanceStatsFor(database, filePath);
     const completedAt = Date.now();
@@ -1339,7 +1381,9 @@ export class HotspotDatabase {
   }
 
   vacuumSyslogDatabase() {
-    return this.vacuumDatabaseFor(this.syslogDb, this.syslogFilePath);
+    return this.vacuumDatabaseFor(this.syslogDb, this.syslogFilePath, {
+      enableIncrementalVacuum: true
+    });
   }
 
   cleanup(now = Date.now()) {
@@ -4419,6 +4463,27 @@ export class HotspotDatabase {
     return { rows, total: Number(total.count) };
   }
 
+  oldestLaw5651LogBefore(createdBefore, createdFrom = null) {
+    const before = Math.trunc(Number(createdBefore));
+    if (!Number.isFinite(before)) return null;
+    if (createdFrom != null) {
+      return this.syslogDb.prepare(`
+        SELECT sequence, created_at
+        FROM law5651_logs
+        WHERE created_at >= ? AND created_at < ?
+        ORDER BY created_at ASC, sequence ASC
+        LIMIT 1
+      `).get(Math.trunc(Number(createdFrom)), before) || null;
+    }
+    return this.syslogDb.prepare(`
+      SELECT sequence, created_at
+      FROM law5651_logs
+      WHERE created_at < ?
+      ORDER BY created_at ASC, sequence ASC
+      LIMIT 1
+    `).get(before) || null;
+  }
+
   cleanupLaw5651Logs(retentionDays, now = Date.now(), options = {}) {
     return this.cleanupArchivedLaw5651Logs({ retentionDays, now, ...options });
   }
@@ -4434,7 +4499,11 @@ export class HotspotDatabase {
     }
   }
 
-  law5651ExportCleanupRange(row, { requireTimestamp = false, requireBackup = false } = {}) {
+  law5651ExportCleanupRange(row, {
+    requireTimestamp = false,
+    requireBackup = false,
+    allowMissingArchiveBefore = null
+  } = {}) {
     const firstSequence = Math.trunc(Number(row?.first_sequence));
     const lastSequence = Math.trunc(Number(row?.last_sequence));
     const recordCount = Math.trunc(Number(row?.record_count) || 0);
@@ -4445,6 +4514,12 @@ export class HotspotDatabase {
         !Number.isFinite(lastCreatedAt)) {
       return null;
     }
+    const periodStartAt = Math.trunc(Number(row?.period_start_at));
+    const periodEndAt = Math.trunc(Number(row?.period_end_at));
+    const hasPeriodBounds = Number.isFinite(periodStartAt) && Number.isFinite(periodEndAt) &&
+      periodEndAt > periodStartAt;
+    const createdFrom = hasPeriodBounds ? periodStartAt : firstCreatedAt;
+    const createdBefore = hasPeriodBounds ? periodEndAt : lastCreatedAt + 1;
     if (requireTimestamp && row.timestamp_status !== 'created') return false;
     if (requireBackup && row.backup_status !== 'succeeded') return false;
     if (Number.isFinite(firstSequence) &&
@@ -4456,19 +4531,21 @@ export class HotspotDatabase {
         FROM law5651_logs
         WHERE sequence BETWEEN ? AND ?
           AND created_at >= ?
-          AND created_at <= ?
-      `).get(firstSequence, lastSequence, firstCreatedAt, lastCreatedAt);
+          AND created_at < ?
+      `).get(firstSequence, lastSequence, createdFrom, createdBefore);
       const currentCount = Number(current?.count || 0);
       if (!currentCount || currentCount > recordCount) return null;
-      if (!this.law5651ExportFileVerified(row)) return false;
-      return { firstSequence, lastSequence, firstCreatedAt, lastCreatedAt };
+      const archiveExpired = Number.isFinite(Number(allowMissingArchiveBefore)) &&
+        createdBefore <= Number(allowMissingArchiveBefore);
+      if (!archiveExpired && !this.law5651ExportFileVerified(row)) return false;
+      return { firstSequence, lastSequence, createdFrom, createdBefore };
     }
     const current = this.syslogDb.prepare(`
       SELECT COUNT(*) count, MIN(sequence) first_sequence, MAX(sequence) last_sequence
       FROM law5651_logs
       WHERE created_at >= ?
-        AND created_at <= ?
-    `).get(firstCreatedAt, lastCreatedAt);
+        AND created_at < ?
+    `).get(createdFrom, createdBefore);
     const currentCount = Number(current?.count || 0);
     if (!currentCount || currentCount > recordCount) return null;
     const derivedFirstSequence = Math.trunc(Number(current.first_sequence));
@@ -4479,12 +4556,14 @@ export class HotspotDatabase {
         derivedLastSequence < derivedFirstSequence) {
       return null;
     }
-    if (!this.law5651ExportFileVerified(row)) return false;
+    const archiveExpired = Number.isFinite(Number(allowMissingArchiveBefore)) &&
+      createdBefore <= Number(allowMissingArchiveBefore);
+    if (!archiveExpired && !this.law5651ExportFileVerified(row)) return false;
     return {
       firstSequence: derivedFirstSequence,
       lastSequence: derivedLastSequence,
-      firstCreatedAt,
-      lastCreatedAt,
+      createdFrom,
+      createdBefore,
       derivedSequence: true
     };
   }
@@ -4498,6 +4577,7 @@ export class HotspotDatabase {
     now = Date.now(),
     requireTimestamp = false,
     requireBackup = false,
+    allowMissingArchiveBefore = null,
     reasons = ['auto', 'kamusm', 'manual']
   } = {}) {
     const days = Math.max(1, Math.trunc(Number(retentionDays) || 730));
@@ -4512,15 +4592,25 @@ export class HotspotDatabase {
         AND record_count > 0
         AND first_created_at IS NOT NULL
         AND last_created_at IS NOT NULL
-        AND last_created_at < ?
-      ORDER BY first_created_at ASC, last_created_at ASC, created_at ASC
+        AND COALESCE(period_start_at, first_created_at) < ?
+      ORDER BY COALESCE(period_start_at, first_created_at) ASC,
+        COALESCE(period_end_at, last_created_at + 1) ASC, created_at ASC
     `).all(...allowedReasons, cutoff);
+    const cleanupRanges = [];
+    for (const row of exports) {
+      const range = this.law5651ExportCleanupRange(row, {
+        requireTimestamp,
+        requireBackup,
+        allowMissingArchiveBefore
+      });
+      if (range) cleanupRanges.push({ row, range });
+    }
+    if (!cleanupRanges.length) return 0;
+
     let deleted = 0;
-    this.syslogDb.exec('BEGIN IMMEDIATE');
     try {
-      for (const row of exports) {
-        const range = this.law5651ExportCleanupRange(row, { requireTimestamp, requireBackup });
-        if (!range) continue;
+      for (const { row, range } of cleanupRanges) {
+        this.syslogDb.exec('BEGIN IMMEDIATE');
         if (range.derivedSequence) {
           this.syslogDb.prepare(`
             UPDATE law5651_exports
@@ -4532,18 +4622,18 @@ export class HotspotDatabase {
           DELETE FROM law5651_logs
           WHERE sequence BETWEEN ? AND ?
             AND created_at >= ?
-            AND created_at <= ?
+            AND created_at < ?
             AND created_at < ?
         `).run(
           range.firstSequence,
           range.lastSequence,
-          range.firstCreatedAt,
-          range.lastCreatedAt,
+          range.createdFrom,
+          range.createdBefore,
           cutoff
         );
         deleted += Number(result.changes || 0);
+        this.syslogDb.exec('COMMIT');
       }
-      this.syslogDb.exec('COMMIT');
     } catch (error) {
       try { this.syslogDb.exec('ROLLBACK'); } catch {}
       throw error;
@@ -4738,6 +4828,10 @@ export class HotspotDatabase {
 
   listSyslogLogs(options = {}) {
     return this.listLaw5651Logs(options);
+  }
+
+  oldestSyslogLogBefore(createdBefore, createdFrom = null) {
+    return this.oldestLaw5651LogBefore(createdBefore, createdFrom);
   }
 
   cleanupSyslogLogs(retentionDays, now = Date.now(), options = {}) {

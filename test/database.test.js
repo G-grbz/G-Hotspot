@@ -1391,3 +1391,33 @@ test('database vacuum compacts free pages and reports maintenance stats', () => 
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('new syslog databases reclaim free pages with incremental vacuum', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-incremental-vacuum-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  try {
+    assert.equal(db.syslogDatabaseMaintenanceStats().autoVacuum, 2);
+    db.syslogDb.exec(`
+      CREATE TABLE vacuum_payload (
+        id INTEGER PRIMARY KEY,
+        body TEXT NOT NULL
+      ) STRICT;
+    `);
+    const payload = 'x'.repeat(4096);
+    const insert = db.syslogDb.prepare('INSERT INTO vacuum_payload(body) VALUES (?)');
+    for (let index = 0; index < 200; index += 1) insert.run(payload);
+    db.syslogDb.exec('DELETE FROM vacuum_payload');
+
+    const before = db.syslogDatabaseMaintenanceStats();
+    assert.ok(before.freelistCount > 0);
+    const result = db.incrementalVacuumSyslogDatabase(1000);
+    assert.equal(result.ok, true);
+    assert.equal(result.supported, true);
+    assert.equal(result.requiresFullVacuum, false);
+    assert.ok(result.after.freelistCount < before.freelistCount);
+    assert.ok(result.reclaimedBytes > 0);
+  } finally {
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

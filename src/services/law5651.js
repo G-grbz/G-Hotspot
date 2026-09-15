@@ -3,10 +3,13 @@ import path from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
+import os from 'node:os';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import dgram from 'node:dgram';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
+import { Worker } from 'node:worker_threads';
 import { gzipSync } from 'node:zlib';
 import { performance } from 'node:perf_hooks';
 import { ipv4InNetworkList } from '../lib/network.js';
@@ -17,13 +20,14 @@ import {
   enrichTrafficLogRecords,
   trafficLogSettings
 } from './trafficLogs.js';
-import { createZipArchive } from './opnsenseTemplate.js';
 
 const execFileAsync = promisify(execFile);
 const AUTO_EXPORT_CHECK_MS = 60 * 1000;
 const AUTO_EXPORT_GRACE_MS = 5 * 1000;
 const AUTO_RETENTION_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const AUTO_RETENTION_CLEANUP_STATE = 'auto_retention_cleanup_at';
+const AUTO_RETENTION_REPAIR_WINDOWS = 2;
+const AUTO_INCREMENTAL_VACUUM_PAGES = 16384;
 const MAX_AUTO_EXPORT_CATCHUP_WINDOWS = 100;
 const TRAFFIC_LOG_FILE_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 const AUTO_EXPORT_REASONS = ['auto', 'kamusm', 'timestamp'];
@@ -42,7 +46,6 @@ const AUTO_EXPORT_INTERVAL_MINUTES = {
   daily: 24 * 60
 };
 const CLIENT_IDENTITY_CACHE_MS = 30 * 1000;
-const EXPORT_PAGE_SIZE = 10000;
 const STORAGE_NOTIFICATION_INTERVALS = {
   hourly: 60 * 60 * 1000,
   daily: 24 * 60 * 60 * 1000,
@@ -51,6 +54,7 @@ const STORAGE_NOTIFICATION_INTERVALS = {
 const STORAGE_NOTIFICATION_CHANNELS = ['email', 'sms', 'telegram', 'android'];
 const NTP_STATUS_HINT =
   'Install timedatectl with systemd/DBus support, or set SYSLOG_NTP_CHECK_ENABLED=false to hide this check.';
+const LAW5651_EXPORT_WORKER_PATH = fileURLToPath(new URL('./law5651ExportWorker.js', import.meta.url));
 let syslogNonce = 0;
 
 function sha256Hex(value) {
@@ -59,6 +63,20 @@ function sha256Hex(value) {
 
 function fileHash(filePath) {
   return createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
+function fileDigest(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const input = fs.createReadStream(filePath);
+    input.on('data', chunk => hash.update(chunk));
+    input.once('error', reject);
+    input.once('end', () => resolve(hash.digest()));
+  });
+}
+
+async function fileHashAsync(filePath) {
+  return (await fileDigest(filePath)).toString('hex');
 }
 
 function fileSize(filePath) {
@@ -154,7 +172,115 @@ function removeExportRetentionFile(filePath, exportDirectory, totals, logger = c
   }
 }
 
-function createExportZipArtifact(lawConfig, files = []) {
+function runLaw5651ExportWorker(workerData) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('./law5651ExportWorker.js', import.meta.url), { workerData });
+    let settled = false;
+    worker.once('message', message => {
+      settled = true;
+      if (message?.ok) resolve(message.result);
+      else reject(new Error(message?.error || 'Syslog export worker failed'));
+    });
+    worker.once('error', error => {
+      settled = true;
+      reject(error);
+    });
+    worker.once('exit', code => {
+      if (!settled && code !== 0) reject(new Error(`Syslog export worker exited with code ${code}`));
+      else if (!settled) reject(new Error('Syslog export worker exited without a result'));
+    });
+  });
+}
+
+function law5651ExportWorkerMessage(value) {
+  try {
+    return JSON.parse(String(value || ''));
+  } catch {
+    throw new Error('Syslog export worker returned an invalid response');
+  }
+}
+
+async function runLaw5651ExportProcess(workerData) {
+  const resultPath = path.join(
+    os.tmpdir(),
+    `g-hotspot-export-result-${process.pid}-${randomBytes(12).toString('hex')}.json`
+  );
+  await fs.promises.writeFile(resultPath, '', { mode: 0o600, flag: 'wx' });
+  const payload = Buffer.from(JSON.stringify({ ...workerData, resultPath }), 'utf8').toString('base64url');
+  const nodeArguments = [LAW5651_EXPORT_WORKER_PATH, payload];
+  const workerEnvironment = { ...process.env };
+  delete workerEnvironment.NODE_TEST_CONTEXT;
+  let commandError = null;
+  try {
+    try {
+      await execFileAsync(
+        'ionice',
+        ['-c', '3', 'nice', '-n', '15', process.execPath, ...nodeArguments],
+        { timeout: 6 * 60 * 60 * 1000, maxBuffer: 1024 * 1024, env: workerEnvironment }
+      );
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && Number(error?.code) !== 127) commandError = error;
+      else {
+        try {
+          await execFileAsync(process.execPath, nodeArguments, {
+            timeout: 6 * 60 * 60 * 1000,
+            maxBuffer: 1024 * 1024,
+            env: workerEnvironment
+          });
+        } catch (fallbackError) {
+          commandError = fallbackError;
+        }
+      }
+    }
+    let message = null;
+    try {
+      message = law5651ExportWorkerMessage(await fs.promises.readFile(resultPath, 'utf8'));
+    } catch (error) {
+      if (!commandError) throw error;
+    }
+    if (!message) throw commandError;
+    if (!message?.ok) throw new Error(message?.error || commandError?.message || 'Syslog export worker failed');
+    if (commandError) throw commandError;
+    return message.result;
+  } finally {
+    await fs.promises.rm(resultPath, { force: true }).catch(() => {});
+  }
+}
+
+async function createZipFileLowPriority(archivePath, sourceFiles) {
+  const tempPath = `${archivePath}.tmp-${process.pid}-${randomBytes(6).toString('hex')}.zip`;
+  const zipArguments = ['-q', '-j', '-1', tempPath, '--', ...sourceFiles];
+  try {
+    try {
+      await execFileAsync('ionice', ['-c', '3', 'nice', '-n', '15', 'zip', ...zipArguments], {
+        timeout: 6 * 60 * 60 * 1000,
+        maxBuffer: 1024 * 1024
+      });
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && Number(error?.code) !== 127) throw error;
+      try {
+        await execFileAsync('zip', zipArguments, {
+          timeout: 6 * 60 * 60 * 1000,
+          maxBuffer: 1024 * 1024
+        });
+      } catch (zipError) {
+        if (zipError?.code !== 'ENOENT') throw zipError;
+        await runLaw5651ExportWorker({
+          job: 'zip',
+          archivePath: tempPath,
+          sourceFiles
+        });
+      }
+    }
+    await fs.promises.chmod(tempPath, 0o600);
+    await fs.promises.rename(tempPath, archivePath);
+  } catch (error) {
+    await fs.promises.rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function createExportZipArtifact(lawConfig, files = []) {
   if (!configFlag(lawConfig.exportZipEnabled)) {
     return {
       filePath: '',
@@ -175,19 +301,16 @@ function createExportZipArtifact(lawConfig, files = []) {
   }
   const logPath = sourceFiles[0];
   const archivePath = exportZipPath(logPath);
-  const entries = sourceFiles.map(filePath => ({
-    name: path.basename(filePath),
-    data: fs.readFileSync(filePath)
-  }));
-  fs.writeFileSync(archivePath, createZipArchive(entries), { mode: 0o600 });
+  const entries = sourceFiles.map(filePath => path.basename(filePath));
+  await createZipFileLowPriority(archivePath, sourceFiles);
   if (configFlag(lawConfig.exportDeleteSourceAfterZip)) {
     for (const filePath of sourceFiles) {
-      fs.rmSync(filePath, { force: true });
+      await fs.promises.rm(filePath, { force: true });
     }
   }
   return {
     filePath: archivePath,
-    entries: entries.map(entry => entry.name),
+    entries,
     sourceFiles,
     sourceFilesDeleted: configFlag(lawConfig.exportDeleteSourceAfterZip)
   };
@@ -616,11 +739,10 @@ function automaticExportTime(row) {
 
 function latestAutomaticExport(db, lawConfig = null) {
   const rows = automaticExportRows(db);
-  const filtered = lawConfig
-    ? rows.filter(row => automaticExportSatisfied(db, row, lawConfig))
-    : rows;
-  filtered.sort((left, right) => automaticExportTime(right) - automaticExportTime(left));
-  return filtered[0] || null;
+  rows.sort((left, right) => automaticExportTime(right) - automaticExportTime(left));
+  return lawConfig
+    ? rows.find(row => automaticExportMetadataSatisfied(db, row, lawConfig)) || null
+    : rows[0] || null;
 }
 
 function automaticExportRows(db) {
@@ -825,7 +947,7 @@ function nextAutomaticTimestampAllowedAt(
   return lastAttemptAt > 0 ? lastAttemptAt + interval.intervalMs : null;
 }
 
-function automaticExportSatisfied(db, existing, lawConfig = {}) {
+function automaticExportMetadataSatisfied(db, existing, lawConfig = {}) {
   if (!existing) return false;
   if (timestampEnabled(lawConfig)) {
     const timestampStatus = exportTimestampStatus(existing);
@@ -852,9 +974,7 @@ function automaticExportSatisfied(db, existing, lawConfig = {}) {
     if (total > 0) {
       if (existing.first_sequence == null || existing.last_sequence == null) return false;
       try {
-        if (!existing.file_path || !fs.existsSync(existing.file_path) || fileHash(existing.file_path) !== existing.export_hash) {
-          return false;
-        }
+        if (!existing.file_path || !existing.export_hash || !fs.statSync(existing.file_path).isFile()) return false;
       } catch {
         return false;
       }
@@ -862,6 +982,17 @@ function automaticExportSatisfied(db, existing, lawConfig = {}) {
     return total <= Number(existing.record_count || 0);
   }
   return true;
+}
+
+async function automaticExportSatisfied(db, existing, lawConfig = {}) {
+  if (!automaticExportMetadataSatisfied(db, existing, lawConfig)) return false;
+  if (existing.period_start_at == null || existing.period_end_at == null) return true;
+  if (Number(existing.record_count || 0) <= 0) return true;
+  try {
+    return await fileHashAsync(existing.file_path) === existing.export_hash;
+  } catch {
+    return false;
+  }
 }
 
 function law5651ExportResultFromRow(row) {
@@ -926,19 +1057,130 @@ function opnsenseCommunicationReady(db, config = {}, now = Date.now()) {
   return Math.trunc(Number(now) || Date.now()) - lastSuccessfulSyncAt <= Math.max(60 * 1000, syncIntervalMs * 3);
 }
 
-function cleanupExpiredLaw5651DatabaseRecords({ db, config, logger = console, now = Date.now() } = {}) {
+async function cleanupExpiredLaw5651DatabaseRecords({ db, config, logger = console, now = Date.now() } = {}) {
   const lawConfig = config.law5651 || config.syslog || {};
   if (typeof db.cleanupLaw5651Logs !== 'function') return 0;
+  const databaseDays = databaseRetentionDays(lawConfig);
+  const exportDays = exportFileRetentionDays(lawConfig);
   try {
-    return db.cleanupLaw5651Logs(databaseRetentionDays(lawConfig), now, {
+    if (!db.syslogFilePath) {
+      return db.cleanupLaw5651Logs(databaseDays, now, {
+        reasons: AUTO_EXPORT_REASONS,
+        requireTimestamp: timestampEnabled(lawConfig),
+        requireBackup: Boolean(lawConfig.backupEnabled && lawConfig.backupWormRequired),
+        allowMissingArchiveBefore: exportDays < databaseDays
+          ? exportRetentionCutoff(exportDays, now)
+          : null
+      });
+    }
+    const result = await runLaw5651ExportProcess({
+      job: 'cleanup-expired-records',
+      syslogFilePath: db.syslogFilePath,
+      retentionDays: databaseDays,
+      now,
       reasons: AUTO_EXPORT_REASONS,
       requireTimestamp: timestampEnabled(lawConfig),
-      requireBackup: Boolean(lawConfig.backupEnabled && lawConfig.backupWormRequired)
+      requireBackup: Boolean(lawConfig.backupEnabled && lawConfig.backupWormRequired),
+      allowMissingArchiveBefore: exportDays < databaseDays
+        ? exportRetentionCutoff(exportDays, now)
+        : null
     });
+    return Number(result?.deleted || 0);
   } catch (error) {
     logger.warn?.(`Syslog retention cleanup failed: ${error.message}`);
     return 0;
   }
+}
+
+function oldestExpiredLaw5651Log(db, cutoff, createdFrom = null) {
+  if (typeof db.oldestLaw5651LogBefore === 'function') {
+    return db.oldestLaw5651LogBefore(cutoff, createdFrom);
+  }
+  return db.listLaw5651Logs({
+    limit: 1,
+    order: 'asc',
+    createdFrom,
+    createdBefore: cutoff
+  }).rows[0] || null;
+}
+
+export async function repairExpiredLaw5651Archives({
+  db,
+  config,
+  logger = console,
+  notificationSender = null,
+  now = Date.now(),
+  limit = AUTO_RETENTION_REPAIR_WINDOWS
+} = {}) {
+  const lawConfig = config.law5651 || config.syslog || {};
+  const cutoff = exportRetentionCutoff(databaseRetentionDays(lawConfig), now);
+  const maximum = Math.max(1, Math.min(
+    timestampEnabled(lawConfig) ? 1 : 10,
+    Math.trunc(Number(limit) || AUTO_RETENTION_REPAIR_WINDOWS)
+  ));
+  const repaired = [];
+  let createdFrom = null;
+  for (let index = 0; index < maximum; index += 1) {
+    const oldest = oldestExpiredLaw5651Log(db, cutoff, createdFrom);
+    if (!oldest) break;
+    const periodStart = localDayStartAt(Number(oldest.created_at), lawConfig.timeZone || 'UTC');
+    const periodEnd = addLocalDays(periodStart, 1, lawConfig.timeZone || 'UTC');
+    createdFrom = periodEnd;
+    const existing = findAutomaticExportByPeriod(db, periodStart, periodEnd);
+    if (await automaticExportSatisfied(db, existing, lawConfig)) continue;
+    const result = await createLaw5651ExportArchive({
+      db,
+      config,
+      exportReason: autoExportReason(lawConfig),
+      periodStartAt: periodStart,
+      periodEndAt: periodEnd,
+      logger,
+      notificationSender
+    });
+    repaired.push(result);
+  }
+  return repaired;
+}
+
+async function maintainLaw5651Database({ db, logger = console } = {}) {
+  if (!db?.syslogFilePath) return null;
+  try {
+    return await runLaw5651ExportProcess({
+      job: 'maintain-database',
+      syslogFilePath: db.syslogFilePath,
+      maxPages: AUTO_INCREMENTAL_VACUUM_PAGES
+    });
+  } catch (error) {
+    logger.warn?.(`Syslog database maintenance failed: ${error.message}`);
+    return null;
+  }
+}
+
+export async function runLaw5651RetentionMaintenance({
+  db,
+  config,
+  logger = console,
+  notificationSender = null,
+  now = Date.now(),
+  repairLimit = AUTO_RETENTION_REPAIR_WINDOWS
+} = {}) {
+  let deletedExpired = await cleanupExpiredLaw5651DatabaseRecords({ db, config, logger, now });
+  const repairedArchives = await repairExpiredLaw5651Archives({
+    db,
+    config,
+    logger,
+    notificationSender,
+    now,
+    limit: repairLimit
+  });
+  if (repairedArchives.length) {
+    deletedExpired += await cleanupExpiredLaw5651DatabaseRecords({ db, config, logger, now });
+  }
+  const maintenance = deletedExpired > 0
+    ? await maintainLaw5651Database({ db, logger })
+    : null;
+  const deletedFiles = cleanupExpiredLaw5651ExportFiles({ db, config, logger, now });
+  return { deletedExpired, repairedArchives, maintenance, deletedFiles };
 }
 
 function cleanupExpiredLaw5651ExportDirectoryFiles({ lawConfig, cutoff, totals, logger = console }) {
@@ -1010,7 +1252,7 @@ export function cleanupExpiredLaw5651ExportFiles({ db, config, logger = console,
   return totals;
 }
 
-function dailyLogLine(row, timeZone) {
+export function law5651DailyLogLine(row, timeZone) {
   return JSON.stringify({
     sequence: Number(row.sequence),
     id: row.id,
@@ -1053,10 +1295,10 @@ function law5651DailyLog(records, {
     `# record_count=${records.length}`,
     '# format=json-lines'
   ];
-  return `${header.join('\n')}\n${records.map(row => dailyLogLine(row, timeZone)).join('\n')}${records.length ? '\n' : ''}`;
+  return `${header.join('\n')}\n${records.map(row => law5651DailyLogLine(row, timeZone)).join('\n')}${records.length ? '\n' : ''}`;
 }
 
-function law5651DailyLogHeader({
+export function law5651DailyLogHeader({
   appName = 'G-Hotspot',
   timeZone = 'UTC',
   dateLabel = '',
@@ -1075,55 +1317,20 @@ function law5651DailyLogHeader({
   ].join('\n');
 }
 
-function writeLaw5651DailyLogFile(db, logPath, {
+async function writeLaw5651DailyLogFile(db, logPath, {
   appName = 'G-Hotspot',
   timeZone = 'UTC',
   dateLabel = '',
   periodStart = null,
   periodEnd = null
 } = {}) {
-  const firstPage = db.listLaw5651Logs({
-    limit: EXPORT_PAGE_SIZE,
-    offset: 0,
-    order: 'asc',
-    createdFrom: periodStart,
-    createdBefore: periodEnd
+  if (!db?.syslogFilePath) throw new Error('Syslog database path is unavailable for export');
+  return runLaw5651ExportProcess({
+    job: 'write-daily-log',
+    syslogFilePath: db.syslogFilePath,
+    logPath,
+    options: { appName, timeZone, dateLabel, periodStart, periodEnd }
   });
-  const total = Number(firstPage.total || 0);
-  fs.writeFileSync(logPath, `${law5651DailyLogHeader({
-    appName,
-    timeZone,
-    dateLabel,
-    periodStart,
-    periodEnd,
-    recordCount: total
-  })}\n`, { mode: 0o600 });
-  let written = 0;
-  let firstRow = null;
-  let lastRow = null;
-  for (let offset = 0; offset < total; offset += EXPORT_PAGE_SIZE) {
-    const rows = offset === 0
-      ? firstPage.rows
-      : db.listLaw5651Logs({
-          limit: EXPORT_PAGE_SIZE,
-          offset,
-          order: 'asc',
-          createdFrom: periodStart,
-          createdBefore: periodEnd
-        }).rows;
-    if (!rows.length) break;
-    if (!firstRow) firstRow = rows[0];
-    lastRow = rows.at(-1);
-    fs.appendFileSync(logPath, `${rows.map(row => dailyLogLine(row, timeZone)).join('\n')}\n`, { mode: 0o600 });
-    written += rows.length;
-  }
-  return {
-    recordCount: written,
-    firstSequence: firstRow ? Number(firstRow.sequence) : null,
-    lastSequence: lastRow ? Number(lastRow.sequence) : null,
-    firstCreatedAt: firstRow ? Number(firstRow.created_at) : null,
-    lastCreatedAt: lastRow ? Number(lastRow.created_at) : null
-  };
 }
 
 function isInScope(clientIp, networks) {
@@ -1517,7 +1724,7 @@ function basicAuthHeader(username, password) {
 
 async function runKamusmTimestamp(lawConfig, logPath, tokenPath, requestPath) {
   try {
-    const digest = createHash('sha256').update(fs.readFileSync(logPath)).digest();
+    const digest = await fileDigest(logPath);
     const query = rfc3161TimestampQuery(digest, { certReq: true });
     fs.writeFileSync(requestPath, query, { mode: 0o600 });
     const token = await postTimestampQuery(
@@ -1567,7 +1774,7 @@ async function runRfc3161Timestamp(lawConfig, manifestPath, tokenPath, requestPa
     };
   }
   try {
-    const digest = createHash('sha256').update(fs.readFileSync(manifestPath)).digest();
+    const digest = await fileDigest(manifestPath);
     const query = rfc3161TimestampQuery(digest, { certReq: lawConfig.timestampCertRequest !== false });
     fs.writeFileSync(requestPath, query, { mode: 0o600 });
     const token = await postTimestampQuery(
@@ -1624,7 +1831,7 @@ async function requestTimestampAttestation(lawConfig, manifestPath, tokenPath, r
     };
   }
   try {
-    const digest = createHash('sha256').update(fs.readFileSync(manifestPath)).digest();
+    const digest = await fileDigest(manifestPath);
     const query = rfc3161TimestampQuery(digest, { certReq: lawConfig.timestampCertRequest !== false });
     fs.writeFileSync(requestPath, query, { mode: 0o600 });
     const token = await postTimestampQuery(
@@ -1904,7 +2111,7 @@ export async function createLaw5651ExportArchive({
   if (hasPeriod) {
     const existing = findAutomaticExportByPeriod(db, periodStart, periodEnd);
     const shouldReuseExisting = AUTO_EXPORT_REASONS.includes(safeReason) || timestampDisabledExport(existing);
-    if (shouldReuseExisting && automaticExportSatisfied(db, existing, lawConfig)) {
+    if (shouldReuseExisting && await automaticExportSatisfied(db, existing, lawConfig)) {
       return law5651ExportResultFromRow(existing);
     }
   }
@@ -1920,7 +2127,7 @@ export async function createLaw5651ExportArchive({
   const logPath = `${basePath}.log`;
   const timestampRequestPath = `${logPath}.tsq`;
   const tokenPath = `${logPath}.tsr`;
-  const exportStats = writeLaw5651DailyLogFile(db, logPath, {
+  const exportStats = await writeLaw5651DailyLogFile(db, logPath, {
     appName: config.appName || 'G-Hotspot',
     timeZone,
     dateLabel: dateLabel || law5651FileDate(now, timeZone).slice(0, 10),
@@ -1932,9 +2139,9 @@ export async function createLaw5651ExportArchive({
   const timestamp = gap
     ? evidenceGapTimestamp(lawConfig, gap)
     : await runTimestamp(lawConfig, logPath, tokenPath, timestampRequestPath);
-  const archive = createExportZipArtifact(lawConfig, [logPath, timestamp.requestPath, timestamp.tokenPath]);
+  const archive = await createExportZipArtifact(lawConfig, [logPath, timestamp.requestPath, timestamp.tokenPath]);
   const exportedFilePath = archive.filePath || logPath;
-  const exportHash = fileHash(exportedFilePath);
+  const exportHash = await fileHashAsync(exportedFilePath);
   const exportRow = db.createLaw5651Export({
     exportReason: safeReason,
     periodStartAt: periodStart,
@@ -2112,7 +2319,13 @@ export function createLaw5651AutoExporter({ db, config, logger = console, notifi
     lastRetentionDeletedFiles: 0,
     totalRetentionDeletedFiles: 0,
     lastRetentionDeletedBytes: 0,
-    totalRetentionDeletedBytes: 0
+    totalRetentionDeletedBytes: 0,
+    lastRetentionRepairedArchives: 0,
+    totalRetentionRepairedArchives: 0,
+    lastRetentionReclaimedBytes: 0,
+    totalRetentionReclaimedBytes: 0,
+    databaseIncrementalVacuumEnabled: false,
+    databaseFullVacuumRequired: false
   };
 
   function refreshState(now = Date.now()) {
@@ -2143,7 +2356,7 @@ export function createLaw5651AutoExporter({ db, config, logger = console, notifi
 
   async function exportWindow(periodStart, periodEnd, lawConfig) {
     const existing = findAutomaticExportByPeriod(db, periodStart, periodEnd);
-    if (automaticExportSatisfied(db, existing, lawConfig)) return null;
+    if (await automaticExportSatisfied(db, existing, lawConfig)) return null;
     return createLaw5651ExportArchive({
       db,
       config,
@@ -2232,8 +2445,18 @@ export function createLaw5651AutoExporter({ db, config, logger = console, notifi
         current < previousRetentionCleanupAt ||
         current - previousRetentionCleanupAt >= AUTO_RETENTION_CLEANUP_INTERVAL_MS;
       if (retentionCleanupDue) {
-        const deletedExpired = cleanupExpiredLaw5651DatabaseRecords({ db, config, logger, now: current });
-        const deletedFiles = cleanupExpiredLaw5651ExportFiles({ db, config, logger, now: current });
+        const {
+          deletedExpired,
+          repairedArchives,
+          maintenance,
+          deletedFiles
+        } = await runLaw5651RetentionMaintenance({
+          db,
+          config,
+          logger,
+          notificationSender,
+          now: current
+        });
         state.lastRetentionCleanupAt = current;
         state.lastRetentionDeleted = deletedExpired;
         state.totalRetentionDeleted += deletedExpired;
@@ -2241,16 +2464,26 @@ export function createLaw5651AutoExporter({ db, config, logger = console, notifi
         state.totalRetentionDeletedFiles += deletedFiles.deletedFiles;
         state.lastRetentionDeletedBytes = deletedFiles.deletedBytes;
         state.totalRetentionDeletedBytes += deletedFiles.deletedBytes;
+        state.lastRetentionRepairedArchives = repairedArchives.length;
+        state.totalRetentionRepairedArchives += repairedArchives.length;
+        state.lastRetentionReclaimedBytes = Number(maintenance?.reclaimedBytes || 0);
+        state.totalRetentionReclaimedBytes += state.lastRetentionReclaimedBytes;
+        state.databaseIncrementalVacuumEnabled = Boolean(maintenance?.supported);
+        state.databaseFullVacuumRequired = Boolean(maintenance?.requiresFullVacuum);
         setLaw5651StateValue(db, AUTO_RETENTION_CLEANUP_STATE, String(current), current);
-        if (deletedExpired > 0 || deletedFiles.deletedFiles > 0) {
+        if (deletedExpired > 0 || deletedFiles.deletedFiles > 0 || repairedArchives.length > 0) {
           safeRecordEvent(db, {
             eventType: 'syslog_retention_cleanup',
             severity: 'info',
-            message: `Syslog retention cleanup removed ${deletedExpired} archived records from the database and ${deletedFiles.deletedFiles} expired export files.`,
+            message: `Syslog retention cleanup repaired ${repairedArchives.length} archives, removed ${deletedExpired} archived records from the database and ${deletedFiles.deletedFiles} expired export files.`,
             detail: {
+              repairedArchives: repairedArchives.length,
               deletedExpired,
               deletedFiles: deletedFiles.deletedFiles,
               deletedBytes: deletedFiles.deletedBytes,
+              reclaimedBytes: Number(maintenance?.reclaimedBytes || 0),
+              incrementalVacuumEnabled: Boolean(maintenance?.supported),
+              fullVacuumRequired: Boolean(maintenance?.requiresFullVacuum),
               databaseRetentionDays: databaseRetentionDays(lawConfig),
               exportRetentionDays: exportFileRetentionDays(lawConfig)
             }

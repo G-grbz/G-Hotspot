@@ -20,6 +20,7 @@ import {
 } from '../src/services/syslog.js';
 import {
   cleanupExpiredLaw5651ExportFiles,
+  runLaw5651RetentionMaintenance,
   timedatectlNtpStatus,
   trafficLogRecordsFromSyslogMessage
 } from '../src/services/law5651.js';
@@ -1481,6 +1482,145 @@ test('syslog retention cleanup deletes only archived old records', async () => {
   }
 });
 
+test('syslog retention cleanup handles timestamps arriving out of sequence order', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-retention-order-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  const periodStart = Date.UTC(2024, 0, 1, 0, 0, 0);
+  const periodEnd = Date.UTC(2024, 0, 2, 0, 0, 0);
+  const config = {
+    appName: 'G-Hotspot',
+    syslog: {
+      enabled: true,
+      exportDirectory: path.join(directory, 'exports'),
+      timeZone: 'UTC',
+      timestampMode: 'disabled',
+      exportZipEnabled: true,
+      exportDeleteSourceAfterZip: true,
+      databaseRetentionDays: 180,
+      exportRetentionDays: 730
+    }
+  };
+  try {
+    const recordAt = (suffix, createdAt) => {
+      const record = syslogRecordFromSession({
+        sessionId: `session-order-${suffix}`,
+        clientIp: `192.168.10.${60 + suffix}`,
+        downloadBytes: suffix,
+        uploadBytes: suffix,
+        lastSeenAt: createdAt
+      }, {
+        id: `auth-order-${suffix}`,
+        method: 'voucher',
+        identity: `voucher-order-${suffix}`,
+        client_ip: `192.168.10.${60 + suffix}`,
+        created_at: createdAt - 60000
+      }, { enabled: true, networks: 'any' });
+      record.createdAt = createdAt;
+      return record;
+    };
+    const laterFirst = periodStart + 20000;
+    const earlierSecond = periodStart + 10000;
+    const latestThird = periodStart + 30000;
+    db.appendSyslogLogs([
+      recordAt(1, laterFirst),
+      recordAt(2, earlierSecond),
+      recordAt(3, latestThird)
+    ]);
+    await createSyslogExportArchive({
+      db,
+      config,
+      exportReason: 'auto',
+      periodStartAt: periodStart,
+      periodEndAt: periodEnd
+    });
+    const exported = db.latestLaw5651Export({ reason: 'auto' });
+    assert.equal(Number(exported.first_created_at), earlierSecond);
+    assert.equal(Number(exported.last_created_at), latestThird);
+
+    // Simulate metadata written by versions that used the first sequence row as the minimum time.
+    db.syslogDb.prepare(`
+      UPDATE law5651_exports SET first_created_at=?, last_created_at=? WHERE id=?
+    `).run(laterFirst, latestThird, exported.id);
+
+    const maintenance = await runLaw5651RetentionMaintenance({
+      db,
+      config,
+      now: Date.UTC(2026, 0, 1, 0, 0, 0),
+      logger: { warn() {} }
+    });
+    assert.equal(maintenance.deletedExpired, 3);
+    assert.equal(maintenance.repairedArchives.length, 0);
+    assert.equal(db.listSyslogLogs().rows.length, 0);
+  } finally {
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('syslog retention cleanup removes only the expired part of a verified daily archive', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-retention-partial-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  const periodStart = Date.UTC(2024, 0, 1, 0, 0, 0);
+  const periodEnd = Date.UTC(2024, 0, 2, 0, 0, 0);
+  const expiredAt = periodStart + 60 * 60 * 1000;
+  const retainedAt = periodStart + 20 * 60 * 60 * 1000;
+  const config = {
+    appName: 'G-Hotspot',
+    syslog: {
+      enabled: true,
+      exportDirectory: path.join(directory, 'exports'),
+      timeZone: 'UTC',
+      timestampMode: 'disabled',
+      exportZipEnabled: true,
+      exportDeleteSourceAfterZip: true,
+      databaseRetentionDays: 1,
+      exportRetentionDays: 730
+    }
+  };
+  try {
+    const recordAt = (suffix, createdAt) => {
+      const record = syslogRecordFromSession({
+        sessionId: `session-partial-${suffix}`,
+        clientIp: `192.168.10.${70 + suffix}`,
+        downloadBytes: suffix,
+        uploadBytes: suffix,
+        lastSeenAt: createdAt
+      }, {
+        id: `auth-partial-${suffix}`,
+        method: 'voucher',
+        identity: `voucher-partial-${suffix}`,
+        client_ip: `192.168.10.${70 + suffix}`,
+        created_at: createdAt - 60000
+      }, { enabled: true, networks: 'any' });
+      record.createdAt = createdAt;
+      return record;
+    };
+    db.appendSyslogLogs([recordAt(1, expiredAt), recordAt(2, retainedAt)]);
+    await createSyslogExportArchive({
+      db,
+      config,
+      exportReason: 'auto',
+      periodStartAt: periodStart,
+      periodEndAt: periodEnd
+    });
+
+    const maintenance = await runLaw5651RetentionMaintenance({
+      db,
+      config,
+      now: periodEnd + 12 * 60 * 60 * 1000,
+      logger: { warn() {} }
+    });
+    assert.equal(maintenance.deletedExpired, 1);
+    assert.equal(maintenance.repairedArchives.length, 0);
+    const remaining = db.listSyslogLogs({ order: 'asc' }).rows;
+    assert.equal(remaining.length, 1);
+    assert.equal(Number(remaining[0].created_at), retainedAt);
+  } finally {
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('syslog retention cleanup supports legacy archives without sequence metadata', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-retention-legacy-'));
   const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
@@ -1570,6 +1710,70 @@ test('syslog retention cleanup keeps old records when archive file is missing', 
     fs.rmSync(exported.filePath);
     assert.equal(db.cleanupSyslogLogs(180, Date.UTC(2026, 0, 1, 0, 0, 0)), 0);
     assert.equal(db.listSyslogLogs().rows.length, 1);
+    assert.equal(db.cleanupSyslogLogs(180, Date.UTC(2026, 0, 1, 0, 0, 0), {
+      allowMissingArchiveBefore: Date.UTC(2025, 11, 1, 0, 0, 0)
+    }), 1);
+    assert.equal(db.listSyslogLogs().rows.length, 0);
+  } finally {
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('syslog retention repairs an unexpectedly missing archive before deleting database records', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'g-hotspot-syslog-retention-repair-'));
+  const db = new HotspotDatabase(path.join(directory, 'hotspot.db'));
+  const oldAt = Date.UTC(2024, 0, 1, 0, 1, 0);
+  const config = {
+    appName: 'G-Hotspot',
+    syslog: {
+      enabled: true,
+      exportDirectory: path.join(directory, 'exports'),
+      timeZone: 'UTC',
+      timestampMode: 'disabled',
+      exportZipEnabled: true,
+      exportDeleteSourceAfterZip: true,
+      databaseRetentionDays: 180,
+      exportRetentionDays: 730
+    }
+  };
+  try {
+    const record = syslogRecordFromSession({
+      sessionId: 'session-old-repair',
+      clientIp: '192.168.10.57',
+      downloadBytes: 1,
+      uploadBytes: 1,
+      lastSeenAt: oldAt
+    }, {
+      id: 'auth-old-repair',
+      method: 'voucher',
+      identity: 'voucher-old-repair',
+      client_ip: '192.168.10.57',
+      created_at: oldAt - 60000
+    }, { enabled: true, networks: 'any' });
+    record.createdAt = oldAt;
+    db.appendSyslogLogs([record]);
+    const original = await createSyslogExportArchive({
+      db,
+      config,
+      exportReason: 'auto',
+      periodStartAt: Date.UTC(2024, 0, 1, 0, 0, 0),
+      periodEndAt: Date.UTC(2024, 0, 2, 0, 0, 0)
+    });
+    fs.rmSync(original.filePath);
+
+    const maintenance = await runLaw5651RetentionMaintenance({
+      db,
+      config,
+      now: Date.UTC(2026, 0, 1, 0, 0, 0),
+      repairLimit: 1,
+      logger: { warn() {} }
+    });
+    assert.equal(maintenance.repairedArchives.length, 1);
+    assert.equal(fs.existsSync(maintenance.repairedArchives[0].filePath), true);
+    assert.equal(maintenance.deletedExpired, 1);
+    assert.equal(maintenance.maintenance.supported, true);
+    assert.equal(db.listSyslogLogs().rows.length, 0);
   } finally {
     db.close();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -2239,24 +2443,20 @@ test('syslog automatic exporter persists a once-per-day retention cleanup cadenc
       exportRetentionDays: 2
     }
   };
-  const cleanupLaw5651Logs = db.cleanupLaw5651Logs.bind(db);
-  let databaseCleanupCount = 0;
-  db.cleanupLaw5651Logs = (...args) => {
-    databaseCleanupCount += 1;
-    return cleanupLaw5651Logs(...args);
-  };
   try {
     const exporter = createSyslogAutoExporter({ db, config, logger: { warn() {} } });
     await exporter.runDueExports(firstRunAt);
     await exporter.runDueExports(firstRunAt + 60 * 1000);
-    assert.equal(databaseCleanupCount, 1);
     assert.equal(Number(db.getLaw5651State('auto_retention_cleanup_at').value), firstRunAt);
 
     const restartedExporter = createSyslogAutoExporter({ db, config, logger: { warn() {} } });
     await restartedExporter.runDueExports(firstRunAt + 60 * 60 * 1000);
-    assert.equal(databaseCleanupCount, 1);
+    assert.equal(Number(db.getLaw5651State('auto_retention_cleanup_at').value), firstRunAt);
     await restartedExporter.runDueExports(firstRunAt + 24 * 60 * 60 * 1000);
-    assert.equal(databaseCleanupCount, 2);
+    assert.equal(
+      Number(db.getLaw5651State('auto_retention_cleanup_at').value),
+      firstRunAt + 24 * 60 * 60 * 1000
+    );
   } finally {
     db.close();
     fs.rmSync(directory, { recursive: true, force: true });
