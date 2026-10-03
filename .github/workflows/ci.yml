@@ -73,7 +73,7 @@ jobs:
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;36.0.0"
 
       - name: Set up Gradle 9.1.0
-        uses: gradle/actions/setup-gradle@v6.3.0
+        uses: gradle/actions/setup-gradle@v6.4.0
         with:
           gradle-version: '9.1.0'
 
