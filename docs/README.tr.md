@@ -26,7 +26,7 @@ Bu doküman GitHub için teknik kurulum, üretim notları, OPNsense API yetkiler
 
 Bu repodaki mevcut durum için net sınırlar:
 
-- Uygulama sürümü: `1.3.1`
+- Uygulama sürümü: `1.3.2`
 - Node.js gereksinimi: `>=24.0.0`
 - Veritabanı: Node.js yerleşik `node:sqlite`
 - Varsayılan gateway modu: `mock`

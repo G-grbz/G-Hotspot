@@ -89,20 +89,20 @@ secret or in the APK; that credential belongs only on the G-Hotspot server.
 
 ## 5. Release flow
 
-After CI is green, push the matching version tag. For version `1.3.1`:
+After CI is green, push the matching version tag. For version `1.3.2`:
 
 ```bash
-git tag -a v1.3.1 -m "G-Hotspot v1.3.1"
-git push origin v1.3.1
+git tag -a v1.3.2 -m "G-Hotspot v1.3.2"
+git push origin v1.3.2
 ```
 
 The release workflow builds and publishes:
 
 ```text
-G-Hotspot-v1.3.1.zip
-G-Hotspot-v1.3.1-android.apk
-G-Hotspot-v1.3.1-android-signing-cert.txt
-G-Hotspot-v1.3.1.sbom.cdx.json
+G-Hotspot-v1.3.2.zip
+G-Hotspot-v1.3.2-android.apk
+G-Hotspot-v1.3.2-android-signing-cert.txt
+G-Hotspot-v1.3.2.sbom.cdx.json
 SHA256SUMS
 ```
 
@@ -113,7 +113,7 @@ build-provenance attestation.
 Users can verify the release APK provenance with:
 
 ```bash
-gh attestation verify G-Hotspot-v1.3.1-android.apk --repo G-grbz/G-Hotspot
+gh attestation verify G-Hotspot-v1.3.2-android.apk --repo G-grbz/G-Hotspot
 ```
 
 and verify downloaded release checksums with:
